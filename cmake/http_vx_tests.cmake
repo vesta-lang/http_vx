@@ -13,7 +13,10 @@
 
 function(http_vx_add_test name)
     add_executable(${name} ${ARGN})
-    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(${name}
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${HTTP_VX_ALLOC_INCLUDE})
     target_compile_options(${name} PRIVATE -Wall -Wextra -pedantic-errors)
+    target_link_libraries(${name} PRIVATE vesta_alloc)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
