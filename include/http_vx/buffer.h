@@ -443,6 +443,60 @@ class Buffer {
 
     /**
      * @brief
+     * \~english Empties it for a DIFFERENT connection, keeping the memory.
+     * \~spanish Lo vacia para OTRA conexion, conservando la memoria.
+     * \~
+     *
+     * \~english
+     * The third thing, and neither of the other two will do.  @c clear empties
+     * the buffer for the next message of the same connection, so the stream
+     * carries on counting; @c release starts the stream over but gives the
+     * memory back.  Handing a buffer from one connection to another needs both
+     * halves: the memory stays, and the stream starts at zero.
+     *
+     * Using @c clear here is the mistake this exists to prevent, and it is a
+     * silent one.  The new connection's readers count from the start of the
+     * connection, which is zero, while the buffer would still be reporting the
+     * PREVIOUS tenant's origin -- so every offset they asked about would be
+     * measured from a point that connection never had.  Nothing would report
+     * an error; the reads would simply land somewhere else.
+     *
+     * The bytes are NOT wiped, and that is safe rather than overlooked: the
+     * live region is what lies between @c head_ and @c tail_, both of which
+     * are now zero, and nothing in this project reads past @c size().  Wiping
+     * would be sixteen kilobytes written for every connection that ever
+     * spoke, to hide bytes that cannot be reached.
+     *
+     * \~spanish
+     * La tercera cosa, y no vale ninguna de las otras dos.  @c clear vacia el
+     * buffer para el mensaje siguiente de la misma conexion, asi que el flujo
+     * sigue contando; @c release empieza el flujo de nuevo pero devuelve la
+     * memoria.  Pasarle un buffer de una conexion a otra necesita las dos
+     * mitades: la memoria se queda, y el flujo empieza en cero.
+     *
+     * Usar @c clear aqui es la equivocacion para la que existe esto, y es
+     * silenciosa.  Los lectores de la conexion nueva cuentan desde el principio
+     * de la conexion, que es cero, mientras que el buffer seguiria diciendo el
+     * origen del inquilino ANTERIOR -- asi que todos los desplazamientos por los
+     * que preguntaran se medirian desde un punto que esa conexion no tuvo nunca.
+     * Nadie daria ningun error; las lecturas caerian simplemente en otro sitio.
+     *
+     * Los bytes NO se borran, y eso es seguro y no un descuido: la region viva
+     * es lo que hay entre @c head_ y @c tail_, que ahora son los dos cero, y
+     * nada de este proyecto lee mas alla de @c size().  Borrarlos serian
+     * dieciseis kilobytes escritos por cada conexion que haya hablado, para
+     * esconder unos bytes a los que no se puede llegar.
+     *
+     * \~
+     */
+    void recycle() noexcept {
+        head_ = 0;
+        tail_ = 0;
+        origin_ = 0;
+    }
+
+    /**
+     * @brief
      * \~english Gives the memory back.
      * \~spanish Devuelve la memoria.
      * \~

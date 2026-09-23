@@ -107,6 +107,7 @@ endif ()
 # que se pueda probar sin abrir un puerto no tiene por que depender de el.
 add_library(http_vx_core STATIC
         core/buffer.cpp
+        reactor/buffer_pool.cpp
         reactor/conn_table.cpp
         reactor/timer_wheel.cpp
 )
@@ -159,6 +160,7 @@ if (HTTP_VX_BUILD_TESTS)
     # olvidaron -- o, peor, que quitarlo no rompa nada porque ya no lo usaba
     # ninguna.
     http_vx_add_test(test_buffer tests/test_buffer.cpp)
+    http_vx_add_test(test_buffer_pool tests/test_buffer_pool.cpp)
     http_vx_add_test(test_chars tests/test_chars.cpp)
     http_vx_add_test(test_content_length tests/test_content_length.cpp)
     http_vx_add_test(test_drain tests/test_drain.cpp)
