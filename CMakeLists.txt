@@ -107,6 +107,7 @@ endif ()
 # que se pueda probar sin abrir un puerto no tiene por que depender de el.
 add_library(http_vx_core STATIC
         core/buffer.cpp
+        reactor/conn_table.cpp
         reactor/timer_wheel.cpp
 )
 target_include_directories(http_vx_core
@@ -166,6 +167,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h1_chunked tests/test_h1_chunked.cpp)
     http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp)
     http_vx_add_test(test_codec_fuzz tests/test_codec_fuzz.cpp fuzz/codec_invariants.cpp)
+    http_vx_add_test(test_conn_table tests/test_conn_table.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
     http_vx_add_test(test_h2_connection tests/test_h2_connection.cpp)
