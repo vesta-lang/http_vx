@@ -106,6 +106,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/field.cpp
         proto/semantics/fields.cpp
         proto/semantics/method.cpp
+        proto/semantics/status.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -121,4 +122,6 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_fields tests/test_fields.cpp
             proto/semantics/field.cpp proto/semantics/fields.cpp)
     http_vx_add_test(test_method tests/test_method.cpp proto/semantics/method.cpp)
+    http_vx_add_test(test_status tests/test_status.cpp
+            proto/semantics/method.cpp proto/semantics/status.cpp)
 endif ()
