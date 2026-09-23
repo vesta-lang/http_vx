@@ -122,6 +122,7 @@ add_library(http_vx_proto STATIC
         proto/h1/chunked.cpp
         proto/h1/framing.cpp
         proto/h1/parser.cpp
+        proto/h1/writer.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -148,6 +149,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp)
     http_vx_add_test(test_h1_fuzz tests/test_h1_fuzz.cpp fuzz/h1_invariants.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
+    http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
