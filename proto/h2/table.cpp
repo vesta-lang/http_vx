@@ -287,6 +287,64 @@ size_t DynamicTable::copy_piece(size_t at, size_t len, uint8_t *out,
     return written;
 }
 
+/**
+ * @brief
+ * \~english Whether @p len bytes from @p at in the ring are @p p.
+ * \~spanish Si los @p len bytes desde @p at del anillo son @p p.
+ * \~
+ */
+bool DynamicTable::piece_is(size_t at, size_t len, const uint8_t *p,
+                            size_t plen) const noexcept {
+    if (len != plen) return false;
+
+    size_t left = len;
+    size_t from = at;
+    size_t done = 0;
+
+    while (left != 0) {
+        const size_t room = bytes_cap_ - from;
+        const size_t n = left < room ? left : room;
+        for (size_t i = 0; i < n; ++i)
+            if (bytes_[from + i] != p[done + i]) return false;
+        done += n;
+        left -= n;
+        from = (from + n) % bytes_cap_;
+    }
+
+    return true;
+}
+
+size_t DynamicTable::find(const uint8_t *name, size_t nlen,
+                          const uint8_t *value, size_t vlen,
+                          bool &exact) const noexcept {
+    exact = false;
+    size_t by_name = count_;
+
+    for (size_t i = 0; i < count_; ++i) {
+        const TableEntry *e = at(i);
+        if (!piece_is(e->byte_off, e->name_len, name, nlen)) continue;
+
+        /* \~english
+         * A name match is worth remembering and not worth stopping for: a
+         * field further back may match the value as well, and that one costs
+         * one byte where this one costs the whole value.
+         * \~spanish
+         * Una coincidencia de nombre merece recordarse y no merece pararse: mas
+         * atras puede haber una que ademas coincida en el valor, y esa cuesta
+         * un byte donde esta cuesta el valor entero.
+         * \~ */
+        if (by_name == count_) by_name = i;
+
+        if (piece_is((e->byte_off + e->name_len) % bytes_cap_, e->value_len,
+                     value, vlen)) {
+            exact = true;
+            return i;
+        }
+    }
+
+    return by_name;
+}
+
 size_t DynamicTable::copy_name(size_t i, uint8_t *out, size_t cap) const noexcept {
     const TableEntry *e = at(i);
     if (e == nullptr) return 0;

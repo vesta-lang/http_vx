@@ -332,6 +332,48 @@ class DynamicTable {
     /// \~english The same for the value.  \~spanish Lo mismo para el valor.  \~
     size_t copy_value(size_t i, uint8_t *out, size_t cap) const noexcept;
 
+    /**
+     * @brief
+     * \~english Looks for a field, by name and by name and value.
+     * \~spanish Busca una cabecera, por nombre y por nombre y valor.
+     * \~
+     *
+     * \~english
+     * What an encoder needs, and only an encoder: a decoder is told an index
+     * and a writer has to find one.  It answers both questions at once because
+     * they are one walk -- an exact match is better than a name match, so a
+     * search that stopped at the first name would have to start again to find
+     * out whether there was something better further back.
+     *
+     * The comparison is made against the ring in place rather than by copying
+     * out.  A name here is compared against every entry, and copying each one
+     * to do it would be copying the table on every field written.
+     *
+     * \~spanish
+     * Lo que necesita un codificador, y solo un codificador: a un
+     * descodificador le dan un indice y un escritor tiene que encontrarlo.
+     * Contesta las dos preguntas de una vez porque son un solo recorrido -- una
+     * coincidencia exacta vale mas que una de nombre, asi que una busqueda que
+     * parara en el primer nombre tendria que empezar otra vez para saber si mas
+     * atras habia algo mejor.
+     *
+     * La comparacion se hace contra el anillo en su sitio y no copiando fuera.
+     * Un nombre de aqui se compara contra todas las entradas, y copiar cada una
+     * para hacerlo seria copiar la tabla en cada cabecera que se escribe.
+     *
+     * \~
+     * @param name  \~english the name  \~spanish el nombre  \~
+     * @param nlen  \~english how many bytes  \~spanish cuantos bytes  \~
+     * @param value \~english the value  \~spanish el valor  \~
+     * @param vlen  \~english how many bytes  \~spanish cuantos bytes  \~
+     * @param exact \~english set when the value matched too
+     *              \~spanish se pone cuando el valor tambien coincidio  \~
+     * @return      \~english how far back it is, or @c count when there is none
+     *              \~spanish cuanto hacia atras esta, o @c count si no hay  \~
+     */
+    size_t find(const uint8_t *name, size_t nlen, const uint8_t *value,
+                size_t vlen, bool &exact) const noexcept;
+
     /// \~english How many entries there are.  \~spanish Cuantas entradas hay.  \~
     size_t count() const noexcept { return count_; }
 
@@ -372,6 +414,11 @@ class DynamicTable {
 
     size_t copy_piece(size_t at, size_t len, uint8_t *out,
                       size_t cap) const noexcept;
+
+    /// \~english Whether a piece of the ring is exactly these bytes.
+    /// \~spanish Si un pedazo del anillo son exactamente estos bytes.  \~
+    bool piece_is(size_t at, size_t len, const uint8_t *p,
+                  size_t plen) const noexcept;
 
     /**
      * \~english

@@ -362,6 +362,85 @@ constexpr size_t kStaticEntries = 61;
  */
 const StaticEntry *static_entry(uint64_t index) noexcept;
 
+/**
+ * @brief
+ * \~english The first entry that names @p id, or zero.
+ * \~spanish La primera entrada que nombra a @p id, o cero.
+ * \~
+ *
+ * \~english
+ * The other direction of the same table, and it is DERIVED from it while this
+ * is compiled rather than written beside it -- the same reason the Huffman
+ * tree is derived: a second list would be a second statement of which index
+ * means which field, and two statements of that disagree by sending a header
+ * the peer reads as another one.
+ *
+ * \~spanish
+ * La otra direccion de la misma tabla, y se DERIVA de ella al compilar en vez
+ * de escribirse al lado -- por lo mismo que se deriva el arbol de Huffman: una
+ * segunda lista seria una segunda declaracion de que indice significa que
+ * cabecera, y dos declaraciones de eso discrepan mandando una cabecera que el
+ * otro extremo lee como otra.
+ *
+ * \~
+ * @param id \~english the identifier  \~spanish el identificador  \~
+ * @return   \~english the index, or zero if the table does not name it
+ *           \~spanish el indice, o cero si la tabla no lo nombra  \~
+ */
+uint64_t static_index_of(FieldId id) noexcept;
+
+/**
+ * @brief
+ * \~english The entry that names @p id AND says @p value, or zero.
+ * \~spanish La entrada que nombra a @p id Y dice @p value, o cero.
+ * \~
+ *
+ * \~english
+ * Worth asking separately because the answer costs a different number of
+ * bytes: a field whose name and value are both in the table is ONE byte on the
+ * wire, and one whose name alone is there costs the value as well.
+ *
+ * \~spanish
+ * Merece preguntarse aparte porque la respuesta cuesta un numero distinto de
+ * bytes: una cabecera cuyo nombre Y valor estan los dos en la tabla es UN byte
+ * en el cable, y una cuyo nombre esta solo cuesta ademas el valor.
+ *
+ * \~
+ * @param id    \~english the identifier  \~spanish el identificador  \~
+ * @param value \~english the value  \~spanish el valor  \~
+ * @param vlen  \~english how many bytes  \~spanish cuantos bytes  \~
+ * @return      \~english the index, or zero  \~spanish el indice, o cero  \~
+ */
+uint64_t static_index_of(FieldId id, const uint8_t *value,
+                         size_t vlen) noexcept;
+
+/**
+ * @brief
+ * \~english The entry for @p which saying @p value, or zero.
+ * \~spanish La entrada de @p which que dice @p value, o cero.
+ * \~
+ *
+ * \~english
+ * The same for the names that are not field names.  A response's status is the
+ * one a server writes on every message, and seven of them are in the table --
+ * which is why an ordinary `200 OK` costs one byte here.
+ *
+ * \~spanish
+ * Lo mismo para los nombres que no son nombres de cabecera.  El estado de una
+ * respuesta es el que escribe un servidor en todos los mensajes, y siete de
+ * ellos estan en la tabla -- que es la razon de que un `200 OK` corriente
+ * cueste aqui un byte.
+ *
+ * \~
+ * @param which \~english which piece it is  \~spanish que pieza es  \~
+ * @param value \~english the value, or null to match the name alone
+ *              \~spanish el valor, o nulo para casar solo el nombre  \~
+ * @param vlen  \~english how many bytes  \~spanish cuantos bytes  \~
+ * @return      \~english the index, or zero  \~spanish el indice, o cero  \~
+ */
+uint64_t static_index_of(Pseudo which, const uint8_t *value,
+                         size_t vlen) noexcept;
+
 } // namespace hpack
 } // namespace h2
 } // namespace http_vx

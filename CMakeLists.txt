@@ -125,6 +125,7 @@ add_library(http_vx_proto STATIC
         proto/h1/writer.cpp
 
         proto/h2/decoder.cpp
+        proto/h2/encoder.cpp
         proto/h2/frame.cpp
         proto/h2/hpack.cpp
         proto/h2/huffman.cpp
@@ -159,6 +160,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
     http_vx_add_test(test_h2_decoder tests/test_h2_decoder.cpp)
+    http_vx_add_test(test_h2_encoder tests/test_h2_encoder.cpp)
     http_vx_add_test(test_h2_frame tests/test_h2_frame.cpp)
     http_vx_add_test(test_h2_hpack tests/test_h2_hpack.cpp)
     http_vx_add_test(test_h2_huffman tests/test_h2_huffman.cpp)

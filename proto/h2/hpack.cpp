@@ -139,7 +139,105 @@ static_assert(sizeof(kStatic) / sizeof(kStatic[0]) == kStaticEntries,
               "the static table must have exactly the sixty-one entries the "
               "specification fixes: both ends count dynamic indices from it");
 
+/**
+ * @brief
+ * \~english Where each identifier is first named, built from the table.
+ * \~spanish Donde se nombra por primera vez cada identificador, sacado de la tabla.
+ * \~
+ *
+ * \~english
+ * Derived while this is compiled, for the same reason the Huffman tree is: a
+ * hand-written second list would be a second statement of which index means
+ * which field, and the two would eventually disagree -- by sending a header the
+ * peer reads as a different one, on a connection that keeps working.
+ *
+ * \~spanish
+ * Derivado al compilar, por lo mismo que el arbol de Huffman: una segunda lista
+ * escrita a mano seria una segunda declaracion de que indice significa que
+ * cabecera, y las dos acabarian discrepando -- mandando una cabecera que el
+ * otro extremo lee como otra, en una conexion que sigue funcionando.
+ *
+ * \~
+ */
+struct FieldIndex {
+    uint8_t first[static_cast<size_t>(FieldId::Count)];
+};
+
+constexpr FieldIndex build_field_index() noexcept {
+    FieldIndex ix{};
+    for (size_t i = kStaticEntries; i != 0; --i) {
+        const StaticEntry &e = kStatic[i - 1];
+        if (e.id != FieldId::Unknown)
+            ix.first[static_cast<size_t>(e.id)] = static_cast<uint8_t>(i);
+    }
+    return ix;
+}
+
+constexpr FieldIndex kByField = build_field_index();
+
+/**
+ * @brief
+ * \~english Whether @p e says exactly these @p vlen bytes.
+ * \~spanish Si @p e dice exactamente estos @p vlen bytes.
+ * \~
+ */
+bool value_is(const StaticEntry &e, const uint8_t *value, size_t vlen) noexcept {
+    if (e.value_len != vlen) return false;
+    for (size_t i = 0; i < vlen; ++i)
+        if (static_cast<uint8_t>(e.value[i]) != value[i]) return false;
+    return true;
+}
+
 } // namespace
+
+uint64_t static_index_of(FieldId id) noexcept {
+    if (id == FieldId::Unknown) return 0;
+    if (static_cast<size_t>(id) >= static_cast<size_t>(FieldId::Count)) return 0;
+    return kByField.first[static_cast<size_t>(id)];
+}
+
+uint64_t static_index_of(FieldId id, const uint8_t *value,
+                         size_t vlen) noexcept {
+    const uint64_t first = static_index_of(id);
+    if (first == 0) return 0;
+
+    /* \~english
+     * Entries with the same name sit together in the table, so the search for
+     * one that also matches the value walks forward from the first and stops
+     * when the name changes.  That is a property of the ordering the
+     * specification fixed and not of this code -- which is why the walk stops
+     * on the name rather than taking a fixed number of steps.
+     *
+     * \~spanish
+     * Las entradas con el mismo nombre van juntas en la tabla, asi que la
+     * busqueda de una que ademas case el valor avanza desde la primera y para
+     * cuando cambia el nombre.  Es una propiedad del orden que fijo la
+     * especificacion y no de este codigo -- que es la razon de que el recorrido
+     * pare en el nombre y no de un numero fijo de pasos.
+     * \~ */
+    for (uint64_t i = first; i <= kStaticEntries; ++i) {
+        const StaticEntry &e = kStatic[i - 1];
+        if (e.id != id) break;
+        if (value_is(e, value, vlen)) return i;
+    }
+
+    return 0;
+}
+
+uint64_t static_index_of(Pseudo which, const uint8_t *value,
+                         size_t vlen) noexcept {
+    if (which == Pseudo::None) return 0;
+
+    uint64_t by_name = 0;
+    for (uint64_t i = 1; i <= kStaticEntries; ++i) {
+        const StaticEntry &e = kStatic[i - 1];
+        if (e.pseudo != which) continue;
+        if (by_name == 0) by_name = i;
+        if (value != nullptr && value_is(e, value, vlen)) return i;
+    }
+
+    return value == nullptr ? by_name : 0;
+}
 
 const StaticEntry *static_entry(uint64_t index) noexcept {
     /* \~english
