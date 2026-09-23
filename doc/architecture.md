@@ -143,7 +143,7 @@ preserializadas.
       reactor/     la interfaz por finalizacion
       windows/     IOCP
       linux/       io_uring y epoll
-      tests/       sobre core/ y proto/
+      tests/       sobre core/ y proto/, sin red
       fuzz/        los codecs y la pila QUIC
       bench/       con medidas fechadas por maquina
 
@@ -282,6 +282,32 @@ Anunciar que "se soportan" seria un error de categoria.
 
 Las tablas dinamicas de HPACK y QPACK son la excepcion: viven lo que la
 conexion, no lo que la peticion, y tienen su propio tope negociado.
+
+### 8.1 Internar, y donde NO
+
+Un nombre de cabecera se compara muchisimas mas veces de las que se lee, asi
+que pide a gritos internarse.  Pero hay dos clases de nombre y solo una admite
+ese trato:
+
+| | como se representa | por que |
+| :-- | :-- | :-- |
+| **conocido** | un IDENTIFICADOR entero, resuelto al compilar | el identificador ES la forma internada: comparar es `==`, sin pozo, sin candado y sin reserva |
+| **desconocido** | una vista sobre el buffer de la peticion | viene de la red |
+
+> **R31. Un nombre o un valor que viene de la red NO DEBE internarse en un pozo
+> global.  Si se interna, DEBE ser POR CONEXION y con tope.**
+
+Un pozo global alimentado por la red **crece sin limite**: basta mandar
+`x-1`, `x-2`, `x-3`... para que no pare nunca.  Eso no es una optimizacion, es
+una vulnerabilidad, y el modo de fallo es el peor -- no se nota hasta que la
+maquina se queda sin memoria, y para entonces no hay nada que senale al
+culpable.
+
+Lo bueno es que **el protocolo ya trae la respuesta**: las tablas dinamicas de
+HPACK y QPACK son exactamente eso -- internado por conexion, con un tope que
+las dos partes negocian --.  Asi que en h2 y h3 no hay que inventar nada; y en
+h1, que no tiene tabla dinamica, un nombre desconocido es una vista sobre la
+arena de la peticion y muere con ella.
 
 ## 9. TLS es un SERVICIO que alguien PROVEE
 

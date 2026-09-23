@@ -41,12 +41,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-# Aun no hay fuentes: este arbol es el esqueleto acordado en doc/architecture.md
-# y se va poblando por escalones.  El orden esta en ese documento; el primero es
-# `proto/`, que es donde vive la correctitud y no necesita ni plataforma ni
-# bucle de eventos para probarse.
+# El arbol se puebla por escalones; el orden y el porque estan en
+# doc/architecture.md, seccion 14.  Lo que hay hoy es la semantica -- lo que una
+# peticion SIGNIFICA --, que es lo unico comun a las tres versiones y lo unico
+# que no necesita ni plataforma ni bucle de eventos para probarse.
 # ---------------------------------------------------------------------------
+
+add_library(http_vx_proto STATIC
+        proto/semantics/field.cpp
+)
+target_include_directories(http_vx_proto PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(http_vx_proto PRIVATE -Wall -Wextra -pedantic-errors)
 
 if (HTTP_VX_BUILD_TESTS)
     enable_testing()
+    include(cmake/http_vx_tests.cmake)
+    http_vx_add_test(test_field tests/test_field.cpp proto/semantics/field.cpp)
 endif ()
