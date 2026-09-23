@@ -101,8 +101,13 @@ endif ()
 # que no necesita ni plataforma ni bucle de eventos para probarse.
 # ---------------------------------------------------------------------------
 
+# `reactor/timer_wheel.cpp` vive aqui y no en un objetivo `http_vx_reactor`
+# porque no toca el sistema operativo: son tres arrays y una mascara.  El
+# objetivo del reactor sera el que SI lo toque -- epoll, IOCP, io_uring -- y lo
+# que se pueda probar sin abrir un puerto no tiene por que depender de el.
 add_library(http_vx_core STATIC
         core/buffer.cpp
+        reactor/timer_wheel.cpp
 )
 target_include_directories(http_vx_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -176,6 +181,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
+    http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
 endif ()
 
 # ---------------------------------------------------------------------------
