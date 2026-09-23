@@ -57,7 +57,8 @@ namespace {
 
 using http_vx::Buffer;
 using http_vx::ConnHandle;
-using http_vx::ConnState;
+using http_vx::kReadPending;
+using http_vx::kWritePending;
 using http_vx::MemoryBackend;
 using http_vx::Service;
 using http_vx::Shard;
@@ -209,14 +210,18 @@ void test_an_idle_connection_holds_no_buffer() {
           "the service saw the wrong number of bytes");
 
     /* \~english
-     * Now it is answering, so it holds the write buffer -- and the read one
-     * went back the moment the service was done with it.
+     * Now it is answering AND reading again, so it holds two: the one the
+     * answer is going out of, and the one the next request will arrive in.
+     * That is the high-water mark of the pool and the number to size it by --
+     * not how many connections talk at once, but how many are mid-exchange.
      * \~spanish
-     * Ahora esta contestando, asi que tiene el buffer de escritura -- y el de
-     * lectura volvio en cuanto el servicio acabo con el.
+     * Ahora esta contestando Y leyendo otra vez, asi que tiene dos: aquel del
+     * que sale la respuesta, y aquel en el que llegara la peticion siguiente.
+     * Ese es el pico del pozo y el numero por el que dimensionarlo -- no cuantas
+     * conexiones hablan a la vez, sino cuantas estan a mitad de intercambio.
      * \~ */
-    check(r.shard.buffers().lent() == 1,
-          "a connection answering is not holding exactly one buffer");
+    check(r.shard.buffers().lent() == 2,
+          "a connection answering and reading is not holding two buffers");
 
     check(r.shard.poll(2, 0) == 1, "the write did not come back");
     check(r.io.written_size() == std::strlen(msg), "the answer did not go out");
@@ -385,11 +390,10 @@ void test_a_connection_without_a_buffer_still_expires() {
           "the second connection got a buffer that did not exist");
 
     const http_vx::ConnHot *h = r.shard.conns().hot(second);
-    check(h != nullptr &&
-              h->state == static_cast<uint16_t>(ConnState::Idle),
-          "a connection with no buffer is not idle");
-    check(h != nullptr && h->buffer == http_vx::kNoBuffer,
-          "a connection with no buffer says it has one");
+    check(h != nullptr && (h->flags & kReadPending) == 0,
+          "a connection with no buffer says it is reading");
+    check(h != nullptr && h->queue == http_vx::kNoBuffer,
+          "a connection with no buffer has an answer queued");
 
     /* \~english
      * And it still goes away when its time is up.
@@ -477,9 +481,120 @@ void test_a_service_can_end_it() {
           "a closed connection kept its deadline");
 }
 
+/**
+ * @brief
+ * \~english Reading carries on while an answer is still going out.
+ * \~spanish Se sigue leyendo mientras una respuesta todavia esta saliendo.
+ * \~
+ *
+ * \~english
+ * The two directions of a socket are independent, so a peer that sends its
+ * next request while this one is being answered must not be made to wait for
+ * an answer it has not asked for yet.  A loop that read only between writes
+ * would turn every connection into strict ping-pong -- correct, and slower
+ * than the protocol allows for no reason the protocol gives.
+ *
+ * What there may NOT be two of is reads, or writes: two reads outstanding on
+ * a stream socket complete in whatever order the kernel finishes them, so the
+ * bytes would arrive with no way to say which came first, and two writes would
+ * interleave on the wire.  A stream that can be reordered is not a stream.
+ *
+ * \~spanish
+ * Los dos sentidos de un socket son independientes, asi que a un extremo que
+ * manda su peticion siguiente mientras se contesta esta no se le puede hacer
+ * esperar por una respuesta que todavia no ha pedido.  Un bucle que solo leyera
+ * entre escrituras convertiria cada conexion en un ping-pong estricto --
+ * correcto, y mas lento de lo que permite el protocolo sin ninguna razon que de
+ * el protocolo.
+ *
+ * De lo que NO puede haber dos es de lecturas, ni de escrituras: dos lecturas
+ * pendientes sobre un socket de flujo acaban en el orden en que las termine el
+ * nucleo, asi que los bytes llegarian sin forma de decir cual iba antes, y dos
+ * escrituras se entrelazarian en el cable.  Un flujo que se puede desordenar no
+ * es un flujo.
+ *
+ * \~
+ */
+void test_both_directions_at_once() {
+    Rig r;
+    check(r.start(8, 10), "the shard would not start");
+
+    /* \~english
+     * The kernel takes the answer two bytes at a time, so a write stays
+     * outstanding across several completions -- which is what makes room for
+     * a read to happen while it is going.
+     * \~spanish
+     * El nucleo coge la respuesta de dos en dos bytes, asi que una escritura
+     * sigue pendiente durante varias finalizaciones -- que es lo que hace sitio
+     * para que ocurra una lectura mientras va.
+     * \~ */
+    r.io.chunk(2);
+
+    const ConnHandle c = r.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    const char *first = "aaaaaaaa";
+    r.io.feed(reinterpret_cast<const uint8_t *>(first), std::strlen(first));
+    check(r.shard.poll(1, 0) == 1, "the first read did not come back");
+
+    const http_vx::ConnHot *h = r.shard.conns().hot(c);
+    check(h != nullptr, "the connection is not there");
+
+    /* \~english
+     * A write is going AND a read is outstanding, at the same time, on the
+     * same connection.  That is the whole point.
+     * \~spanish
+     * Va una escritura Y hay una lectura pendiente, a la vez, en la misma
+     * conexion.  De eso se trata.
+     * \~ */
+    check(h != nullptr && (h->flags & kWritePending) != 0,
+          "the answer is not going out");
+    check(h != nullptr && (h->flags & kReadPending) != 0,
+          "reading stopped while the answer was going out");
+    check(r.shard.buffers().lent() == 2,
+          "a connection reading and writing is not holding two buffers");
+
+    /* \~english
+     * The peer sends again while the first answer is still going out.  The
+     * second answer cannot be sent yet -- two writes would interleave -- so it
+     * waits in the queue instead of holding up the read that made it.
+     * \~spanish
+     * El otro extremo manda otra vez mientras la primera respuesta sigue
+     * saliendo.  La segunda no se puede mandar todavia -- dos escrituras se
+     * entrelazarian -- asi que espera en la cola en vez de retener la lectura
+     * que la hizo.
+     * \~ */
+    const char *second = "bb";
+    r.io.feed(reinterpret_cast<const uint8_t *>(second), std::strlen(second));
+
+    for (int i = 0; i < 3; ++i) r.shard.poll(2, 0);
+
+    check(r.service.calls >= 2, "the second request was not read");
+
+    /* \~english
+     * And it all comes out, in order: the first answer whole, then the second.
+     * A response that overtook the one before it would be the answer to the
+     * wrong request.
+     * \~spanish
+     * Y sale todo, en orden: la primera respuesta entera y luego la segunda.
+     * Una respuesta que adelantara a la anterior seria la respuesta a la
+     * peticion equivocada.
+     * \~ */
+    for (int i = 0; i < 40; ++i) r.shard.poll(3, 0);
+
+    const size_t total = std::strlen(first) + std::strlen(second);
+    check(r.io.written_size() == total, "not everything went out");
+    check(std::memcmp(r.io.written(), first, std::strlen(first)) == 0,
+          "the first answer is not what went out first");
+    check(std::memcmp(r.io.written() + std::strlen(first), second,
+                      std::strlen(second)) == 0,
+          "the second answer did not follow the first");
+}
+
 } // namespace
 
 int main() {
+    test_both_directions_at_once();
     test_an_idle_connection_holds_no_buffer();
     test_activity_pushes_the_deadline();
     test_a_connection_without_a_buffer_still_expires();

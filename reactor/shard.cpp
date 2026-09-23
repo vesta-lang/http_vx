@@ -8,12 +8,15 @@
 /**
  * @file reactor/shard.cpp
  * @brief
- * \~english Driving one thread's connections.
- * \~spanish Mover las conexiones de un hilo.
+ * \~english Driving one thread's connections, in both directions at once.
+ * \~spanish Mover las conexiones de un hilo, en los dos sentidos a la vez.
  * \~
  */
 
 #include "http_vx/shard.h"
+
+#include "util/alloc/alloc_tag.h"
+#include "util/alloc/host_allocator.h"
 
 namespace http_vx {
 
@@ -21,53 +24,13 @@ Service::~Service() = default;
 
 namespace {
 
-/**
- * @brief
- * \~english Whether the operating system is holding something of @p h.
- * \~spanish Si el sistema operativo tiene algo de @p h.
- * \~
- *
- * \~english
- * The question the buffer rules turn on, and it is answerable from one field
- * because this loop keeps AT MOST ONE operation per connection outstanding.
- *
- * That is a real limitation and it is worth naming: a connection cannot be
- * reading and writing at the same time here, so a peer that sends while a
- * response is going out waits for the kernel's receive queue to hold it.  For
- * request-and-response that is exactly right.  For HTTP/2, where a peer may
- * be sending one request while another is being answered, it costs
- * concurrency that the protocol allows -- and lifting it means a count and a
- * per-operation record rather than a state, which is a bigger change than it
- * looks and is not worth making before something measures the cost.
- *
- * \~spanish
- * La pregunta sobre la que giran las reglas del buffer, y se puede contestar
- * con un solo campo porque este bucle mantiene COMO MUCHO UNA operacion
- * pendiente por conexion.
- *
- * Es una limitacion de verdad y merece nombrarse: aqui una conexion no puede
- * estar leyendo y escribiendo a la vez, asi que un extremo que mande mientras
- * sale una respuesta espera a que se lo guarde la cola de recepcion del nucleo.
- * Para peticion-y-respuesta eso es exactamente lo correcto.  Para HTTP/2, donde
- * un extremo puede estar mandando una peticion mientras se contesta otra, cuesta
- * una concurrencia que el protocolo permite -- y levantarlo es una cuenta y un
- * registro por operacion en vez de un estado, que es un cambio mayor de lo que
- * parece y no vale la pena hacerlo antes de que algo mida lo que cuesta.
- *
- * \~
- */
+/// \~english Whether the operating system is holding anything of @p h.
+/// \~spanish Si el sistema operativo tiene algo de @p h.  \~
 bool busy(const ConnHot &h) noexcept {
-    return h.state == static_cast<uint16_t>(ConnState::Reading) ||
-           h.state == static_cast<uint16_t>(ConnState::Writing);
+    return (h.flags & (kReadPending | kWritePending)) != 0;
 }
 
-void set_state(ConnHot &h, ConnState s) noexcept {
-    h.state = static_cast<uint16_t>(s);
-}
-
-bool is_state(const ConnHot &h, ConnState s) noexcept {
-    return h.state == static_cast<uint16_t>(s);
-}
+bool closing(const ConnHot &h) noexcept { return (h.flags & kClosing) != 0; }
 
 } // namespace
 
@@ -82,6 +45,15 @@ bool Shard::reset(const ShardConfig &cfg, Backend &io, Service &service,
     if (!conns_.reset(cfg.connections)) return false;
     if (!pool_.reset(cfg.buffers, cfg.buffer_ceiling)) return false;
     if (!wheel_.reset(cfg.connections, cfg.wheel_slots, now)) return false;
+
+    const util::AllocScope scope(util::AllocUse::Long, util::AllocShape::Fixed,
+                                 util::AllocFill::Sparse);
+
+    queue_next_ = static_cast<uint32_t *>(
+        util::host_alloc(static_cast<size_t>(cfg.buffers) * sizeof(uint32_t)));
+    if (queue_next_ == nullptr) return false;
+
+    for (uint32_t i = 0; i < cfg.buffers; ++i) queue_next_[i] = kNoBuffer;
 
     /* \~english
      * A deadline that does not fit the wheel is refused when it is armed, so
@@ -98,6 +70,11 @@ bool Shard::reset(const ShardConfig &cfg, Backend &io, Service &service,
 }
 
 void Shard::release() noexcept {
+    if (queue_next_ != nullptr) {
+        util::host_free(queue_next_);
+        queue_next_ = nullptr;
+    }
+
     conns_.release();
     pool_.release_all();
     wheel_.release();
@@ -105,101 +82,174 @@ void Shard::release() noexcept {
     service_ = nullptr;
 }
 
-void Shard::let_go(ConnHandle c, ConnHot &h) noexcept {
-    if (h.buffer != kNoBuffer) {
-        pool_.release(h.buffer);
-        h.buffer = kNoBuffer;
+void Shard::drop_queue(ConnHot &h) noexcept {
+    while (h.queue != kNoBuffer) {
+        const uint32_t next = queue_next_[h.queue];
+        queue_next_[h.queue] = kNoBuffer;
+        pool_.release(h.queue);
+        h.queue = next;
     }
+    h.queued = 0;
+}
 
+void Shard::let_go(ConnHandle c, ConnHot &h) noexcept {
+    drop_queue(h);
     wheel_.cancel(c.slot);
-    set_state(h, ConnState::Idle);
-
     service_->on_close(c);
     conns_.close(c);
 }
 
-bool Shard::start_read(ConnHandle c, uint64_t now) noexcept {
-    (void)now;
+bool Shard::leave_if_done(ConnHandle c, ConnHot &h) noexcept {
+    if (!closing(h) || busy(h)) return false;
+    let_go(c, h);
+    return true;
+}
 
-    ConnHot *h = conns_.hot(c);
-    if (h == nullptr) return false;
+void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
+    if ((h.flags & kReadPending) != 0 || closing(h)) return;
+
+    /* \~english
+     * A connection with answers piling up is not read from.  That is flow
+     * control and not a limit: a peer sending faster than it reads is making
+     * this server hold its output, and the answer is to stop taking more in.
+     * The bytes wait in the kernel's receive queue, which is where they
+     * belong.
+     * \~spanish
+     * De una conexion con respuestas amontonandose no se lee.  Eso es control de
+     * flujo y no un limite: un extremo que manda mas deprisa de lo que lee esta
+     * haciendo que este servidor le guarde su salida, y la respuesta es dejar de
+     * aceptar mas.  Los bytes esperan en la cola de recepcion del nucleo, que es
+     * donde les toca.
+     * \~ */
+    if (h.queued >= cfg_.max_queued) return;
 
     /* \~english
      * The buffer is taken HERE, when there is a reason to read, and not when
-     * the connection arrived.  That is R1: an idle connection is a record in
-     * an array and a socket, and the buffer it would have been given is
-     * serving somebody who is actually talking.
+     * the connection arrived.  That is R1.  Not getting one is not a failure
+     * either: the connection does not read this time round, its deadline is
+     * still armed, and TCP slows the peer down by itself.
      * \~spanish
      * El buffer se coge AQUI, cuando hay razon para leer, y no cuando llego la
-     * conexion.  Eso es la R1: una conexion parada es un registro de un array y
-     * un socket, y el buffer que se le habria dado esta sirviendo a alguien que
-     * si esta hablando.
+     * conexion.  Eso es la R1.  Y que no haya tampoco es un fallo: la conexion
+     * no lee esta vuelta, su plazo sigue armado, y TCP frena al otro extremo el
+     * solo.
      * \~ */
-    if (h->buffer == kNoBuffer) {
-        h->buffer = pool_.acquire();
-
-        /* \~english
-         * No buffer is not a failure.  The connection stays idle and does not
-         * read this time round; the bytes wait in the kernel's receive queue,
-         * which is a place designed to hold them, and TCP slows the peer down
-         * by itself.  Its deadline is still armed, so a connection that never
-         * gets a turn still goes away rather than sitting there forever.
-         * \~spanish
-         * Que no haya buffer no es un fallo.  La conexion se queda parada y no
-         * lee esta vuelta; los bytes esperan en la cola de recepcion del nucleo,
-         * que es un sitio hecho para guardarlos, y TCP frena al otro extremo el
-         * solo.  Su plazo sigue armado, asi que una conexion a la que no le
-         * toque nunca se va igual en vez de quedarse ahi para siempre.
-         * \~ */
-        if (h->buffer == kNoBuffer) return false;
-    }
+    const uint32_t b = pool_.acquire();
+    if (b == kNoBuffer) return;
 
     Op op;
     op.conn = c;
     op.kind = OpKind::Recv;
-    op.buffer = h->buffer;
+    op.buffer = b;
     op.offset = 0;
     op.length = cfg_.read_size;
 
     if (!io_->submit(op)) {
-        pool_.release(h->buffer);
-        h->buffer = kNoBuffer;
-        return false;
+        pool_.release(b);
+        return;
     }
 
-    set_state(*h, ConnState::Reading);
+    h.flags |= kReadPending;
+}
+
+bool Shard::want_write(ConnHandle c, ConnHot &h, uint32_t buf) noexcept {
+    /* \~english
+     * Straight out when nothing is going and nothing is waiting.  Otherwise
+     * it goes to the BACK of the queue -- answers leave in the order they were
+     * made, which is not a nicety: a response that overtook the one before it
+     * would be a response to the wrong request.
+     * \~spanish
+     * Sale directa cuando no va nada ni espera nada.  Si no, va al FINAL de la
+     * cola -- las respuestas salen en el orden en que se hicieron, y eso no es
+     * un detalle: una respuesta que adelantara a la anterior seria la respuesta
+     * a la peticion equivocada.
+     * \~ */
+    if ((h.flags & kWritePending) == 0 && h.queue == kNoBuffer) {
+        Buffer *out = pool_.at(buf);
+        if (out == nullptr) return false;
+
+        Op op;
+        op.conn = c;
+        op.kind = OpKind::Send;
+        op.buffer = buf;
+        op.offset = 0;
+        op.length = static_cast<uint32_t>(out->size());
+
+        if (!io_->submit(op)) return false;
+
+        h.flags |= kWritePending;
+        return true;
+    }
+
+    queue_next_[buf] = kNoBuffer;
+
+    if (h.queue == kNoBuffer) {
+        h.queue = buf;
+    } else {
+        uint32_t at = h.queue;
+        while (queue_next_[at] != kNoBuffer) at = queue_next_[at];
+        queue_next_[at] = buf;
+    }
+
+    ++h.queued;
     return true;
 }
 
+void Shard::send_next(ConnHandle c, ConnHot &h) noexcept {
+    if ((h.flags & kWritePending) != 0 || h.queue == kNoBuffer) return;
+
+    const uint32_t buf = h.queue;
+    h.queue = queue_next_[buf];
+    queue_next_[buf] = kNoBuffer;
+    if (h.queued != 0) --h.queued;
+
+    Buffer *out = pool_.at(buf);
+    if (out == nullptr) {
+        pool_.release(buf);
+        return;
+    }
+
+    Op op;
+    op.conn = c;
+    op.kind = OpKind::Send;
+    op.buffer = buf;
+    op.offset = 0;
+    op.length = static_cast<uint32_t>(out->size());
+
+    if (!io_->submit(op)) {
+        pool_.release(buf);
+        return;
+    }
+
+    h.flags |= kWritePending;
+}
+
 ConnHandle Shard::adopt(int32_t fd, uint64_t now) noexcept {
+    (void)now;
+
     const ConnHandle c = conns_.open(fd, now);
     if (!c.valid()) return c;
 
     ConnHot *h = conns_.hot(c);
-    h->buffer = kNoBuffer;
-    set_state(*h, ConnState::Idle);
+    h->queue = kNoBuffer;
+    h->queued = 0;
+    h->flags = 0;
 
     /* \~english
      * The deadline is armed by the SLOT and not by the handle, and that is
-     * safe for one reason: arming a slot that is already armed replaces what
-     * was there.  So a slot handed to a new connection cannot still be
-     * carrying the previous one's deadline -- the arming here is what
-     * overwrites it.  Where the two must not be confused is when a deadline
-     * FIRES, and there the index is turned back into a handle by asking the
-     * table, so the life is read rather than assumed.
+     * safe because arming a slot that is already armed replaces what was
+     * there.  Where the two must not be confused is when a deadline FIRES, and
+     * there the index is turned back into a handle by asking the table.
      * \~spanish
-     * El plazo se arma por la CASILLA y no por la referencia, y eso es seguro
-     * por una razon: armar una casilla que ya esta armada sustituye lo que
-     * hubiera.  Asi que una casilla entregada a una conexion nueva no puede
-     * seguir llevando el plazo de la anterior -- armarla aqui es lo que lo pisa.
-     * Donde no se pueden confundir las dos cosas es cuando un plazo VENCE, y
-     * ahi el indice se convierte otra vez en referencia preguntandole a la
-     * tabla, asi que la vida se lee en vez de suponerse.
+     * El plazo se arma por la CASILLA y no por la referencia, y es seguro porque
+     * armar una casilla ya armada sustituye lo que hubiera.  Donde no se pueden
+     * confundir es cuando un plazo VENCE, y ahi el indice se convierte otra vez
+     * en referencia preguntandole a la tabla.
      * \~ */
     wheel_.arm(c.slot, cfg_.idle_ticks);
 
     service_->on_open(c);
-    start_read(c, now);
+    want_read(c, *h);
     return c;
 }
 
@@ -207,74 +257,76 @@ void Shard::close(ConnHandle c) noexcept {
     ConnHot *h = conns_.hot(c);
     if (h == nullptr) return;
 
-    /* \~english
-     * A connection with an operation still in the operating system does not
-     * leave now.  Its buffer is the kernel's until the completion comes back,
-     * and giving it to the pool before then is a use-after-free the kernel
-     * performs -- into memory that by then belongs to somebody else.  So the
-     * connection is marked and the completion finishes the job.
-     * \~spanish
-     * Una conexion con una operacion todavia en el sistema operativo no se va
-     * ahora.  Su buffer es del nucleo hasta que vuelva la finalizacion, y darlo
-     * al pozo antes es un uso despues de liberar que hace el nucleo -- sobre una
-     * memoria que para entonces es de otro --.  Asi que la conexion se marca y
-     * la finalizacion acaba el trabajo.
-     * \~ */
-    if (busy(*h)) {
-        set_state(*h, ConnState::Closing);
-        return;
-    }
+    h->flags |= kClosing;
 
-    let_go(c, *h);
+    /* \~english
+     * Everything that is only WAITING goes back now -- those buffers are this
+     * shard's and holding them would be holding them for nobody.  What is with
+     * the operating system stays with it: giving that back is a use-after-free
+     * the kernel performs, into memory that by then belongs to somebody else.
+     * \~spanish
+     * Todo lo que solo ESTA ESPERANDO vuelve ahora -- esos buffers son de este
+     * fragmento y guardarlos seria guardarlos para nadie --.  Lo que esta en el
+     * sistema operativo se queda con el: devolver eso es un uso despues de
+     * liberar que hace el nucleo, sobre una memoria que para entonces es de
+     * otro.
+     * \~ */
+    drop_queue(*h);
+    leave_if_done(c, *h);
 }
 
-void Shard::on_read(const Completion &done, uint64_t now) noexcept {
+void Shard::on_read(const Completion &done) noexcept {
     ConnHot *h = conns_.hot(done.conn);
 
     /* \~english
      * A completion for a connection that is no longer this one.  With the
-     * closing rule above it should not happen -- a connection with an
-     * operation outstanding keeps its slot -- so reaching here means something
-     * released a slot it did not own.  The buffer is given back anyway,
-     * because a pool that leaked one buffer per occurrence would end up empty
-     * and the server would stop reading, which is a symptom nobody could trace
-     * back to here.
+     * closing rule it should not happen, so reaching here means something
+     * released a slot it did not own -- and the buffer is given back anyway,
+     * because a pool that leaked one per occurrence would end up empty and the
+     * server would stop reading, which is a symptom nobody could trace back to
+     * here.
      * \~spanish
      * Una finalizacion de una conexion que ya no es esta.  Con la regla de
-     * cierre de arriba no deberia pasar -- una conexion con una operacion
-     * pendiente se queda su casilla -- asi que llegar aqui quiere decir que algo
-     * solto una casilla que no era suya.  El buffer se devuelve igual, porque un
-     * pozo que perdiera un buffer por vez acabaria vacio y el servidor dejaria
-     * de leer, que es un sintoma que nadie podria rastrear hasta aqui.
+     * cierre no deberia pasar, asi que llegar aqui quiere decir que algo solto
+     * una casilla que no era suya -- y el buffer se devuelve igual, porque un
+     * pozo que perdiera uno por vez acabaria vacio y el servidor dejaria de
+     * leer, que es un sintoma que nadie podria rastrear hasta aqui.
      * \~ */
     if (h == nullptr) {
         if (done.buffer != kNoBuffer) pool_.release(done.buffer);
         return;
     }
 
-    if (is_state(*h, ConnState::Closing)) {
-        let_go(done.conn, *h);
+    h->flags &= static_cast<uint16_t>(~kReadPending);
+
+    if (closing(*h)) {
+        pool_.release(done.buffer);
+        leave_if_done(done.conn, *h);
         return;
     }
 
-    set_state(*h, ConnState::Idle);
-
     /* \~english
-     * A failure or the peer closing its end, and neither is an error worth
-     * telling anybody about: one is the network and the other is a client that
-     * has finished.  What they have in common is that there is nothing more to
-     * read.
+     * A failure or the peer closing its end.  Neither is an error worth
+     * telling anybody about -- one is the network and the other is a client
+     * that has finished -- and what they have in common is that there is
+     * nothing more to read.  What is already queued still goes out, which is
+     * why this closes rather than letting go: a client that sent its last
+     * request and shut its sending half is owed the answer.
      * \~spanish
-     * Un fallo o el otro extremo cerrando su lado, y ninguno es un error del que
-     * contarle nada a nadie: uno es la red y el otro es un cliente que ha
-     * acabado.  Lo que tienen en comun es que ya no hay nada mas que leer.
+     * Un fallo o el otro extremo cerrando su lado.  Ninguno es un error del que
+     * contarle nada a nadie -- uno es la red y el otro un cliente que ha acabado
+     * -- y lo que tienen en comun es que ya no hay nada mas que leer.  Lo que ya
+     * este encolado sale igual, que es la razon de que esto cierre en vez de
+     * soltar: a un cliente que mando su ultima peticion y cerro su mitad de
+     * enviar se le debe la respuesta.
      * \~ */
     if (!done.ok() || done.eof()) {
+        pool_.release(done.buffer);
         close(done.conn);
         return;
     }
 
-    Buffer *in = pool_.at(h->buffer);
+    Buffer *in = pool_.at(done.buffer);
     if (in == nullptr) {
         close(done.conn);
         return;
@@ -285,7 +337,7 @@ void Shard::on_read(const Completion &done, uint64_t now) noexcept {
      * the loop does -- which is why the wheel was built so that doing it is an
      * unlink and a push rather than a search.
      * \~spanish
-     * La actividad empuja el plazo mas lejos, y esto es lo que mas veces hace el
+     * La actividad empuja el plazo mas lejos, y es lo que mas veces hace el
      * bucle -- que es la razon de que la rueda se hiciera para que hacerlo sea
      * un desenlace y un meter en una lista, y no una busqueda.
      * \~ */
@@ -295,29 +347,21 @@ void Shard::on_read(const Completion &done, uint64_t now) noexcept {
     if (cold != nullptr) cold->bytes_in += static_cast<uint64_t>(done.result);
 
     /* \~english
-     * A second buffer for the answer, so a connection that is answering holds
-     * TWO of them.  It is the pool's real high-water mark and it is worth
-     * knowing: the number to size the pool by is not how many connections talk
-     * at once, it is how many are mid-exchange.
-     *
-     * Not getting one closes the connection rather than holding the request.
-     * That is the shard at its limit saying so: keeping it would mean a
-     * request that is never answered and a peer that waits for a response
-     * until its own timeout, which is a worse way to be told the same thing.
-     *
+     * A second buffer for the answer, so a connection mid-exchange holds two.
+     * Not getting one closes the connection rather than holding the request:
+     * keeping it would mean a request that is never answered and a peer that
+     * waits until its own timeout, which is a worse way to be told the same
+     * thing.
      * \~spanish
-     * Un segundo buffer para la respuesta, asi que una conexion que esta
-     * contestando tiene DOS.  Es el pico de verdad del pozo y merece saberse: el
-     * numero por el que dimensionarlo no es cuantas conexiones hablan a la vez,
-     * es cuantas estan a mitad de intercambio.
-     *
-     * No conseguirlo cierra la conexion en vez de retener la peticion.  Es el
-     * fragmento en su limite diciendolo: quedarsela seria una peticion que no se
-     * contesta nunca y un extremo que espera una respuesta hasta su propio
-     * plazo, que es una forma peor de que le digan lo mismo.
+     * Un segundo buffer para la respuesta, asi que una conexion a mitad de
+     * intercambio tiene dos.  No conseguirlo cierra la conexion en vez de
+     * retener la peticion: quedarsela seria una peticion que no se contesta
+     * nunca y un extremo que espera hasta su propio plazo, que es una forma peor
+     * de que le digan lo mismo.
      * \~ */
     const uint32_t wb = pool_.acquire();
     if (wb == kNoBuffer) {
+        pool_.release(done.buffer);
         close(done.conn);
         return;
     }
@@ -328,66 +372,61 @@ void Shard::on_read(const Completion &done, uint64_t now) noexcept {
 
     /* \~english
      * The read buffer goes back now, whatever happens next.  What the service
-     * wanted from it, it has taken -- and holding it through the write would
-     * be holding a buffer for a connection that is not reading, which is the
-     * thing R1 is about.
+     * wanted from it, it has taken.
      * \~spanish
      * El buffer de lectura vuelve ahora, pase lo que pase despues.  Lo que
-     * quisiera el servicio de el ya lo ha cogido -- y guardarlo durante la
-     * escritura seria tener un buffer para una conexion que no esta leyendo, que
-     * es de lo que va la R1.
+     * quisiera el servicio de el ya lo ha cogido.
      * \~ */
-    pool_.release(h->buffer);
-    h->buffer = kNoBuffer;
+    const bool empty = out->empty();
+    pool_.release(done.buffer);
 
-    if (!keep || out->empty()) {
-        pool_.release(wb);
-        if (!keep) {
-            close(done.conn);
-            return;
-        }
-        start_read(done.conn, now);
-        return;
-    }
-
-    Op op;
-    op.conn = done.conn;
-    op.kind = OpKind::Send;
-    op.buffer = wb;
-    op.offset = 0;
-    op.length = static_cast<uint32_t>(out->size());
-
-    if (!io_->submit(op)) {
+    if (!keep) {
         pool_.release(wb);
         close(done.conn);
         return;
     }
 
-    h->buffer = wb;
-    set_state(*h, ConnState::Writing);
+    if (empty) {
+        pool_.release(wb);
+    } else if (!want_write(done.conn, *h, wb)) {
+        pool_.release(wb);
+        close(done.conn);
+        return;
+    }
+
+    /* \~english
+     * And straight back to reading, WITHOUT waiting for the answer to go out.
+     * That is the whole of what having two directions buys: a peer sending its
+     * next request while this one is being answered is not made to wait for
+     * the answer it has not asked for yet.
+     * \~spanish
+     * Y de vuelta a leer, SIN esperar a que salga la respuesta.  Eso es todo lo
+     * que compra tener dos sentidos: a un extremo que manda su peticion
+     * siguiente mientras se contesta esta no se le hace esperar por una respuesta
+     * que todavia no ha pedido.
+     * \~ */
+    want_read(done.conn, *h);
 }
 
-void Shard::on_write(const Completion &done, uint64_t now) noexcept {
+void Shard::on_write(const Completion &done) noexcept {
     ConnHot *h = conns_.hot(done.conn);
     if (h == nullptr) {
         if (done.buffer != kNoBuffer) pool_.release(done.buffer);
         return;
     }
 
-    if (is_state(*h, ConnState::Closing)) {
-        let_go(done.conn, *h);
-        return;
-    }
-
-    set_state(*h, ConnState::Idle);
-
-    if (!done.ok()) {
-        close(done.conn);
-        return;
-    }
+    h->flags &= static_cast<uint16_t>(~kWritePending);
 
     Buffer *out = pool_.at(done.buffer);
-    if (out == nullptr) {
+
+    if (closing(*h)) {
+        pool_.release(done.buffer);
+        leave_if_done(done.conn, *h);
+        return;
+    }
+
+    if (!done.ok() || out == nullptr) {
+        pool_.release(done.buffer);
         close(done.conn);
         return;
     }
@@ -397,25 +436,20 @@ void Shard::on_write(const Completion &done, uint64_t now) noexcept {
 
     /* \~english
      * What went out is consumed, so what is left is simply what is still in
-     * the buffer.  The alternative -- remembering how far a response had got
-     * -- would be a number kept beside the buffer that says the same thing the
-     * buffer already knows, and two of those disagree.
+     * the buffer.  Remembering how far a response had got would be a number
+     * beside the buffer that says what the buffer already knows, and two of
+     * those disagree.
      *
      * Consuming here is safe because the operation has COME BACK: the buffer
-     * stopped being the kernel's the moment this completion arrived.  Doing it
-     * while the write was outstanding would be moving memory the kernel is
-     * reading from.
+     * stopped being the kernel's the moment this completion arrived.
      *
      * \~spanish
-     * Lo que salio se consume, asi que lo que queda es sencillamente lo que
-     * sigue en el buffer.  La alternativa -- acordarse de por donde iba una
-     * respuesta -- seria un numero guardado al lado del buffer que dice lo mismo
-     * que el buffer ya sabe, y dos de esos discrepan.
+     * Lo que salio se consume, asi que lo que queda es lo que sigue en el
+     * buffer.  Acordarse de por donde iba una respuesta seria un numero al lado
+     * del buffer que dice lo que el buffer ya sabe, y dos de esos discrepan.
      *
      * Consumir aqui es seguro porque la operacion ha VUELTO: el buffer dejo de
-     * ser del nucleo en el momento en que llego esta finalizacion.  Hacerlo
-     * mientras la escritura estaba pendiente seria mover una memoria de la que
-     * el nucleo esta leyendo.
+     * ser del nucleo en el momento en que llego esta finalizacion.
      * \~ */
     out->consume(static_cast<size_t>(done.result));
 
@@ -428,22 +462,33 @@ void Shard::on_write(const Completion &done, uint64_t now) noexcept {
         op.length = static_cast<uint32_t>(out->size());
 
         if (!io_->submit(op)) {
+            pool_.release(done.buffer);
             close(done.conn);
             return;
         }
 
-        set_state(*h, ConnState::Writing);
+        h->flags |= kWritePending;
         return;
     }
 
     pool_.release(done.buffer);
-    h->buffer = kNoBuffer;
-
     wheel_.arm(done.conn.slot, cfg_.idle_ticks);
-    start_read(done.conn, now);
+
+    /* \~english
+     * The next answer goes out, and reading starts again -- room in the queue
+     * has just appeared, so a connection that was being held back for sending
+     * faster than it reads is let go of here.
+     * \~spanish
+     * Sale la respuesta siguiente, y se vuelve a leer -- acaba de aparecer sitio
+     * en la cola, asi que una conexion a la que se estaba frenando por mandar
+     * mas deprisa de lo que lee se suelta aqui.
+     * \~ */
+    send_next(done.conn, *h);
+    want_read(done.conn, *h);
 }
 
 size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
+    (void)now;
     if (io_ == nullptr) return 0;
 
     Completion done[64];
@@ -456,12 +501,12 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
         switch (done[i].kind) {
         case OpKind::Recv:
         case OpKind::RecvFrom:
-            on_read(done[i], now);
+            on_read(done[i]);
             break;
 
         case OpKind::Send:
         case OpKind::SendTo:
-            on_write(done[i], now);
+            on_write(done[i]);
             break;
 
         case OpKind::Accept:
@@ -485,22 +530,11 @@ size_t Shard::expire(uint64_t now) noexcept {
          * and never guessed.  A deadline armed for a connection that has since
          * gone names a slot somebody else may be in -- and closing that one
          * would be disconnecting a client for another client's silence.
-         *
-         * It cannot happen here, because closing a connection cancels its
-         * deadline and arming replaces what was there.  Going through the
-         * table anyway costs one comparison and means the property does not
-         * depend on both of those staying true.
-         *
          * \~spanish
          * El indice se convierte en referencia preguntandole a la tabla, asi que
-         * la vida se lee y no se adivina nunca.  Un plazo armado por una conexion
-         * que ya se fue nombra una casilla en la que puede estar otro -- y
-         * cerrar a ese seria desconectar a un cliente por el silencio de otro.
-         *
-         * Aqui no puede pasar, porque cerrar una conexion cancela su plazo y
-         * armar sustituye lo que hubiera.  Pasar por la tabla igualmente cuesta
-         * una comparacion y quiere decir que la propiedad no depende de que esas
-         * dos cosas sigan siendo ciertas.
+         * la vida se lee y no se adivina.  Un plazo armado por una conexion que
+         * ya se fue nombra una casilla en la que puede estar otro -- y cerrar a
+         * ese seria desconectar a un cliente por el silencio de otro.
          * \~ */
         const ConnHandle c = conns_.at(slot);
         if (!c.valid()) continue;

@@ -195,12 +195,37 @@ struct ConnHot {
      */
     uint32_t life;
 
-    /// \~english Which buffer it borrowed, or @c kNoBuffer.
-    /// \~spanish Que buffer tomo prestado, o @c kNoBuffer.  \~
-    uint32_t buffer;
+    /**
+     * \~english
+     * The first answer waiting to go out, or @c kNoBuffer.  A connection may
+     * have a write with the operating system AND more answers ready behind it,
+     * because reading and writing are independent directions and the loop does
+     * both at once -- so there has to be somewhere for the second answer to
+     * wait that is not "hold up the read that produced it".
+     *
+     * The rest of the queue is threaded through an array beside the buffers,
+     * so a queue of any depth is still this one field.
+     *
+     * \~spanish
+     * La primera respuesta que espera para salir, o @c kNoBuffer.  Una conexion
+     * puede tener una escritura en el sistema operativo Y mas respuestas listas
+     * detras, porque leer y escribir son sentidos independientes y el bucle hace
+     * los dos a la vez -- asi que la segunda respuesta tiene que tener donde
+     * esperar que no sea "retener la lectura que la produjo".
+     *
+     * El resto de la cola va enhebrado en un array al lado de los buffers, asi
+     * que una cola de cualquier profundidad sigue siendo este unico campo.
+     * \~
+     */
+    uint32_t queue;
 
-    uint16_t state;
+    /// \~english What is outstanding and whether it is ending; see @c ConnFlag.
+    /// \~spanish Que hay pendiente y si se esta acabando; ver @c ConnFlag.  \~
     uint16_t flags;
+
+    /// \~english How many answers are waiting behind the one going out.
+    /// \~spanish Cuantas respuestas esperan detras de la que esta saliendo.  \~
+    uint16_t queued;
 };
 
 static_assert(sizeof(ConnHot) == 16, "the hot record is meant to be sixteen bytes");

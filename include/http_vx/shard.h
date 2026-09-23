@@ -94,32 +94,51 @@ namespace http_vx {
  *
  * \~
  */
-enum class ConnState : uint16_t {
-    /// \~english Nothing is outstanding and nothing is owed.
-    /// \~spanish No hay nada pendiente y no se debe nada.  \~
-    Idle,
+enum ConnFlag : uint16_t {
+    /**
+     * \~english
+     * A read is with the operating system.  At most ONE, and that is not a
+     * limitation: two reads outstanding on the same stream socket complete in
+     * whatever order the kernel finishes them, so the bytes would arrive in
+     * two buffers with no way to say which came first.  A stream that can be
+     * reordered is not a stream.
+     * \~spanish
+     * Hay una lectura en el sistema operativo.  Como mucho UNA, y eso no es una
+     * limitacion: dos lecturas pendientes sobre el mismo socket de flujo acaban
+     * en el orden en que las termine el nucleo, asi que los bytes llegarian en
+     * dos buffers sin forma de decir cual iba antes.  Un flujo que se puede
+     * desordenar no es un flujo.
+     * \~
+     */
+    kReadPending = 1,
 
-    /// \~english A read is with the operating system.
-    /// \~spanish Hay una lectura en el sistema operativo.  \~
-    Reading,
-
-    /// \~english A write is with the operating system.
-    /// \~spanish Hay una escritura en el sistema operativo.  \~
-    Writing,
+    /**
+     * \~english
+     * A write is with the operating system.  Also at most one, for the same
+     * reason read the other way round: two writes would interleave on the
+     * wire.  What there may be more of is answers WAITING, and those go in the
+     * queue.
+     * \~spanish
+     * Hay una escritura en el sistema operativo.  Tambien como mucho una, por lo
+     * mismo leido al reves: dos escrituras se entrelazarian en el cable.  De lo
+     * que si puede haber mas es de respuestas ESPERANDO, y esas van en la cola.
+     * \~
+     */
+    kWritePending = 2,
 
     /**
      * \~english
      * It is over, and the loop is waiting for what the operating system still
      * holds.  A connection does not leave until its outstanding operations
-     * come back, because until then its buffer is not this shard's to give
+     * come back, because until then their buffers are not this shard's to give
      * away.
      * \~spanish
      * Se acabo, y el bucle espera lo que todavia tiene el sistema operativo.
      * Una conexion no se va hasta que vuelvan sus operaciones pendientes,
-     * porque hasta entonces su buffer no es de este fragmento para darlo.
+     * porque hasta entonces sus buffers no son de este fragmento para darlos.
      * \~
      */
-    Closing,
+    kClosing = 4,
 };
 
 /**
@@ -223,6 +242,30 @@ struct ShardConfig {
     /// \~english How much to ask for in one read.
     /// \~spanish Cuanto pedir en una lectura.  \~
     uint32_t read_size = 16384;
+
+    /**
+     * \~english
+     * How many answers may wait behind the one going out before the loop
+     * stops reading from that connection.
+     *
+     * It is flow control and not a limit on the protocol: a peer that keeps
+     * sending requests without reading the answers is a peer making this
+     * server hold its output, and the answer is to stop taking more in.  The
+     * bytes wait in the kernel's receive queue, which is where they belong,
+     * and reading starts again as soon as an answer goes out.
+     *
+     * \~spanish
+     * Cuantas respuestas pueden esperar detras de la que esta saliendo antes de
+     * que el bucle deje de leer de esa conexion.
+     *
+     * Es control de flujo y no un limite del protocolo: un extremo que siga
+     * mandando peticiones sin leer las respuestas es un extremo haciendo que
+     * este servidor le guarde su salida, y la respuesta es dejar de aceptar mas.
+     * Los bytes esperan en la cola de recepcion del nucleo, que es donde les
+     * toca, y se vuelve a leer en cuanto salga una respuesta.
+     * \~
+     */
+    uint16_t max_queued = 8;
 
     /// \~english How many completions to take at once.
     /// \~spanish Cuantas finalizaciones coger de una vez.  \~
@@ -347,20 +390,53 @@ class Shard {
     void release() noexcept;
 
   private:
-    /// \~english Gets a buffer and asks for a read.
-    /// \~spanish Consigue un buffer y pide una lectura.  \~
-    bool start_read(ConnHandle c, uint64_t now) noexcept;
+    /// \~english Gets a buffer and asks for a read, if one is wanted.
+    /// \~spanish Consigue un buffer y pide una lectura, si hace falta.  \~
+    void want_read(ConnHandle c, ConnHot &h) noexcept;
 
-    /// \~english Lets go of whatever @p h is holding.
-    /// \~spanish Suelta lo que sea que tenga @p h.  \~
+    /// \~english Sends @p buffer, or queues it behind what is already going.
+    /// \~spanish Manda @p buffer, o lo encola detras de lo que ya va.  \~
+    bool want_write(ConnHandle c, ConnHot &h, uint32_t buf) noexcept;
+
+    /// \~english Sends the next queued answer, if there is one.
+    /// \~spanish Manda la respuesta encolada siguiente, si hay.  \~
+    void send_next(ConnHandle c, ConnHot &h) noexcept;
+
+    /// \~english Gives back every answer that was still waiting.
+    /// \~spanish Devuelve todas las respuestas que seguian esperando.  \~
+    void drop_queue(ConnHot &h) noexcept;
+
+    /// \~english Lets go of everything @p h has.
+    /// \~spanish Suelta todo lo que tiene @p h.  \~
     void let_go(ConnHandle c, ConnHot &h) noexcept;
 
-    void on_read(const Completion &done, uint64_t now) noexcept;
-    void on_write(const Completion &done, uint64_t now) noexcept;
+    /// \~english Finishes leaving, if nothing is outstanding any more.
+    /// \~spanish Acaba de irse, si ya no queda nada pendiente.  \~
+    bool leave_if_done(ConnHandle c, ConnHot &h) noexcept;
+
+    void on_read(const Completion &done) noexcept;
+    void on_write(const Completion &done) noexcept;
 
     ConnTable conns_;
     BufferPool pool_;
     TimerWheel wheel_;
+
+    /**
+     * \~english
+     * The queued answers, threaded through an array indexed by buffer.  One
+     * entry per buffer in the pool and not one per connection, because a
+     * buffer is in exactly one connection's queue or in none -- so the whole
+     * of every queue on the shard fits in the same four bytes per buffer,
+     * with nothing allocated when an answer is queued.
+     * \~spanish
+     * Las respuestas encoladas, enhebradas en un array indexado por buffer.  Una
+     * entrada por buffer del pozo y no una por conexion, porque un buffer esta
+     * en la cola de exactamente una conexion o en ninguna -- asi que todas las
+     * colas del fragmento caben en los mismos cuatro bytes por buffer, y no se
+     * reserva nada al encolar una respuesta.
+     * \~
+     */
+    uint32_t *queue_next_ = nullptr;
 
     Backend *io_ = nullptr;
     Service *service_ = nullptr;

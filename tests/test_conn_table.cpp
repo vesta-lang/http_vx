@@ -83,8 +83,10 @@ void test_the_ordinary_life_of_a_slot() {
     ConnHot *hot = t.hot(h);
     check(hot != nullptr, "the hot record is not there");
     check(hot != nullptr && hot->fd == 42, "the socket is not the one given");
-    check(hot != nullptr && hot->buffer == kNoBuffer,
-          "an idle connection was given a buffer");
+    check(hot != nullptr && hot->queue == kNoBuffer,
+          "a new connection already has answers queued");
+    check(hot != nullptr && hot->flags == 0,
+          "a new connection already has something outstanding");
 
     ConnCold *cold = t.cold(h);
     check(cold != nullptr, "the cold record is not there");

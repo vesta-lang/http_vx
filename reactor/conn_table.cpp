@@ -102,9 +102,9 @@ bool ConnTable::reset(uint32_t capacity) noexcept {
     for (uint32_t i = 0; i < capacity_; ++i) {
         hot_[i].fd = -1;
         hot_[i].life = 1;
-        hot_[i].buffer = kNoBuffer;
-        hot_[i].state = 0;
+        hot_[i].queue = kNoBuffer;
         hot_[i].flags = 0;
+        hot_[i].queued = 0;
 
         next_free_[i] = i + 1 == capacity_ ? kNoSlot : i + 1;
     }
@@ -123,9 +123,9 @@ ConnHandle ConnTable::open(int32_t fd, uint64_t opened) noexcept {
 
     ConnHot &h = hot_[slot];
     h.fd = fd;
-    h.buffer = kNoBuffer;
-    h.state = 0;
+    h.queue = kNoBuffer;
     h.flags = 0;
+    h.queued = 0;
 
     /* \~english
      * The cold half is cleared here, where it costs one write of sixty-four
@@ -156,9 +156,9 @@ bool ConnTable::close(ConnHandle h) noexcept {
 
     ConnHot &slot = hot_[h.slot];
     slot.fd = -1;
-    slot.buffer = kNoBuffer;
-    slot.state = 0;
+    slot.queue = kNoBuffer;
     slot.flags = 0;
+    slot.queued = 0;
 
     /* \~english
      * The life goes up HERE, which is the single line the whole file is about.
