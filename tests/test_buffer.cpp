@@ -80,6 +80,122 @@ void fill(http_vx::Buffer &b, size_t n, uint8_t seed = 0) {
 
 /**
  * @brief
+ * \~english The view: where the bytes are, and where they are in the stream.
+ * \~spanish La vista: donde estan los bytes, y donde estan dentro del flujo.
+ * \~
+ *
+ * \~english
+ * @c has is checked at its edges and past both of them, because it is what
+ * stands between a stream position and a pointer.  A position before the
+ * origin names a byte that has already been dropped, and resolving one would
+ * produce a pointer BEFORE the buffer -- which is not a read of the wrong
+ * bytes, it is a read of somebody else's memory.
+ *
+ * \~spanish
+ * @c has se comprueba en sus extremos y pasados los dos, porque es lo que hay
+ * entre una posicion del flujo y un puntero.  Una posicion anterior al origen
+ * nombra un byte que ya se descarto, y resolverla produciria un puntero
+ * ANTERIOR al buffer -- que no es una lectura de los bytes equivocados, es una
+ * lectura de la memoria de otro.
+ *
+ * \~
+ */
+void test_view() {
+    const uint8_t bytes[] = "abcdefgh";
+    const http_vx::View v{bytes, 8, 1000};
+
+    check(v.end() == 1008, "the end is not the origin plus the size");
+    check(v.at(1000) == bytes, "the origin does not resolve to the first byte");
+    check(v.at(1007) == bytes + 7, "the last byte does not resolve to itself");
+
+    check(v.has(1000, 8), "the whole of it is not here");
+    check(v.has(1007, 1), "the last byte is not here");
+    check(v.has(1008, 0), "an empty piece at the end is not here");
+    check(!v.has(1000, 9), "one byte more than there is was reported here");
+    check(!v.has(1008, 1), "a byte past the end was reported here");
+
+    /* \~english
+     * And behind the origin, which is the case that matters: those bytes were
+     * dropped, and a check written as `at + len <= end` would say yes to them
+     * because the sum comes out small.
+     * \~spanish
+     * Y por detras del origen, que es el caso que importa: esos bytes se
+     * descartaron, y una comprobacion escrita como `at + len <= end` diria que
+     * si porque la suma sale pequena.
+     * \~ */
+    check(!v.has(999, 1), "a byte that was already dropped was reported here");
+    check(!v.has(0, 1), "the start of the connection was reported here");
+
+    /* \~english
+     * A length near the top of the range must not wrap the sum into saying
+     * yes.  It is the same trick the content length refuses, in the other
+     * direction.
+     * \~spanish
+     * Una longitud cerca del techo del rango no puede dar la vuelta a la suma
+     * para que diga que si.  Es el mismo truco que rechaza la longitud de
+     * contenido, en el otro sentido.
+     * \~ */
+    check(!v.has(1000, ~uint64_t{0}), "a length that wraps was reported here");
+
+    const http_vx::View empty{nullptr, 0, 0};
+    check(empty.end() == 0, "an empty view ends somewhere");
+    check(empty.has(0, 0), "nothing is not here");
+    check(!empty.has(0, 1), "something is here in an empty view");
+}
+
+/**
+ * @brief
+ * \~english The origin counts what was dropped, and only that.
+ * \~spanish El origen cuenta lo descartado, y solo eso.
+ * \~
+ */
+void test_origin() {
+    http_vx::Buffer b;
+    check(b.origin() == 0, "a fresh buffer has dropped something");
+
+    fill(b, 100);
+    check(b.origin() == 0, "arriving counted as dropping");
+    check(b.view().origin == 0, "the view disagrees with the buffer");
+
+    b.consume(40);
+    check(b.origin() == 40, "the origin did not follow the dropping");
+    check(b.view().origin == 40, "the view disagrees with the buffer");
+    check(b.view().end() == 100, "the view ends somewhere else");
+
+    /* \~english
+     * Asking to drop more than is here drops what is here, and the origin
+     * follows THAT.  Believing the number instead would put the origin ahead
+     * of bytes that never arrived, and every position behind it would name a
+     * byte that is not the one it meant.
+     * \~spanish
+     * Pedir que se descarte mas de lo que hay descarta lo que hay, y el origen
+     * sigue A ESO.  Creerse el numero pondria el origen por delante de bytes
+     * que no llegaron nunca, y toda posicion posterior nombraria un byte que no
+     * es el que queria decir.
+     * \~ */
+    b.consume(1000);
+    check(b.origin() == 100, "the origin followed a number instead of the bytes");
+    check(b.empty(), "something was left");
+
+    /* \~english
+     * Emptying it for the next message does NOT start the stream over: the
+     * connection carries on, and a position from before still means what it
+     * meant.  Giving the memory back does, because that is a connection
+     * ending.
+     * \~spanish
+     * Vaciarlo para el mensaje siguiente NO reinicia el flujo: la conexion
+     * sigue, y una posicion de antes significa lo mismo.  Devolver la memoria
+     * si, porque eso es una conexion que acaba.
+     * \~ */
+    b.clear();
+    check(b.origin() == 100, "emptying it started the connection over");
+
+    b.release();
+    check(b.origin() == 0, "giving the memory back kept the old stream");
+}
+
+/**
+ * @brief
  * \~english A fresh buffer owns nothing.
  * \~spanish Un buffer recien hecho no tiene nada.
  * \~
@@ -389,6 +505,8 @@ void test_ceiling() {
 } // namespace
 
 int main() {
+    test_view();
+    test_origin();
     test_empty();
     test_cycle();
     test_clamping();

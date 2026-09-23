@@ -111,7 +111,7 @@ Reading run(const Wire &w, const http_vx::h2::Limits &limits, bool preface,
     size_t given = step == 0 ? w.used : 0;
 
     for (;;) {
-        const ReadResult res = r.read(w.bytes, given);
+        const ReadResult res = r.read(http_vx::View{w.bytes, given, 0});
 
         if (res == ReadResult::Frame) {
             ++out.frames;
@@ -131,7 +131,7 @@ Reading run(const Wire &w, const http_vx::h2::Limits &limits, bool preface,
     }
 
     out.error = r.error();
-    out.consumed = r.consumed();
+    out.consumed = static_cast<size_t>(r.consumed());
     return out;
 }
 
@@ -438,7 +438,7 @@ void test_padding() {
 
         FrameReader r(limits);
         r.reset(0, true);
-        check(r.read(w.bytes, w.used) == ReadResult::Frame, "a padded frame was refused");
+        check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Frame, "a padded frame was refused");
         check(r.payload().len == 3, "the padding was counted as payload");
         check(std::memcmp(w.bytes + r.payload().off, "abc", 3) == 0,
               "the payload is not what was padded");
@@ -460,7 +460,7 @@ void test_padding() {
 
         FrameReader r(limits);
         r.reset(0, true);
-        check(r.read(w.bytes, w.used) == ReadResult::Frame,
+        check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Frame,
               "a frame that is all padding was refused");
         check(r.payload().len == 0, "a frame that is all padding has a payload");
     }
@@ -508,7 +508,7 @@ void test_padding() {
 
         FrameReader r(limits);
         r.reset(0, true);
-        check(r.read(w.bytes, w.used) == ReadResult::Frame,
+        check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Frame,
               "a padded HEADERS with priority was refused");
         check(r.payload().len == 2, "the priority bytes were counted as block");
         check(std::memcmp(w.bytes + r.payload().off, "xy", 2) == 0,
@@ -736,7 +736,7 @@ void test_boundary_stays_put() {
     FrameReader r(limits);
     r.reset(0, true);
 
-    check(r.read(w.bytes, w.used) == ReadResult::Frame, "the ping was not read");
+    check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Frame, "the ping was not read");
     check(r.consumed() == after_ping, "the boundary is not after the ping");
 
     /* \~english
@@ -747,7 +747,7 @@ void test_boundary_stays_put() {
      * ha entendido la cabecera y no puede terminar la trama.
      * \~ */
     const size_t partial = after_ping + http_vx::h2::kFrameHeaderSize + 2;
-    check(r.read(w.bytes, partial) == ReadResult::NeedMore,
+    check(r.read(http_vx::View{w.bytes, partial, 0}) == ReadResult::NeedMore,
           "half a frame was handed over");
     check(r.consumed() == after_ping,
           "the boundary moved into a frame that had not arrived");
@@ -759,7 +759,7 @@ void test_boundary_stays_put() {
      * Y el resto la termina sin volver a leer la cabecera del buffer -- se
      * entendio una vez y se guardo.
      * \~ */
-    check(r.read(w.bytes, w.used) == ReadResult::Frame,
+    check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Frame,
           "the frame did not finish when the rest arrived");
     check(r.consumed() == w.used, "the boundary is not at the end");
     check(r.payload().len == 5, "the payload is not the whole of it");
@@ -781,9 +781,9 @@ void test_sticky() {
 
     FrameReader r(limits);
     r.reset(0, true);
-    check(r.read(w.bytes, w.used) == ReadResult::Error, "it was not refused");
+    check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Error, "it was not refused");
     const ErrorCode first = r.error();
-    check(r.read(w.bytes, w.used) == ReadResult::Error,
+    check(r.read(http_vx::View{w.bytes, w.used, 0}) == ReadResult::Error,
           "calling again after a refusal changed the answer");
     check(r.error() == first, "the reason changed");
 }

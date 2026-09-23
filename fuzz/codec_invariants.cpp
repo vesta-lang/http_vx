@@ -103,7 +103,7 @@ Breach run(const uint8_t *data, size_t size, size_t step, Request &req,
              * estado que no avanzo, y la otra forma en que eso se manifiesta es
              * una conexion que espera una peticion que ya recibio.
              * \~ */
-            if (p.consumed() != given) return Breach::AskedForMoreWithInputLeft;
+            if (p.head_size() != given) return Breach::AskedForMoreWithInputLeft;
             if (given == size) break;
             continue;
         }
@@ -112,7 +112,7 @@ Breach run(const uint8_t *data, size_t size, size_t step, Request &req,
 
     out.result = r;
     out.error = p.error();
-    out.consumed = p.consumed();
+    out.consumed = p.head_size();
 
     if (out.consumed > size) return Breach::ConsumedPastTheEnd;
 
@@ -279,7 +279,7 @@ Breach run_body(const uint8_t *data, size_t size, size_t step,
     size_t last_end = 0;
 
     for (;;) {
-        const h1::ChunkResult res = r.read(data, given, trailers);
+        const h1::ChunkResult res = r.read(View{data, given, 0}, trailers);
 
         if (res == h1::ChunkResult::Data) {
             const Span s = r.chunk();
@@ -292,7 +292,16 @@ Breach run_body(const uint8_t *data, size_t size, size_t step,
         }
 
         if (res == h1::ChunkResult::NeedMore) {
-            if (r.consumed() != given) return Breach::AskedForMoreWithInputLeft;
+            /* \~english
+             * Against what it has LOOKED at and not against what it has
+             * finished: those part company once the trailers begin, and it is
+             * the reading that has to keep moving.
+             * \~spanish
+             * Contra lo que ha MIRADO y no contra lo que ha terminado: los dos
+             * se separan en cuanto empiezan los remolques, y es la lectura la
+             * que tiene que seguir avanzando.
+             * \~ */
+            if (r.position() != given) return Breach::AskedForMoreWithInputLeft;
             if (given == size) {
                 out.result = res;
                 break;
@@ -389,7 +398,7 @@ Breach run_frames(const uint8_t *data, size_t size, size_t step,
     size_t last_end = 0;
 
     for (;;) {
-        const h2::ReadResult res = r.read(data, given);
+        const h2::ReadResult res = r.read(View{data, given, 0});
 
         if (res == h2::ReadResult::Frame) {
             const Span s = r.payload();

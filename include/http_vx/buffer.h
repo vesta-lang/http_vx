@@ -76,6 +76,129 @@ namespace http_vx {
 
 /**
  * @brief
+ * \~english The bytes that are here, and where they are in the stream.
+ * \~spanish Los bytes que hay, y donde estan dentro del flujo.
+ * \~
+ *
+ * \~english
+ * Three numbers instead of two, and the third is the one that closes a hole.
+ *
+ * An offset from @c data survives growing and sliding, because both move
+ * @c data with them.  What it does not survive is DROPPING what is in front of
+ * it: after bytes are consumed, the same offset names a byte further along.
+ * That is fine while a message is read from start to finish and thrown away
+ * whole, and it is not fine for a body of a gigabyte -- which cannot be
+ * dropped as it is processed, so it stays in memory until the message ends.
+ *
+ * So a reader counts from the START OF THE CONNECTION instead, and @c origin
+ * says how many bytes have already been dropped.  A position measured that way
+ * survives all three, and there is nothing to adjust when bytes go -- which is
+ * the point: an adjustment that has to be remembered is an adjustment that is
+ * forgotten, and forgetting it is silent.
+ *
+ * | | grows | slides | drops |
+ * | :-- | :-- | :-- | :-- |
+ * | a pointer | dies | dies | dies |
+ * | an offset from @c data | lives | lives | **dies** |
+ * | a position in the stream | lives | lives | lives |
+ *
+ * The spans inside a message -- a field's name, a request's target -- stay
+ * offsets from @c data, because they are small, there are many of them, and
+ * they die with the message anyway.  What that costs is one rule: **the bytes
+ * of a message may not be dropped while anything still points into them.**
+ *
+ * \~spanish
+ * Tres numeros en vez de dos, y el tercero es el que cierra un hueco.
+ *
+ * Un desplazamiento desde @c data sobrevive a crecer y a deslizar, porque las
+ * dos cosas mueven @c data con ellas.  A lo que no sobrevive es a DESCARTAR lo
+ * que tiene delante: despues de consumir bytes, el mismo desplazamiento nombra
+ * un byte mas adelante.  Eso vale mientras un mensaje se lea de principio a fin
+ * y se tire entero, y no vale para un cuerpo de un gigabyte -- que no se puede
+ * ir descartando segun se procesa, asi que se queda en memoria hasta que
+ * termine el mensaje.
+ *
+ * Asi que un lector cuenta desde el PRINCIPIO DE LA CONEXION, y @c origin dice
+ * cuantos bytes se descartaron ya.  Una posicion medida asi sobrevive a las
+ * tres, y no hay nada que ajustar cuando se van bytes -- que es de lo que se
+ * trata: un ajuste que hay que acordarse de hacer es un ajuste que se olvida, y
+ * olvidarlo es mudo.
+ *
+ * | | crece | desliza | descarta |
+ * | :-- | :-- | :-- | :-- |
+ * | un puntero | muere | muere | muere |
+ * | un desplazamiento desde @c data | vive | vive | **muere** |
+ * | una posicion del flujo | vive | vive | vive |
+ *
+ * Los trozos de dentro de un mensaje -- el nombre de una cabecera, el destino
+ * de una peticion -- siguen siendo desplazamientos desde @c data, porque son
+ * pequenos, hay muchos y mueren con el mensaje de todas formas.  Lo que eso
+ * cuesta es una regla: **los bytes de un mensaje no se pueden descartar
+ * mientras algo siga apuntando dentro de ellos.**
+ *
+ * \~
+ */
+struct View {
+    /// \~english The first byte that is still here.
+    /// \~spanish El primer byte que sigue aqui.  \~
+    const uint8_t *data;
+    /// \~english How many there are.  \~spanish Cuantos hay.  \~
+    size_t size;
+    /**
+     * \~english
+     * Which byte of the connection @c data is.  Zero on a fresh one, and it
+     * only ever goes up.
+     * \~spanish
+     * Que byte de la conexion es @c data.  Cero en una recien hecha, y solo
+     * sube.
+     * \~
+     */
+    uint64_t origin;
+
+    /// \~english The stream position one past the last byte here.
+    /// \~spanish La posicion del flujo una detras del ultimo byte de aqui.  \~
+    uint64_t end() const noexcept { return origin + size; }
+
+    /**
+     * @brief
+     * \~english Whether @p len bytes from stream position @p at are here.
+     * \~spanish Si los @p len bytes desde la posicion @p at del flujo estan aqui.
+     * \~
+     *
+     * \~english
+     * Asked before resolving, always.  A position before @c origin names a
+     * byte that has already been dropped, and resolving it would produce a
+     * pointer BEFORE the buffer -- which is not a read of the wrong bytes, it
+     * is a read of somebody else's memory.
+     *
+     * \~spanish
+     * Se pregunta antes de resolver, siempre.  Una posicion anterior a
+     * @c origin nombra un byte que ya se descarto, y resolverla produciria un
+     * puntero ANTERIOR al buffer -- que no es una lectura de los bytes
+     * equivocados, es una lectura de la memoria de otro.
+     *
+     * \~
+     */
+    bool has(uint64_t at, uint64_t len) const noexcept {
+        return at >= origin && len <= end() - at;
+    }
+
+    /**
+     * @brief
+     * \~english Where stream position @p at is right now.
+     * \~spanish Donde esta ahora mismo la posicion @p at del flujo.
+     * \~
+     * @param at \~english the position  \~spanish la posicion  \~
+     * @return   \~english the pointer; only meaningful if @c has said so
+     *           \~spanish el puntero; solo significa algo si @c has lo dijo  \~
+     */
+    const uint8_t *at(uint64_t pos) const noexcept {
+        return data + (pos - origin);
+    }
+};
+
+/**
+ * @brief
  * \~english What the first allocation asks for.
  * \~spanish Lo que pide la primera reserva.
  * \~
@@ -162,6 +285,51 @@ class Buffer {
     bool empty() const noexcept { return head_ == tail_; }
     /// \~english How much memory it holds.  \~spanish Cuanta memoria tiene.  \~
     size_t capacity() const noexcept { return cap_; }
+
+    /**
+     * @brief
+     * \~english Which byte of the connection @c data is.
+     * \~spanish Que byte de la conexion es @c data.
+     * \~
+     *
+     * \~english
+     * It counts what has been dropped, so it only goes up, and it is what
+     * makes a position survive the dropping.  It is sixty-four bits because a
+     * connection that stays open carries more than four thousand million bytes
+     * without anything unusual happening -- and a counter that wrapped would
+     * put a reader's position behind the buffer.
+     *
+     * \~spanish
+     * Cuenta lo que se ha descartado, asi que solo sube, y es lo que hace que
+     * una posicion sobreviva al descarte.  Son sesenta y cuatro bits porque una
+     * conexion que se quede abierta lleva mas de cuatro mil millones de bytes
+     * sin que pase nada raro -- y un contador que diera la vuelta pondria la
+     * posicion de un lector por detras del buffer.
+     *
+     * \~
+     */
+    uint64_t origin() const noexcept { return origin_; }
+
+    /**
+     * @brief
+     * \~english The bytes that are here, and where they are in the stream.
+     * \~spanish Los bytes que hay, y donde estan dentro del flujo.
+     * \~
+     *
+     * \~english
+     * The three things a reader needs, taken from one object so they cannot
+     * disagree.  Handing them over separately would let a caller pass the
+     * pointer of one buffer and the origin of another, which is a mistake that
+     * compiles.
+     *
+     * \~spanish
+     * Las tres cosas que necesita un lector, sacadas de un objeto para que no
+     * puedan discrepar.  Entregarlas por separado dejaria pasar el puntero de
+     * un buffer y el origen de otro, que es una equivocacion que compila.
+     *
+     * \~
+     */
+    View view() const noexcept { return View{data(), size(), origin_}; }
 
     /**
      * @brief
@@ -331,6 +499,22 @@ class Buffer {
     size_t cap_ = 0;
     size_t head_ = 0;
     size_t tail_ = 0;
+
+    /**
+     * \~english
+     * How many bytes of the connection have been dropped.  It is not reset by
+     * @c clear, which empties the buffer for the NEXT message of the same
+     * connection: the stream carries on, and a position from before would be
+     * as valid as it ever was.  @c release does reset it, because that is a
+     * connection ending.
+     * \~spanish
+     * Cuantos bytes de la conexion se han descartado.  No lo reinicia
+     * @c clear, que vacia el buffer para el mensaje SIGUIENTE de la misma
+     * conexion: el flujo sigue, y una posicion de antes vale lo mismo que
+     * valia.  @c release si lo reinicia, porque eso es una conexion que acaba.
+     * \~
+     */
+    uint64_t origin_ = 0;
 };
 
 } // namespace http_vx

@@ -41,7 +41,7 @@ inline bool carries_header_block(uint8_t type) noexcept {
 
 } // namespace
 
-void FrameReader::reset(size_t start, bool preface) noexcept {
+void FrameReader::reset(uint64_t start, bool preface) noexcept {
     state_ = preface ? State::Preface : State::Header;
     error_ = ErrorCode::NoError;
     pos_ = start;
@@ -60,7 +60,7 @@ ReadResult FrameReader::fail(ErrorCode e) noexcept {
     return ReadResult::Error;
 }
 
-bool FrameReader::strip(const uint8_t *data, size_t &off,
+bool FrameReader::strip(const View &v, uint64_t &off,
                         size_t &len) noexcept {
     /* \~english
      * Every step here subtracts, and every subtraction is preceded by the
@@ -80,7 +80,7 @@ bool FrameReader::strip(const uint8_t *data, size_t &off,
 
     if (header_.has(kPadded)) {
         if (len < 1) return false;
-        pad = data[off];
+        pad = *v.at(off);
         ++off;
         --len;
     }
@@ -193,14 +193,14 @@ ErrorCode FrameReader::check_continuation() noexcept {
     return ErrorCode::NoError;
 }
 
-ReadResult FrameReader::read(const uint8_t *data, size_t size) noexcept {
+ReadResult FrameReader::read(const View &v) noexcept {
     if (state_ == State::Failed) return ReadResult::Error;
 
     for (;;) {
         switch (state_) {
 
         case State::Preface: {
-            const size_t have = size - pos_;
+            const uint64_t have = v.end() - pos_;
             if (have < sizeof(kClientPreface)) {
                 /* \~english
                  * What has arrived must still be the beginning of it.  A
@@ -216,14 +216,14 @@ ReadResult FrameReader::read(const uint8_t *data, size_t size) noexcept {
                  * importa: esos bytes podrian ser una peticion de HTTP/1.1 que
                  * otra parte de este servidor si podria haber contestado.
                  * \~ */
-                for (size_t i = 0; i < have; ++i)
-                    if (data[pos_ + i] != kClientPreface[i])
+                for (uint64_t i = 0; i < have; ++i)
+                    if (*v.at(pos_ + i) != kClientPreface[i])
                         return fail(ErrorCode::ProtocolError);
                 return ReadResult::NeedMore;
             }
 
-            for (size_t i = 0; i < sizeof(kClientPreface); ++i)
-                if (data[pos_ + i] != kClientPreface[i])
+            for (uint64_t i = 0; i < sizeof(kClientPreface); ++i)
+                if (*v.at(pos_ + i) != kClientPreface[i])
                     return fail(ErrorCode::ProtocolError);
 
             pos_ += sizeof(kClientPreface);
@@ -233,9 +233,9 @@ ReadResult FrameReader::read(const uint8_t *data, size_t size) noexcept {
         }
 
         case State::Header: {
-            if (size - pos_ < kFrameHeaderSize) return ReadResult::NeedMore;
+            if (v.end() - pos_ < kFrameHeaderSize) return ReadResult::NeedMore;
 
-            decode_frame_header(data + pos_, header_);
+            decode_frame_header(v.at(pos_), header_);
 
             /* \~english
              * Validated from the header alone, before a byte of payload is
@@ -258,15 +258,28 @@ ReadResult FrameReader::read(const uint8_t *data, size_t size) noexcept {
         }
 
         case State::Payload: {
-            if (size - pos_ < header_.length) return ReadResult::NeedMore;
+            if (v.end() - pos_ < header_.length) return ReadResult::NeedMore;
 
-            size_t off = pos_;
+            uint64_t off = pos_;
             size_t len = header_.length;
 
-            if (header_.known() && !strip(data, off, len))
+            if (header_.known() && !strip(v, off, len))
                 return fail(ErrorCode::ProtocolError);
 
-            payload_ = Span{static_cast<uint32_t>(off),
+            /* \~english
+             * The payload comes back as an offset from the VIEW and not as
+             * a position in the stream, because it is read now and dies
+             * now: the caller looks at it before it reads again, and the
+             * next read is what may drop it.  Thirty-two bits are enough
+             * for that and sixty-four would not fit a span.
+             * \~spanish
+             * La carga vuelve como desplazamiento desde la VISTA y no como
+             * posicion del flujo, porque se lee ahora y muere ahora: quien
+             * llama la mira antes de volver a leer, y la lectura siguiente
+             * es la que puede descartarla.  Treinta y dos bits bastan para
+             * eso y sesenta y cuatro no cabrian en un trozo.
+             * \~ */
+            payload_ = Span{static_cast<uint32_t>(off - v.origin),
                             static_cast<uint32_t>(len)};
             pos_ += header_.length;
             boundary_ = pos_;

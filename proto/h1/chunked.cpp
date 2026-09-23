@@ -151,7 +151,7 @@ StatusCode chunk_status(ChunkError e) noexcept {
     }
 }
 
-void ChunkedReader::reset(size_t body_start) noexcept {
+void ChunkedReader::reset(uint64_t body_start) noexcept {
     state_ = State::Size;
     error_ = ChunkError::None;
     pos_ = body_start;
@@ -164,6 +164,7 @@ void ChunkedReader::reset(size_t body_start) noexcept {
     name_off_ = 0;
     name_len_ = 0;
     trailer_count_ = 0;
+    in_trailers_ = false;
     name_id_ = FieldId::Unknown;
 }
 
@@ -173,8 +174,7 @@ ChunkResult ChunkedReader::fail(ChunkError e) noexcept {
     return ChunkResult::Error;
 }
 
-ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
-                                Fields &trailers) noexcept {
+ChunkResult ChunkedReader::read(const View &v, Fields &trailers) noexcept {
     if (state_ == State::Done) return ChunkResult::Done;
     if (state_ == State::Failed) return ChunkResult::Error;
 
@@ -182,9 +182,9 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         switch (state_) {
 
         case State::Size: {
-            while (pos_ < size) {
-                const uint8_t v = hex_value(data[pos_]);
-                if (v == 16) break;
+            while (pos_ < v.end()) {
+                const uint8_t digit = hex_value(*v.at(pos_));
+                if (digit == 16) break;
 
                 ++size_digits_;
                 if (size_digits_ > limits_.max_chunk_size_digits)
@@ -201,13 +201,13 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
                  * una garantia de correccion que solo vale mientras nadie toque
                  * un ajuste no es una garantia.
                  * \~ */
-                if (chunk_left_ > (~uint64_t{0} - v) / 16)
+                if (chunk_left_ > (~uint64_t{0} - digit) / 16)
                     return fail(ChunkError::ChunkSizeTooLong);
 
-                chunk_left_ = chunk_left_ * 16 + v;
+                chunk_left_ = chunk_left_ * 16 + digit;
                 ++pos_;
             }
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
 
             /* \~english
              * A size with no digits is not a size of zero.  It is what the
@@ -220,7 +220,7 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
              * \~ */
             if (size_digits_ == 0) return fail(ChunkError::BadChunkSize);
 
-            const uint8_t c = data[pos_];
+            const uint8_t c = *v.at(pos_);
             if (c == ';') {
                 mark_ = pos_;
                 ++pos_;
@@ -237,8 +237,8 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::Extension: {
-            while (pos_ < size) {
-                const uint8_t c = data[pos_];
+            while (pos_ < v.end()) {
+                const uint8_t c = *v.at(pos_);
                 if (c == kCr) break;
                 if (c == kLf) return fail(ChunkError::BareLineFeed);
                 /* \~english
@@ -259,19 +259,20 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
             }
             if (pos_ - mark_ > limits_.max_chunk_extension)
                 return fail(ChunkError::BadChunkExtension);
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
             ++pos_;
             state_ = State::SizeLf;
             break;
         }
 
         case State::SizeLf: {
-            if (pos_ == size) return ChunkResult::NeedMore;
-            if (data[pos_] != kLf) return fail(ChunkError::BareCarriageReturn);
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
+            if (*v.at(pos_) != kLf) return fail(ChunkError::BareCarriageReturn);
             ++pos_;
 
             if (chunk_left_ == 0) {
                 trailers_start_ = pos_;
+                in_trailers_ = true;
                 state_ = State::TrailerStart;
                 break;
             }
@@ -296,13 +297,26 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::Data: {
-            const size_t avail = size - pos_;
+            const uint64_t avail = v.end() - pos_;
             if (avail == 0) return ChunkResult::NeedMore;
 
             const uint64_t want = chunk_left_;
-            const size_t take = want < avail ? static_cast<size_t>(want) : avail;
+            const size_t take = static_cast<size_t>(want < avail ? want : avail);
 
-            chunk_ = Span{static_cast<uint32_t>(pos_),
+            /* \~english
+             * An offset from the VIEW and not a position in the stream: the
+             * caller looks at it before it reads again, and the next read is
+             * what may drop it.  Which is the whole reason this reader counts
+             * from the connection -- so that the bytes behind a piece that has
+             * been dealt with can go.
+             * \~spanish
+             * Un desplazamiento desde la VISTA y no una posicion del flujo:
+             * quien llama lo mira antes de volver a leer, y la lectura
+             * siguiente es la que puede descartarlo.  Que es toda la razon de
+             * que este lector cuente desde la conexion -- para que los bytes de
+             * detras de un pedazo ya atendido se puedan ir.
+             * \~ */
+            chunk_ = Span{static_cast<uint32_t>(pos_ - v.origin),
                           static_cast<uint32_t>(take)};
             pos_ += take;
             chunk_left_ -= take;
@@ -313,8 +327,8 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::DataCr: {
-            if (pos_ == size) return ChunkResult::NeedMore;
-            const uint8_t c = data[pos_];
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
+            const uint8_t c = *v.at(pos_);
             if (c == kLf) return fail(ChunkError::BareLineFeed);
             if (c != kCr) return fail(ChunkError::BadChunkTerminator);
             ++pos_;
@@ -323,8 +337,8 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::DataLf: {
-            if (pos_ == size) return ChunkResult::NeedMore;
-            if (data[pos_] != kLf) return fail(ChunkError::BareCarriageReturn);
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
+            if (*v.at(pos_) != kLf) return fail(ChunkError::BareCarriageReturn);
             ++pos_;
             size_digits_ = 0;
             chunk_left_ = 0;
@@ -333,11 +347,11 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::TrailerStart: {
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
             if (pos_ - trailers_start_ > limits_.max_trailer_bytes)
                 return fail(ChunkError::TrailersTooLarge);
 
-            const uint8_t c = data[pos_];
+            const uint8_t c = *v.at(pos_);
             if (c == kCr) {
                 ++pos_;
                 state_ = State::EndLf;
@@ -354,21 +368,21 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::TrailerName: {
-            while (pos_ < size && is_tchar(data[pos_])) ++pos_;
+            while (pos_ < v.end() && is_tchar(*v.at(pos_))) ++pos_;
             if (pos_ - trailers_start_ > limits_.max_trailer_bytes)
                 return fail(ChunkError::TrailersTooLarge);
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
 
-            if (data[pos_] != ':') return fail(ChunkError::BadTrailerName);
+            if (*v.at(pos_) != ':') return fail(ChunkError::BadTrailerName);
             if (pos_ == mark_) return fail(ChunkError::BadTrailerName);
 
             const size_t len = pos_ - mark_;
             if (len > 0xFFFF) return fail(ChunkError::TrailersTooLarge);
 
-            name_off_ = static_cast<uint32_t>(mark_);
+            name_off_ = static_cast<uint32_t>(mark_ - v.origin);
             name_len_ = static_cast<uint16_t>(len);
             name_id_ =
-                field_id_of(reinterpret_cast<const char *>(data + mark_), len);
+                field_id_of(reinterpret_cast<const char *>(v.at(mark_)), len);
 
             if (field_forbidden_in_trailers(name_id_))
                 return fail(ChunkError::ForbiddenTrailer);
@@ -379,18 +393,18 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::TrailerValueStart: {
-            while (pos_ < size && is_ows(data[pos_])) ++pos_;
+            while (pos_ < v.end() && is_ows(*v.at(pos_))) ++pos_;
             if (pos_ - trailers_start_ > limits_.max_trailer_bytes)
                 return fail(ChunkError::TrailersTooLarge);
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
             mark_ = pos_;
             state_ = State::TrailerValue;
             break;
         }
 
         case State::TrailerValue: {
-            while (pos_ < size) {
-                const uint8_t c = data[pos_];
+            while (pos_ < v.end()) {
+                const uint8_t c = *v.at(pos_);
                 if (c == kCr) break;
                 if (c == kLf) return fail(ChunkError::BareLineFeed);
                 if (!is_field_vchar(c) && !is_ows(c))
@@ -399,10 +413,10 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
             }
             if (pos_ - trailers_start_ > limits_.max_trailer_bytes)
                 return fail(ChunkError::TrailersTooLarge);
-            if (pos_ == size) return ChunkResult::NeedMore;
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
 
-            size_t end = pos_;
-            while (end > mark_ && is_ows(data[end - 1])) --end;
+            uint64_t end = pos_;
+            while (end > mark_ && is_ows(*v.at(end - 1))) --end;
 
             const size_t len = end - mark_;
             if (len > 0xFFFF) return fail(ChunkError::TrailersTooLarge);
@@ -410,7 +424,7 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
             Field f{};
             f.name_off = name_off_;
             f.name_len = name_len_;
-            f.value_off = static_cast<uint32_t>(mark_);
+            f.value_off = static_cast<uint32_t>(mark_ - v.origin);
             f.value_len = static_cast<uint16_t>(len);
             f.id = name_id_;
             trailers.add(f);
@@ -422,17 +436,27 @@ ChunkResult ChunkedReader::read(const uint8_t *data, size_t size,
         }
 
         case State::TrailerLf: {
-            if (pos_ == size) return ChunkResult::NeedMore;
-            if (data[pos_] != kLf) return fail(ChunkError::BareCarriageReturn);
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
+            if (*v.at(pos_) != kLf) return fail(ChunkError::BareCarriageReturn);
             ++pos_;
             state_ = State::TrailerStart;
             break;
         }
 
         case State::EndLf: {
-            if (pos_ == size) return ChunkResult::NeedMore;
-            if (data[pos_] != kLf) return fail(ChunkError::BareCarriageReturn);
+            if (pos_ == v.end()) return ChunkResult::NeedMore;
+            if (*v.at(pos_) != kLf) return fail(ChunkError::BareCarriageReturn);
             ++pos_;
+            /* \~english
+             * The message is over, so there is nothing behind the reading any
+             * more -- what the trailers point into is the caller's to finish
+             * with before it drops anything.
+             * \~spanish
+             * El mensaje se acabo, asi que ya no hay nada por detras de la
+             * lectura -- lo que apuntan los remolques es cosa de quien llama,
+             * que tiene que terminar con ellos antes de descartar nada.
+             * \~ */
+            in_trailers_ = false;
             state_ = State::Done;
             return ChunkResult::Done;
         }

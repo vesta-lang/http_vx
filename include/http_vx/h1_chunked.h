@@ -72,6 +72,7 @@
 #ifndef HTTP_VX_H1_CHUNKED_H
 #define HTTP_VX_H1_CHUNKED_H
 
+#include "http_vx/buffer.h"
 #include "http_vx/fields.h"
 #include "http_vx/h1_limits.h"
 #include "http_vx/span.h"
@@ -224,10 +225,12 @@ class ChunkedReader {
      * \~
      *
      * @param body_start
-     *   \~english what @c RequestParser::consumed reported
-     *   \~spanish lo que informo @c RequestParser::consumed  \~
+     *   \~english the stream position the body starts at, which is the
+     *   buffer's origin plus @c RequestParser::head_size
+     *   \~spanish la posicion del flujo donde empieza el cuerpo, que es el
+     *   origen del buffer mas @c RequestParser::head_size  \~
      */
-    void reset(size_t body_start) noexcept;
+    void reset(uint64_t body_start) noexcept;
 
     /**
      * @brief
@@ -258,13 +261,13 @@ class ChunkedReader {
      * la razon de que aqui nada necesite nunca el cuerpo entero de una vez.
      *
      * \~
-     * @param data     \~english the message's first byte  \~spanish el primer byte del mensaje  \~
-     * @param size     \~english how many bytes are there  \~spanish cuantos bytes hay  \~
+     * @param v        \~english the bytes that are here and where they are
+     *                 \~spanish los bytes que hay y donde estan  \~
      * @param trailers \~english where the trailer fields go
      *                 \~spanish donde van las cabeceras de remolque  \~
      * @return         \~english what it found  \~spanish que encontro  \~
      */
-    ChunkResult read(const uint8_t *data, size_t size, Fields &trailers) noexcept;
+    ChunkResult read(const View &v, Fields &trailers) noexcept;
 
     /**
      * @brief
@@ -297,13 +300,73 @@ class ChunkedReader {
      * After @c Done this is where the NEXT message starts, framing and
      * trailers included.
      *
+     * **It is a point with nothing behind it**, which is what makes it safe to
+     * drop up to while the body is still arriving -- and dropping as it
+     * arrives is the whole reason this reader counts from the connection.
+     *
+     * While the trailers are being read it stops at where they began, and does
+     * not follow the reading.  A trailer's name is recorded when its colon
+     * arrives and used when its value ends, so between those two moments the
+     * reader is holding a position behind where it is looking; following the
+     * reading would invite dropping the name of the field about to be built.
+     * Trailers are small and they are the last thing in a message, so nothing
+     * is lost by waiting.
+     *
+     * The same care is the caller's afterwards: once the message is done, the
+     * trailers are spans into these bytes, and they may not be dropped while
+     * anything is still reading them.
+     *
      * \~spanish
      * Tras @c Done, aqui es donde empieza el mensaje SIGUIENTE, con troceado y
      * remolques incluidos.
      *
+     * **Es un punto sin nada detras**, que es lo que hace seguro descartar
+     * hasta el mientras el cuerpo sigue llegando -- y descartar segun llega es
+     * toda la razon de que este lector cuente desde la conexion.
+     *
+     * Mientras se leen los remolques se queda donde empezaron, y no sigue a la
+     * lectura.  El nombre de un remolque se anota cuando llegan sus dos puntos
+     * y se usa cuando acaba su valor, asi que entre esos dos momentos el lector
+     * tiene una posicion por detras de donde mira; seguir a la lectura
+     * invitaria a descartar el nombre de la cabecera que se esta construyendo.
+     * Los remolques son pequenos y son lo ultimo de un mensaje, asi que no se
+     * pierde nada esperando.
+     *
+     * El mismo cuidado es de quien llama despues: una vez terminado el mensaje,
+     * los remolques son trozos dentro de estos bytes, y no se pueden descartar
+     * mientras algo los siga leyendo.
+     *
      * \~
      */
-    size_t consumed() const noexcept { return pos_; }
+    uint64_t consumed() const noexcept {
+        return in_trailers_ ? trailers_start_ : pos_;
+    }
+
+    /**
+     * @brief
+     * \~english How far it has looked, which is not where it has finished.
+     * \~spanish Hasta donde ha mirado, que no es donde ha terminado.
+     * \~
+     *
+     * \~english
+     * The two are the same number for most of a body and differ once the
+     * trailers begin, and telling them apart is what @c consumed is about.
+     * This one is the reading: it moves with every byte, so it is what says
+     * whether a connection is getting anywhere -- which is the question a
+     * timeout asks, and the one that @c consumed would answer wrongly for a
+     * peer that is dribbling out a trailer.
+     *
+     * \~spanish
+     * Los dos son el mismo numero durante casi todo un cuerpo y difieren en
+     * cuanto empiezan los remolques, y distinguirlos es de lo que va
+     * @c consumed.  Este es la lectura: se mueve con cada byte, asi que es lo
+     * que dice si una conexion esta llegando a alguna parte -- que es la
+     * pregunta que hace un plazo, y la que @c consumed contestaria mal para un
+     * extremo que este soltando un remolque gota a gota.
+     *
+     * \~
+     */
+    uint64_t position() const noexcept { return pos_; }
 
     /// \~english How many bytes of body there were.
     /// \~spanish Cuantos bytes de cuerpo habia.  \~
@@ -333,9 +396,9 @@ class ChunkedReader {
     State state_ = State::Size;
     ChunkError error_ = ChunkError::None;
 
-    size_t pos_ = 0;
-    size_t mark_ = 0;
-    size_t trailers_start_ = 0;
+    uint64_t pos_ = 0;
+    uint64_t mark_ = 0;
+    uint64_t trailers_start_ = 0;
 
     Span chunk_ = {0, 0};
     uint64_t chunk_left_ = 0;
@@ -344,6 +407,19 @@ class ChunkedReader {
     uint32_t name_off_ = 0;
     uint16_t name_len_ = 0;
     uint16_t trailer_count_ = 0;
+
+    /**
+     * \~english
+     * Whether the trailers have begun.  It freezes what @c consumed reports,
+     * because from here on the reader keeps a position behind where it is
+     * looking.
+     * \~spanish
+     * Si empezaron los remolques.  Congela lo que informa @c consumed, porque
+     * de aqui en adelante el lector guarda una posicion por detras de donde
+     * mira.
+     * \~
+     */
+    bool in_trailers_ = false;
     FieldId name_id_ = FieldId::Unknown;
 };
 

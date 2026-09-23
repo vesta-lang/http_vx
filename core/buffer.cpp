@@ -129,11 +129,12 @@ Buffer::~Buffer() { release(); }
 
 Buffer::Buffer(Buffer &&other) noexcept
     : base_(other.base_), cap_(other.cap_), head_(other.head_),
-      tail_(other.tail_) {
+      tail_(other.tail_), origin_(other.origin_) {
     other.base_ = nullptr;
     other.cap_ = 0;
     other.head_ = 0;
     other.tail_ = 0;
+    other.origin_ = 0;
 }
 
 Buffer &Buffer::operator=(Buffer &&other) noexcept {
@@ -143,10 +144,12 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
     cap_ = other.cap_;
     head_ = other.head_;
     tail_ = other.tail_;
+    origin_ = other.origin_;
     other.base_ = nullptr;
     other.cap_ = 0;
     other.head_ = 0;
     other.tail_ = 0;
+    other.origin_ = 0;
     return *this;
 }
 
@@ -157,6 +160,17 @@ void Buffer::release() noexcept {
     cap_ = 0;
     head_ = 0;
     tail_ = 0;
+
+    /* \~english
+     * And the stream starts over, because giving the memory back is a
+     * connection ending -- unlike @c clear, which empties the buffer for the
+     * next message of the same one.
+     * \~spanish
+     * Y el flujo empieza de nuevo, porque devolver la memoria es una conexion
+     * que acaba -- al reves que @c clear, que vacia el buffer para el mensaje
+     * siguiente de la misma.
+     * \~ */
+    origin_ = 0;
 }
 
 void Buffer::compact() noexcept {
@@ -264,7 +278,22 @@ void Buffer::commit(size_t n) noexcept {
 
 void Buffer::consume(size_t n) noexcept {
     const size_t live = tail_ - head_;
-    head_ += n < live ? n : live;
+    const size_t drop = n < live ? n : live;
+    head_ += drop;
+
+    /* \~english
+     * And the stream moves on by exactly what was dropped -- by what was
+     * DROPPED and not by what was asked for, because a caller asking for more
+     * than is here is a caller whose idea of the connection is already wrong,
+     * and believing it would put the origin ahead of bytes that never arrived.
+     *
+     * \~spanish
+     * Y el flujo avanza exactamente lo que se descarto -- lo que se DESCARTO y
+     * no lo que se pidio, porque quien pida mas de lo que hay es alguien cuya
+     * idea de la conexion ya esta mal, y creerselo pondria el origen por delante
+     * de bytes que no llegaron nunca.
+     * \~ */
+    origin_ += drop;
 
     /* \~english
      * Everything consumed is the common case -- one message per read -- and

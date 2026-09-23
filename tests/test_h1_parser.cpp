@@ -163,7 +163,7 @@ void test_simple() {
 
         check(res == ParseResult::Done, "an ordinary request was not read");
         check(p.error() == ParseError::None, "an ordinary request reported an error");
-        check(p.consumed() == len, "the head did not end where the message does");
+        check(p.head_size() == len, "the head did not end where the message does");
 
         check(r.method == http_vx::MethodId::Get, "the method was not recognised");
         check(span_is(r.method_text, msg, "GET"), "the method spelling is wrong");
@@ -217,7 +217,7 @@ void test_head_ends_at_the_blank_line() {
     http_vx::Request r;
     check(feed_whole(p, msg, std::strlen(msg), r) == ParseResult::Done,
           "the request was not read");
-    check(p.consumed() == head, "the head swallowed part of the body");
+    check(p.head_size() == head, "the head swallowed part of the body");
     check(r.method == http_vx::MethodId::Post, "the method is wrong");
 }
 
@@ -580,7 +580,7 @@ void test_reuse() {
 
     check(feed_whole(p, second, std::strlen(second), r) == ParseResult::Done,
           "the second request was not read");
-    check(p.consumed() == std::strlen(second),
+    check(p.head_size() == std::strlen(second),
           "the position did not go back to the start");
     check(r.method == http_vx::MethodId::Put, "the second method is wrong");
     check(span_is(r.target, second, "/two"), "the second target is wrong");
@@ -616,10 +616,10 @@ void test_sticky() {
         http_vx::Request r;
         const size_t len = std::strlen(msg);
         check(feed_whole(p, msg, len, r) == ParseResult::Done, "it was not read");
-        const size_t head = p.consumed();
+        const size_t head = p.head_size();
         check(feed_whole(p, msg, len, r) == ParseResult::Done,
               "calling again changed the answer");
-        check(p.consumed() == head, "calling again moved past the head");
+        check(p.head_size() == head, "calling again moved past the head");
         check(r.fields.size() == 1, "calling again read the body as fields");
     }
     {

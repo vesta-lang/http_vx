@@ -316,17 +316,33 @@ class RequestParser {
      * \~
      *
      * \~english
-     * After @c Done this is where the body starts, and it is the number the
-     * connection hands to @c Buffer::consume once the message is finished
-     * with.
+     * An offset from the bytes this was given, not a position in the
+     * connection, and it is named for what it is so that it cannot be
+     * mistaken for the other.  The readers that consume as they go count
+     * from the start of the CONNECTION, because what they produce dies
+     * immediately and the bytes behind it can be dropped; this one counts
+     * from the message, because what it produces -- the request -- stays
+     * alive while the handler uses it, and those bytes cannot be dropped
+     * until it is done.
+     *
+     * So it is where the body starts, measured from where the head did.
      *
      * \~spanish
-     * Tras @c Done, aqui es donde empieza el cuerpo, y es el numero que la
-     * conexion le da a @c Buffer::consume cuando termina con el mensaje.
+     * Un desplazamiento desde los bytes que se le dieron, no una posicion en
+     * la conexion, y se llama por lo que es para que no se pueda confundir
+     * con la otra.  Los lectores que consumen segun avanzan cuentan desde el
+     * principio de la CONEXION, porque lo que producen muere en el acto y
+     * los bytes de detras se pueden descartar; este cuenta desde el mensaje,
+     * porque lo que produce -- la peticion -- sigue vivo mientras el
+     * manejador la usa, y esos bytes no se pueden descartar hasta que
+     * termine.
+     *
+     * Asi que es donde empieza el cuerpo, medido desde donde empezo la
+     * cabeza.
      *
      * \~
      */
-    size_t consumed() const noexcept { return pos_; }
+    size_t head_size() const noexcept { return pos_; }
 
     /// \~english Makes it ready for the next message.
     /// \~spanish Lo deja listo para el mensaje siguiente.  \~

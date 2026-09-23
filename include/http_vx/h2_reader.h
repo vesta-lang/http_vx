@@ -63,6 +63,7 @@
 #ifndef HTTP_VX_H2_READER_H
 #define HTTP_VX_H2_READER_H
 
+#include "http_vx/buffer.h"
 #include "http_vx/h2_frame.h"
 #include "http_vx/h2_limits.h"
 #include "http_vx/span.h"
@@ -120,14 +121,16 @@ class FrameReader {
      * \~spanish Lo deja listo para leer una conexion desde @p start.
      * \~
      *
-     * @param start   \~english where the connection's bytes begin
-     *                \~spanish donde empiezan los bytes de la conexion  \~
+     * @param start   \~english the stream position of its first byte, which
+     *                is @c Buffer::origin on one that is starting
+     *                \~spanish la posicion en el flujo de su primer byte, que
+     *                es @c Buffer::origin en una que empieza  \~
      * @param preface \~english whether the client's preface comes first, which
      *                it does on a connection a client opened
      *                \~spanish si va delante el preambulo del cliente, que es
      *                lo que pasa en una conexion que abrio un cliente  \~
      */
-    void reset(size_t start, bool preface) noexcept;
+    void reset(uint64_t start, bool preface) noexcept;
 
     /**
      * @brief
@@ -144,12 +147,11 @@ class FrameReader {
      * que conteste @c NeedMore o @c Error.
      *
      * \~
-     * @param data \~english the connection's first byte
-     *             \~spanish el primer byte de la conexion  \~
-     * @param size \~english how many bytes are there  \~spanish cuantos bytes hay  \~
-     * @return     \~english what it found  \~spanish que encontro  \~
+     * @param v \~english the bytes that are here and where they are
+     *          \~spanish los bytes que hay y donde estan  \~
+     * @return  \~english what it found  \~spanish que encontro  \~
      */
-    ReadResult read(const uint8_t *data, size_t size) noexcept;
+    ReadResult read(const View &v) noexcept;
 
     /// \~english The header of the frame the last @c Frame refers to.
     /// \~spanish La cabecera de la trama a la que se refiere el ultimo @c Frame.  \~
@@ -221,7 +223,7 @@ class FrameReader {
      *
      * \~
      */
-    size_t consumed() const noexcept { return boundary_; }
+    uint64_t consumed() const noexcept { return boundary_; }
 
     /**
      * @brief
@@ -261,7 +263,7 @@ class FrameReader {
      * sobre cuanto miden.
      * \~
      */
-    bool strip(const uint8_t *data, size_t &off, size_t &len) noexcept;
+    bool strip(const View &v, uint64_t &off, size_t &len) noexcept;
 
     /**
      * \~english
@@ -279,7 +281,7 @@ class FrameReader {
     ErrorCode error_ = ErrorCode::NoError;
 
     /// \~english How far it has looked.  \~spanish Hasta donde ha mirado.  \~
-    size_t pos_ = 0;
+    uint64_t pos_ = 0;
     /**
      * \~english
      * How far it has finished, which is not the same and is what
@@ -293,7 +295,7 @@ class FrameReader {
      * todavia no se puede tirar.
      * \~
      */
-    size_t boundary_ = 0;
+    uint64_t boundary_ = 0;
     FrameHeader header_ = {};
     Span payload_ = {0, 0};
 

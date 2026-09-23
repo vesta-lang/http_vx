@@ -100,7 +100,7 @@ Reading read_body(const char *msg, size_t step,
 
     size_t given = step == 0 ? len : 0;
     for (;;) {
-        const ChunkResult res = r.read(d, given, trailers);
+        const ChunkResult res = r.read(http_vx::View{d, given, 0}, trailers);
 
         if (res == ChunkResult::Data) {
             const http_vx::Span s = r.chunk();
@@ -126,7 +126,7 @@ Reading read_body(const char *msg, size_t step,
     }
 
     out.error = r.error();
-    out.consumed = r.consumed();
+    out.consumed = static_cast<size_t>(r.consumed());
     out.body_bytes = r.body_bytes();
     out.trailer_count = trailers.size();
     return out;
