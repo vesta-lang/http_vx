@@ -348,6 +348,62 @@ class Encoder {
                             const uint8_t *value, size_t vlen,
                             Indexing how = Indexing::WithoutIndexing) noexcept;
 
+    /**
+     * @brief
+     * \~english Takes the peer's new table size, and arranges to say so.
+     * \~spanish Acepta el tamano de tabla nuevo del otro extremo, y se encarga de decirlo.
+     * \~
+     *
+     * \~english
+     * A table size change is not a local decision even though it changes only
+     * this end's table: HPACK requires it to be ANNOUNCED, at the start of the
+     * next header block, because the peer's decoder has to evict at the same
+     * moment or the two stop agreeing about what an index means.
+     *
+     * So this does not write anything -- there is no block open to write it
+     * into -- it records that the next block owes one.  "The next block" is
+     * well defined here without the encoder tracking block boundaries: a size
+     * change can only be learnt from a SETTINGS, a SETTINGS can only arrive
+     * between frames, and a header block cannot be interrupted by another
+     * frame.  So the first field written after this call is always at the
+     * start of a block.
+     *
+     * **And a peer that SHRINKS its table is the case that matters.**  Growing
+     * is an offer this end may decline; shrinking is the peer telling this end
+     * that entries it was relying on are gone.  Carrying on indexing them
+     * would send a number the peer resolves to nothing -- and it answers that
+     * by ending the connection, correctly, for what looks from its side like a
+     * corrupt block.
+     *
+     * \~spanish
+     * Un cambio de tamano de tabla no es una decision local aunque solo cambie
+     * la tabla de este extremo: HPACK exige ANUNCIARLO, al principio del bloque
+     * de cabeceras siguiente, porque el descodificador del otro tiene que
+     * desalojar en el mismo momento o los dos dejan de estar de acuerdo sobre lo
+     * que significa un indice.
+     *
+     * Asi que esto no escribe nada -- no hay ningun bloque abierto donde
+     * escribirlo -- sino que apunta que el bloque siguiente debe uno.  "El
+     * bloque siguiente" esta bien definido aqui sin que el codificador lleve la
+     * cuenta de las fronteras de bloque: un cambio de tamano solo se puede
+     * saber por un SETTINGS, un SETTINGS solo puede llegar entre tramas, y un
+     * bloque de cabeceras no se puede interrumpir con otra trama.  Asi que la
+     * primera cabecera escrita despues de esta llamada esta siempre al principio
+     * de un bloque.
+     *
+     * **Y el caso que importa es el de un extremo que ENCOGE su tabla.**  Crecer
+     * es una oferta que este extremo puede declinar; encoger es el otro
+     * diciendole que las entradas en las que se apoyaba ya no estan.  Seguir
+     * indexandolas seria mandar un numero que el otro no resuelve a nada -- y
+     * eso lo contesta terminando la conexion, con razon, por lo que desde su
+     * lado parece un bloque corrompido.
+     *
+     * \~
+     * @param n \~english the peer's new table size
+     *          \~spanish el tamano de tabla nuevo del otro extremo  \~
+     */
+    void set_table_size(uint32_t n) noexcept;
+
     /// \~english What this end told the peer to remember.
     /// \~spanish Lo que este extremo le dijo al otro que recordara.  \~
     DynamicTable &table() noexcept { return table_; }
@@ -363,7 +419,27 @@ class Encoder {
     WriteStatus put_int(Buffer &out, uint64_t value, uint8_t prefix_bits,
                         uint8_t keep) noexcept;
 
+    /// \~english Writes the size update this block owes, if it owes one.
+    /// \~spanish Escribe la actualizacion de tamano que debe este bloque, si debe.  \~
+    WriteStatus flush_size_update(Buffer &out) noexcept;
+
     DynamicTable table_;
+
+    /**
+     * \~english
+     * The size the next block must announce, or @c kNoSizeUpdate when it owes
+     * none.  A sentinel rather than a companion boolean because zero IS a
+     * valid size -- a peer may refuse to remember anything at all -- and a
+     * boolean beside it would be a second thing to keep in step.
+     * \~spanish
+     * El tamano que tiene que anunciar el bloque siguiente, o @c kNoSizeUpdate
+     * cuando no debe ninguno.  Un centinela y no un booleano al lado porque el
+     * cero SI es un tamano valido -- un extremo puede negarse a recordar nada --
+     * y un booleano al lado seria una segunda cosa que mantener de acuerdo.
+     * \~
+     */
+    static constexpr uint32_t kNoSizeUpdate = 0xFFFFFFFF;
+    uint32_t pending_size_ = kNoSizeUpdate;
 };
 
 } // namespace hpack

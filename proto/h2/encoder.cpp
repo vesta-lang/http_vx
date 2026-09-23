@@ -80,6 +80,19 @@ constexpr Form kWithoutIndexing{0x00, 4};
 constexpr Form kNever{0x10, 4};
 
 /**
+ * \~english
+ * `001xxxxx`: the table has changed size.  It is not a field at all -- it
+ * carries no name and no value -- which is why it can only appear where a
+ * field would start and must be the first thing in a block.
+ * \~spanish
+ * `001xxxxx`: la tabla ha cambiado de tamano.  No es una cabecera -- no lleva
+ * nombre ni valor -- que es la razon de que solo pueda aparecer donde empezaria
+ * una y tenga que ser lo primero de un bloque.
+ * \~
+ */
+constexpr Form kSizeUpdate{0x20, 5};
+
+/**
  * @brief
  * \~english The most a name or a value may be.
  * \~spanish Lo mas que puede medir un nombre o un valor.
@@ -151,6 +164,46 @@ bool must_never_be_indexed(FieldId id) noexcept {
 
 void Encoder::reset(uint32_t peer_table_size) noexcept {
     table_.reset(peer_table_size);
+    pending_size_ = kNoSizeUpdate;
+}
+
+void Encoder::set_table_size(uint32_t n) noexcept {
+    /* \~english
+     * Never above what this end announced it would spend.  The peer's number
+     * is a permission and not an instruction: it says what the peer will hold,
+     * and holding it is this end's own memory to decide about.
+     * \~spanish
+     * Nunca por encima de lo que anuncio este extremo que gastaria.  El numero
+     * del otro es un permiso y no una orden: dice lo que va a guardar el otro, y
+     * guardarlo es memoria propia de este sobre la que decide el.
+     * \~ */
+    const uint32_t want = n < table_.announced() ? n : table_.announced();
+    if (want == table_.max_size()) return;
+
+    table_.set_max_size(want);
+    pending_size_ = want;
+}
+
+WriteStatus Encoder::flush_size_update(Buffer &out) noexcept {
+    if (pending_size_ == kNoSizeUpdate) return WriteStatus::Ok;
+
+    const uint32_t n = pending_size_;
+
+    /* \~english
+     * Cleared BEFORE the write rather than after.  A write that fails is a
+     * connection that is ending -- the block is half made and cannot be
+     * unmade -- so leaving the flag set would only mean the next block, if
+     * there somehow were one, announced a size that had already been
+     * announced.
+     * \~spanish
+     * Se borra ANTES de escribir y no despues.  Una escritura que falla es una
+     * conexion que se acaba -- el bloque esta a medio hacer y no se puede
+     * deshacer -- asi que dejar la marca puesta solo querria decir que el bloque
+     * siguiente, si de algun modo lo hubiera, anunciaria un tamano ya
+     * anunciado.
+     * \~ */
+    pending_size_ = kNoSizeUpdate;
+    return put_int(out, n, kSizeUpdate.prefix_bits, kSizeUpdate.keep);
 }
 
 WriteStatus Encoder::put_int(Buffer &out, uint64_t value, uint8_t prefix_bits,
@@ -214,6 +267,9 @@ WriteStatus Encoder::write_status(Buffer &out, StatusCode status) noexcept {
      * estatica, asi que los corrientes no llegan a la escritura de abajo.
      * \~ */
     if (status < 100 || status > 999) return WriteStatus::TooLong;
+
+    const WriteStatus su = flush_size_update(out);
+    if (su != WriteStatus::Ok) return su;
 
     uint8_t text[3];
     text[0] = static_cast<uint8_t>('0' + status / 100);
@@ -298,6 +354,18 @@ WriteStatus Encoder::write_pair(Buffer &out, FieldId id, const uint8_t *name,
      * \~ */
     if (how == Indexing::Incremental && must_never_be_indexed(id))
         return WriteStatus::MustNotBeIndexed;
+
+    /* \~english
+     * After the refusals and before anything is written.  A size update is the
+     * first thing in a block, and a field that is going to be refused has not
+     * begun one.
+     * \~spanish
+     * Despues de los rechazos y antes de escribir nada.  Una actualizacion de
+     * tamano es lo primero de un bloque, y una cabecera que va a ser rechazada
+     * no ha empezado ninguno.
+     * \~ */
+    const WriteStatus su = flush_size_update(out);
+    if (su != WriteStatus::Ok) return su;
 
     uint64_t index = 0;
     bool exact = false;
