@@ -177,7 +177,7 @@ ErrorCode FrameReader::check_continuation() noexcept {
 
     if (is_block) {
         header_block_bytes_ += payload_.len;
-        if (header_block_bytes_ > limits_.max_header_list_size)
+        if (header_block_bytes_ > limits_.max_header_block_bytes)
             return ErrorCode::EnhanceYourCalm;
 
         if (header_.has(kEndHeaders)) {

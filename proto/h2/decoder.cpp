@@ -1,0 +1,517 @@
+/*
+ * http_vx -- servidor HTTP/1.1, HTTP/2 y HTTP/3
+ *
+ * Copyright (c) 2026 David Lopez T. (DesmonHak)
+ * Licencia: MIT (ver LICENSE).
+ */
+
+/**
+ * @file proto/h2/decoder.cpp
+ * @brief
+ * \~english Reading a header block, and refusing the ones that lie.
+ * \~spanish Leer un bloque de cabeceras, y rechazar los que mienten.
+ * \~
+ */
+
+#include "http_vx/h2_decoder.h"
+
+#include "http_vx/chars.h"
+#include "http_vx/h2_huffman.h"
+
+#include "util/mem/vesta_memcpy.h"
+
+namespace http_vx {
+namespace h2 {
+namespace hpack {
+namespace {
+
+/**
+ * @brief
+ * \~english The five names that are not field names.
+ * \~spanish Los cinco nombres que no son nombres de cabecera.
+ * \~
+ *
+ * \~english
+ * One table, and the colon is part of it.  A name that begins with a colon and
+ * is not one of these is refused rather than passed along as an ordinary
+ * field: the colon is reserved for the protocol, so a name nobody has defined
+ * with one is a name from a version this end does not speak -- and treating it
+ * as an ordinary field would be inventing a meaning for it.
+ *
+ * \~spanish
+ * Una tabla, y los dos puntos son parte de ella.  Un nombre que empiece por dos
+ * puntos y no sea uno de estos se rechaza en vez de pasarlo como cabecera
+ * corriente: los dos puntos estan reservados para el protocolo, asi que un
+ * nombre con ellos que nadie ha definido es un nombre de una version que este
+ * extremo no habla -- y tratarlo como cabecera corriente seria inventarle un
+ * significado.
+ *
+ * \~
+ */
+struct PseudoRow {
+    const char *name;
+    uint8_t len;
+    Pseudo which;
+};
+
+template <size_t N>
+constexpr PseudoRow prow(const char (&text)[N], Pseudo which) {
+    return PseudoRow{text, static_cast<uint8_t>(N - 1), which};
+}
+
+constexpr PseudoRow kPseudo[] = {
+    prow(":authority", Pseudo::Authority), prow(":method", Pseudo::Method),
+    prow(":path", Pseudo::Path),           prow(":scheme", Pseudo::Scheme),
+    prow(":status", Pseudo::Status),
+};
+
+constexpr size_t kPseudoCount = sizeof(kPseudo) / sizeof(kPseudo[0]);
+
+Pseudo pseudo_of(const uint8_t *name, size_t len) noexcept {
+    for (size_t i = 0; i < kPseudoCount; ++i) {
+        if (kPseudo[i].len != len) continue;
+        size_t j = 0;
+        for (; j < len; ++j)
+            if (name[j] != static_cast<uint8_t>(kPseudo[i].name[j])) break;
+        if (j == len) return kPseudo[i].which;
+    }
+    return Pseudo::None;
+}
+
+constexpr uint64_t bit(FieldId id) noexcept {
+    return uint64_t{1} << static_cast<unsigned>(id);
+}
+
+/**
+ * @brief
+ * \~english The fields HTTP/2 has no place for.
+ * \~spanish Las cabeceras para las que HTTP/2 no tiene sitio.
+ * \~
+ *
+ * \~english
+ * They all describe a single hop of a single connection -- how it is framed,
+ * whether it is kept, what it might turn into -- and HTTP/2 answers all of
+ * those itself, at the frame layer, for the whole connection at once.  A
+ * message that carries one is a message from HTTP/1.1 wearing HTTP/2's
+ * clothes, and forwarding it would let an intermediary be told two different
+ * things about the same connection by the same peer.
+ *
+ * `proxy-connection` is in here, which is why it is in @c FieldId at all: it
+ * was never a real field, it was a mistake that spread, and the only reason to
+ * recognise it is to be able to refuse it by name.
+ *
+ * \~spanish
+ * Todas describen un salto de una conexion -- como se trocea, si se conserva,
+ * en que puede convertirse -- y HTTP/2 contesta a todo eso el mismo, en la capa
+ * de tramas, para la conexion entera de una vez.  Un mensaje que lleve una es
+ * un mensaje de HTTP/1.1 disfrazado de HTTP/2, y reenviarlo dejaria que a un
+ * intermediario le dijeran dos cosas distintas sobre la misma conexion el mismo
+ * extremo.
+ *
+ * `proxy-connection` esta aqui, que es la unica razon de que este en
+ * @c FieldId: no fue nunca una cabecera de verdad, fue una equivocacion que se
+ * extendio, y el unico motivo de reconocerla es poder rechazarla por su nombre.
+ *
+ * \~
+ */
+constexpr uint64_t kForbiddenInH2 =
+    bit(FieldId::Connection) | bit(FieldId::KeepAlive) |
+    bit(FieldId::TransferEncoding) | bit(FieldId::Upgrade) |
+    bit(FieldId::ProxyConnection);
+
+/**
+ * @brief
+ * \~english Puts @p n bytes into @p out and says where they landed.
+ * \~spanish Pone @p n bytes en @p out y dice donde cayeron.
+ * \~
+ *
+ * \~english
+ * The span is an offset from @c out.data, which growing does not move.  That
+ * is the buffer's invariant and it is what lets a field decoded early still
+ * name its bytes after a later one made the buffer bigger.
+ *
+ * \~spanish
+ * El trozo es un desplazamiento desde @c out.data, que crecer no mueve.  Ese es
+ * el invariante del buffer y es lo que permite que una cabecera descodificada
+ * pronto siga nombrando sus bytes despues de que otra posterior haya hecho
+ * crecer el buffer.
+ *
+ * \~
+ */
+bool put(Buffer &out, const void *p, size_t n, Span &span) noexcept {
+    const size_t at = out.size();
+    if (n != 0) {
+        uint8_t *room = out.reserve(n);
+        if (room == nullptr) return false;
+        util::vesta_memcpy(room, p, n);
+        out.commit(n);
+    }
+    span = Span{static_cast<uint32_t>(at), static_cast<uint32_t>(n)};
+    return true;
+}
+
+} // namespace
+
+void Decoder::reset(const Limits &limits) noexcept {
+    limits_ = limits;
+    table_.reset(limits.header_table_size);
+    list_size_ = 0;
+    seen_ordinary_ = false;
+    pseudo_seen_ = 0;
+}
+
+ErrorCode Decoder::take_string(const uint8_t *p, size_t n, size_t &at,
+                               Buffer &out, Span &span) noexcept {
+    if (at >= n) return ErrorCode::CompressionError;
+
+    const bool coded = (p[at] & 0x80) != 0;
+    const IntResult len = decode_int(p + at, n - at, 7);
+    if (len.status != Status::Ok) return ErrorCode::CompressionError;
+
+    at += len.used;
+    if (len.value > n - at) return ErrorCode::CompressionError;
+
+    const size_t take = static_cast<size_t>(len.value);
+
+    if (!coded) {
+        if (!put(out, p + at, take, span)) return ErrorCode::InternalError;
+        at += take;
+        return ErrorCode::NoError;
+    }
+
+    /* \~english
+     * Room for the most it can come to, asked for BEFORE it is decoded.  The
+     * bound is small -- eight fifths -- and knowing it is what keeps this from
+     * being a place where a sender decides how much memory is asked for.
+     *
+     * \~spanish
+     * Sitio para lo mas que puede llegar a ser, pedido ANTES de descodificarlo.
+     * La cota es pequena -- ocho quintos -- y conocerla es lo que impide que
+     * esto sea un sitio donde quien envia decide cuanta memoria se pide.
+     * \~ */
+    const size_t most = huffman_max_decoded(take);
+    const size_t start = out.size();
+
+    uint8_t *room = out.reserve(most);
+    if (room == nullptr) return ErrorCode::InternalError;
+
+    const HuffmanResult r = huffman_decode(room, most, p + at, take);
+    if (r.status != Status::Ok) return ErrorCode::CompressionError;
+
+    out.commit(r.len);
+    span = Span{static_cast<uint32_t>(start), static_cast<uint32_t>(r.len)};
+    at += take;
+    return ErrorCode::NoError;
+}
+
+ErrorCode Decoder::take_indexed_name(uint64_t index, Buffer &out,
+                                     Reading &f) noexcept {
+    if (index == 0) return ErrorCode::CompressionError;
+
+    if (index <= kStaticEntries) {
+        const StaticEntry *e = static_entry(index);
+        if (!put(out, e->name, e->name_len, f.name))
+            return ErrorCode::InternalError;
+        f.id = e->id;
+        f.pseudo = e->pseudo;
+        return ErrorCode::NoError;
+    }
+
+    const size_t back = static_cast<size_t>(index - kStaticEntries - 1);
+    const TableEntry *e = table_.at(back);
+
+    /* \~english
+     * An index past what is remembered.  It is a connection error and not a
+     * bad request: the peer and this end disagree about what the table holds,
+     * so every index after this one is a guess -- and the peer has no way of
+     * being told which one went wrong.
+     *
+     * \~spanish
+     * Un indice mas alla de lo recordado.  Es un error de conexion y no una
+     * peticion mala: el otro extremo y este discrepan sobre lo que hay en la
+     * tabla, asi que todos los indices de aqui en adelante son conjeturas -- y
+     * al otro extremo no hay forma de decirle cual fue el que fallo.
+     * \~ */
+    if (e == nullptr) return ErrorCode::CompressionError;
+
+    const size_t start = out.size();
+    uint8_t *room = out.reserve(e->name_len);
+    if (room == nullptr) return ErrorCode::InternalError;
+
+    const size_t got = table_.copy_name(back, room, e->name_len);
+    out.commit(got);
+    f.name = Span{static_cast<uint32_t>(start), static_cast<uint32_t>(got)};
+    f.id = e->id;
+    f.pseudo = e->pseudo;
+    return ErrorCode::NoError;
+}
+
+ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
+                        Request &req) noexcept {
+    const uint8_t *base = out.data();
+    const uint8_t *name = base + f.name.off;
+
+    /* \~english
+     * What it costs once it is written out, counted the specification's way.
+     * This is the limit the bomb runs into: a thousand mentions of a remembered
+     * field are a thousand bytes on the wire and a thousand times the field
+     * here.
+     *
+     * \~spanish
+     * Lo que cuesta una vez escrita, contado como dice la especificacion.  Este
+     * es el limite con el que choca la bomba: mil menciones de una cabecera
+     * recordada son mil bytes en el cable y mil veces la cabecera aqui.
+     * \~ */
+    list_size_ += static_cast<uint64_t>(f.name.len) + f.value.len + 32;
+    if (list_size_ > limits_.max_header_list_size)
+        return ErrorCode::EnhanceYourCalm;
+
+    if (f.name.len == 0) return ErrorCode::ProtocolError;
+
+    if (name[0] == ':') {
+        const Pseudo which = pseudo_of(name, f.name.len);
+
+        /* \~english
+         * A colon is reserved for the protocol, so a name with one that nobody
+         * has defined is a name from a version this end does not speak.
+         * \~spanish
+         * Los dos puntos estan reservados para el protocolo, asi que un nombre
+         * con ellos que nadie ha definido es un nombre de una version que este
+         * extremo no habla.
+         * \~ */
+        if (which == Pseudo::None) return ErrorCode::ProtocolError;
+
+        /* \~english
+         * They all come before the ordinary fields.  It is not a style rule:
+         * a recipient decides what to do with a message from them, and one
+         * that arrived after the fields would be deciding after acting.
+         * \~spanish
+         * Todas van antes que las cabeceras corrientes.  No es una regla de
+         * estilo: quien recibe decide que hacer con un mensaje a partir de
+         * ellas, y una que llegara detras de las cabeceras estaria decidiendo
+         * despues de actuar.
+         * \~ */
+        if (seen_ordinary_) return ErrorCode::ProtocolError;
+
+        /* \~english
+         * And once each.  Twice is two answers to one question, which is the
+         * same shape as a message with two content lengths.
+         * \~spanish
+         * Y una vez cada una.  Dos veces son dos respuestas a una pregunta, que
+         * es la misma forma que un mensaje con dos longitudes de contenido.
+         * \~ */
+        const uint8_t mark = static_cast<uint8_t>(1u << static_cast<unsigned>(which));
+        if ((pseudo_seen_ & mark) != 0) return ErrorCode::ProtocolError;
+        pseudo_seen_ |= mark;
+
+        switch (which) {
+        case Pseudo::Method:
+            req.method_text = f.value;
+            req.method = method_id_of(
+                reinterpret_cast<const char *>(base + f.value.off), f.value.len);
+            break;
+        case Pseudo::Path:
+            req.target = f.value;
+            break;
+        case Pseudo::Authority:
+            req.authority = f.value;
+            break;
+        case Pseudo::Scheme:
+            req.scheme = f.value;
+            break;
+        case Pseudo::Status:
+            /* \~english
+             * A status is what a response carries.  In a request it is a peer
+             * answering a question nobody asked.
+             * \~spanish
+             * Un estado es lo que lleva una respuesta.  En una peticion es un
+             * extremo contestando una pregunta que no hizo nadie.
+             * \~ */
+            return ErrorCode::ProtocolError;
+        case Pseudo::None:
+            break;
+        }
+
+        return ErrorCode::NoError;
+    }
+
+    seen_ordinary_ = true;
+
+    /* \~english
+     * Lower case, and it is a refusal rather than a folding.  HTTP/2 requires
+     * it on the wire, so a capital is a message that is wrong -- and folding
+     * it would make this server accept what the peer beside it refuses, which
+     * is where two recipients start disagreeing about a message.
+     *
+     * \~spanish
+     * En minusculas, y es un rechazo y no un plegado.  HTTP/2 lo exige en el
+     * cable, asi que una mayuscula es un mensaje que esta mal -- y plegarla
+     * haria que este servidor aceptara lo que rechaza el de al lado, que es por
+     * donde dos receptores empiezan a discrepar sobre un mensaje.
+     * \~ */
+    for (uint32_t i = 0; i < f.name.len; ++i) {
+        if (name[i] >= 'A' && name[i] <= 'Z') return ErrorCode::ProtocolError;
+        if (!is_tchar(name[i])) return ErrorCode::ProtocolError;
+    }
+
+    if (f.id != FieldId::Unknown && (kForbiddenInH2 & bit(f.id)) != 0)
+        return ErrorCode::ProtocolError;
+
+    /* \~english
+     * `TE` survives, and only saying `trailers`.  It is the one connection
+     * field HTTP/2 keeps, because what it asks for -- that trailers are
+     * acceptable -- is about the message and not about the hop.
+     * \~spanish
+     * `TE` sobrevive, y solo diciendo `trailers`.  Es la unica cabecera de
+     * conexion que conserva HTTP/2, porque lo que pide -- que se admitan
+     * remolques -- es del mensaje y no del salto.
+     * \~ */
+    if (f.id == FieldId::TE) {
+        const char *want = "trailers";
+        if (f.value.len != 8) return ErrorCode::ProtocolError;
+        const uint8_t *v = base + f.value.off;
+        for (int i = 0; i < 8; ++i)
+            if (v[i] != static_cast<uint8_t>(want[i]))
+                return ErrorCode::ProtocolError;
+    }
+
+    Field out_field{};
+    out_field.name_off = f.name.off;
+    out_field.name_len = static_cast<uint16_t>(f.name.len);
+    out_field.value_off = f.value.off;
+    out_field.value_len = static_cast<uint16_t>(f.value.len);
+    out_field.id = f.id;
+    req.fields.add(out_field);
+
+    return ErrorCode::NoError;
+}
+
+ErrorCode Decoder::decode(const uint8_t *block, size_t n, Buffer &out,
+                          Request &req) noexcept {
+    req.clear();
+    list_size_ = 0;
+    seen_ordinary_ = false;
+    pseudo_seen_ = 0;
+
+    /* \~english
+     * A size update may only come at the front of a block.  Once a field has
+     * been read, the table has changed underneath, and a limit arriving then
+     * would evict things the encoder still believes are there.
+     *
+     * \~spanish
+     * Un cambio de tamano solo puede ir al principio de un bloque.  Una vez
+     * leida una cabecera la tabla ha cambiado por debajo, y un limite que
+     * llegara entonces desalojaria cosas que el codificador todavia cree que
+     * estan.
+     * \~ */
+    bool updates_still_allowed = true;
+
+    size_t at = 0;
+    while (at < n) {
+        const uint8_t lead = block[at];
+
+        if ((lead & 0x80) != 0) {
+            // Indexada: nombre y valor, los dos de una tabla.
+            const IntResult idx = decode_int(block + at, n - at, 7);
+            if (idx.status != Status::Ok) return ErrorCode::CompressionError;
+            at += idx.used;
+            updates_still_allowed = false;
+
+            Reading f{};
+            const ErrorCode e = take_indexed_name(idx.value, out, f);
+            if (e != ErrorCode::NoError) return e;
+
+            if (idx.value <= kStaticEntries) {
+                const StaticEntry *se = static_entry(idx.value);
+                if (!put(out, se->value, se->value_len, f.value))
+                    return ErrorCode::InternalError;
+            } else {
+                const size_t back =
+                    static_cast<size_t>(idx.value - kStaticEntries - 1);
+                const TableEntry *te = table_.at(back);
+                if (te == nullptr) return ErrorCode::CompressionError;
+
+                const size_t start = out.size();
+                uint8_t *room = out.reserve(te->value_len);
+                if (room == nullptr) return ErrorCode::InternalError;
+                const size_t got = table_.copy_value(back, room, te->value_len);
+                out.commit(got);
+                f.value = Span{static_cast<uint32_t>(start),
+                               static_cast<uint32_t>(got)};
+            }
+
+            const ErrorCode k = keep(out, f, req);
+            if (k != ErrorCode::NoError) return k;
+            continue;
+        }
+
+        if ((lead & 0x20) != 0 && (lead & 0x40) == 0) {
+            // Cambio de tamano de la tabla.
+            if (!updates_still_allowed) return ErrorCode::CompressionError;
+
+            const IntResult size = decode_int(block + at, n - at, 5);
+            if (size.status != Status::Ok) return ErrorCode::CompressionError;
+            at += size.used;
+
+            if (!table_.set_max_size(static_cast<uint32_t>(size.value)))
+                return ErrorCode::CompressionError;
+            continue;
+        }
+
+        /* \~english
+         * Everything left is a literal, and the three kinds differ in two
+         * things: how many bits of the first byte are the index, and whether
+         * the field is remembered afterwards.
+         *
+         * \~spanish
+         * Lo que queda son literales, y las tres clases se diferencian en dos
+         * cosas: cuantos bits del primer byte son el indice, y si la cabecera
+         * se recuerda despues.
+         * \~ */
+        const bool remember = (lead & 0x40) != 0;
+        const uint8_t prefix = remember ? 6 : 4;
+
+        const IntResult idx = decode_int(block + at, n - at, prefix);
+        if (idx.status != Status::Ok) return ErrorCode::CompressionError;
+        at += idx.used;
+        updates_still_allowed = false;
+
+        Reading f{};
+        f.id = FieldId::Unknown;
+        f.pseudo = Pseudo::None;
+
+        if (idx.value != 0) {
+            const ErrorCode e = take_indexed_name(idx.value, out, f);
+            if (e != ErrorCode::NoError) return e;
+        } else {
+            const ErrorCode e = take_string(block, n, at, out, f.name);
+            if (e != ErrorCode::NoError) return e;
+
+            const uint8_t *nm = out.data() + f.name.off;
+            f.id = field_id_of(reinterpret_cast<const char *>(nm), f.name.len);
+            f.pseudo = f.name.len != 0 && nm[0] == ':'
+                           ? pseudo_of(nm, f.name.len)
+                           : Pseudo::None;
+        }
+
+        const ErrorCode e = take_string(block, n, at, out, f.value);
+        if (e != ErrorCode::NoError) return e;
+
+        if (remember) {
+            const uint8_t *base = out.data();
+            if (!table_.add(base + f.name.off, f.name.len, base + f.value.off,
+                            f.value.len, f.id, f.pseudo))
+                return ErrorCode::InternalError;
+        }
+
+        const ErrorCode k = keep(out, f, req);
+        if (k != ErrorCode::NoError) return k;
+    }
+
+    req.version = Version::Http2;
+    return ErrorCode::NoError;
+}
+
+} // namespace hpack
+} // namespace h2
+} // namespace http_vx

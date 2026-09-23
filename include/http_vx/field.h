@@ -130,6 +130,7 @@ enum class FieldId : uint16_t {
     // --- Authentication / autenticacion ---
     Authorization,
     ProxyAuthorization,
+    ProxyConnection,
     WWWAuthenticate,
     Cookie,
     SetCookie,

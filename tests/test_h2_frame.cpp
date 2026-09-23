@@ -653,7 +653,7 @@ void test_continuation_flood() {
      * que no van vacias y que tampoco terminan nunca.
      * \~ */
     http_vx::h2::Limits tight;
-    tight.max_header_list_size = 8;
+    tight.max_header_block_bytes = 8;
 
     Wire big;
     big.preface();

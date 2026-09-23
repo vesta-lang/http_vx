@@ -242,6 +242,39 @@ Breach check_chunked(const uint8_t *data, size_t size) noexcept;
  */
 Breach check_frames(const uint8_t *data, size_t size) noexcept;
 
+/**
+ * @brief
+ * \~english Reads @p data as an HPACK header block and checks every property.
+ * \~spanish Lee @p data como bloque de cabeceras HPACK y comprueba todas las
+ *           propiedades.
+ * \~
+ *
+ * \~english
+ * Only one pass here, because a header block is not read in pieces: the frame
+ * layer holds one until its last CONTINUATION, so there is no splitting for an
+ * answer to depend on.  What is left is the property that matters most of all
+ * of them -- that every piece of what comes out names bytes that are there --
+ * and this is the layer where it is hardest to keep: a name can arrive as an
+ * index, as Huffman bits or as plain bytes, and only one of those is in the
+ * message.
+ *
+ * \~spanish
+ * Aqui solo hay una pasada, porque un bloque de cabeceras no se lee a trozos:
+ * la capa de tramas guarda uno hasta su ultima CONTINUATION, asi que no hay
+ * particion de la que pueda depender una respuesta.  Lo que queda es la
+ * propiedad que mas importa de todas -- que cada pieza de lo que sale nombre
+ * bytes que estan -- y esta es la capa donde mas cuesta mantenerla: un nombre
+ * puede llegar como indice, como bits Huffman o como bytes tal cual, y solo uno
+ * de esos esta en el mensaje.
+ *
+ * \~
+ * @param data \~english the bytes  \~spanish los bytes  \~
+ * @param size \~english how many  \~spanish cuantos  \~
+ * @return     \~english what was broken, or @c Breach::None
+ *             \~spanish que se rompio, o @c Breach::None  \~
+ */
+Breach check_hpack(const uint8_t *data, size_t size) noexcept;
+
 } // namespace fuzz
 } // namespace http_vx
 

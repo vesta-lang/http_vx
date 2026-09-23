@@ -124,6 +124,7 @@ add_library(http_vx_proto STATIC
         proto/h1/parser.cpp
         proto/h1/writer.cpp
 
+        proto/h2/decoder.cpp
         proto/h2/frame.cpp
         proto/h2/hpack.cpp
         proto/h2/huffman.cpp
@@ -157,6 +158,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_codec_fuzz tests/test_codec_fuzz.cpp fuzz/codec_invariants.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
+    http_vx_add_test(test_h2_decoder tests/test_h2_decoder.cpp)
     http_vx_add_test(test_h2_frame tests/test_h2_frame.cpp)
     http_vx_add_test(test_h2_hpack tests/test_h2_hpack.cpp)
     http_vx_add_test(test_h2_huffman tests/test_h2_huffman.cpp)
@@ -177,7 +179,7 @@ if (HTTP_VX_BUILD_FUZZ)
     # Uno por lector, no uno con una bandera dentro: un fuzzer aprende la forma
     # de lo que se le da, y unos bytes que son una cabeza de peticion no son
     # unos bytes que sean un cuerpo troceado.
-    foreach (_target h1_parser h1_chunked h2_frame)
+    foreach (_target h1_parser h1_chunked h2_frame h2_hpack)
         add_executable(fuzz_${_target}
                 fuzz/fuzz_${_target}.cpp fuzz/codec_invariants.cpp)
         target_include_directories(fuzz_${_target}

@@ -17,6 +17,7 @@
 
 #include "http_vx/h1_chunked.h"
 #include "http_vx/h1_parser.h"
+#include "http_vx/h2_decoder.h"
 #include "http_vx/h2_reader.h"
 
 namespace http_vx {
@@ -488,6 +489,64 @@ Breach run_frames(const uint8_t *data, size_t size, size_t step,
 }
 
 } // namespace
+
+Breach check_hpack(const uint8_t *data, size_t size) noexcept {
+    h2::hpack::Decoder d;
+    h2::Limits limits;
+    d.reset(limits);
+
+    Buffer out;
+    Request req;
+
+    const h2::ErrorCode e = d.decode(data, size, out, req);
+    if (e != h2::ErrorCode::NoError) return Breach::None;
+
+    /* \~english
+     * Everything that came out must name bytes that came out.  This is the
+     * property the whole design rests on and the one this layer could break
+     * most easily, because what it produces points at a buffer it filled
+     * itself from three different sources.
+     *
+     * \~spanish
+     * Todo lo que salio tiene que nombrar bytes que salieron.  Es la propiedad
+     * sobre la que se apoya todo el diseno y la que esta capa podria romper mas
+     * facilmente, porque lo que produce apunta a un buffer que lleno ella misma
+     * desde tres sitios distintos.
+     * \~ */
+    const size_t limit = out.size();
+    if (!inside(req.method_text, limit)) return Breach::PieceOutsideTheMessage;
+    if (!inside(req.target, limit)) return Breach::PieceOutsideTheMessage;
+    if (!inside(req.authority, limit)) return Breach::PieceOutsideTheMessage;
+    if (!inside(req.scheme, limit)) return Breach::PieceOutsideTheMessage;
+
+    for (const Field *f = req.fields.begin(); f != req.fields.end(); ++f) {
+        if (!inside(Span{f->name_off, f->name_len}, limit))
+            return Breach::PieceOutsideTheMessage;
+        if (!inside(Span{f->value_off, f->value_len}, limit))
+            return Breach::PieceOutsideTheMessage;
+    }
+
+    /* \~english
+     * And reading the same block again with a fresh decoder gives the same
+     * answer.  A decoder that depended on anything but its input and its table
+     * would be a connection whose messages change meaning with the weather.
+     * \~spanish
+     * Y leer el mismo bloque otra vez con un descodificador nuevo da la misma
+     * respuesta.  Uno que dependiera de algo que no sea su entrada y su tabla
+     * seria una conexion cuyos mensajes cambian de significado con el tiempo
+     * que haga.
+     * \~ */
+    h2::hpack::Decoder again;
+    again.reset(limits);
+    Buffer out2;
+    Request req2;
+    if (again.decode(data, size, out2, req2) != h2::ErrorCode::NoError ||
+        out2.size() != out.size() ||
+        req2.fields.size() != req.fields.size())
+        return Breach::SplittingChangedTheAnswer;
+
+    return Breach::None;
+}
 
 Breach check_frames(const uint8_t *data, size_t size) noexcept {
     FrameOutcome whole{};

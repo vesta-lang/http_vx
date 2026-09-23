@@ -139,6 +139,7 @@ constexpr FieldRow kFields[] = {
 
     row("authorization"),
     row("proxy-authorization"),
+    row("proxy-connection"),
     row("www-authenticate"),
     row("cookie"),
     row("set-cookie"),

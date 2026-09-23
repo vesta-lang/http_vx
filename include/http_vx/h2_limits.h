@@ -90,14 +90,53 @@ struct Limits {
 
     /**
      * \~english
-     * How many bytes of header block one message may take, before
-     * decompression and across every frame that carries it.  Announced as
-     * `SETTINGS_MAX_HEADER_LIST_SIZE`.
+     * How many bytes of header block one message may take ON THE WIRE, across
+     * every frame that carries it.
+     *
+     * This is not `SETTINGS_MAX_HEADER_LIST_SIZE`, and the difference matters
+     * enough to be two fields: that setting counts the fields AFTER they are
+     * decompressed, and this counts the compressed bytes as they arrive.  One
+     * bounds what a message means and the other bounds what has to be held to
+     * find out -- and HPACK exists precisely so that the two numbers are
+     * nothing like each other.
      *
      * \~spanish
-     * Cuantos bytes de bloque de cabeceras puede ocupar un mensaje, antes de
-     * descomprimir y contando todas las tramas que lo llevan.  Se anuncia como
+     * Cuantos bytes de bloque de cabeceras puede ocupar un mensaje EN EL CABLE,
+     * contando todas las tramas que lo llevan.
+     *
+     * Esto no es `SETTINGS_MAX_HEADER_LIST_SIZE`, y la diferencia importa lo
+     * bastante para ser dos campos: ese ajuste cuenta las cabeceras DESPUES de
+     * descomprimirlas, y este cuenta los bytes comprimidos segun llegan.  Uno
+     * acota lo que un mensaje significa y el otro lo que hay que guardar para
+     * averiguarlo -- y HPACK existe justamente para que los dos numeros no se
+     * parezcan en nada.
+     * \~
+     */
+    uint32_t max_header_block_bytes = 32768;
+
+    /**
+     * \~english
+     * How many bytes the fields of one message may take once they are
+     * decompressed, counted the specification's way: name plus value plus
+     * thirty-two, per field.  Announced as `SETTINGS_MAX_HEADER_LIST_SIZE`.
+     *
+     * **This is the one that bounds the bomb.**  A block of a few hundred
+     * bytes can name a remembered field thousands of times, and each naming
+     * costs one byte on the wire and whatever the field is worth once it is
+     * written out.  The limit above never fires on that -- the block really is
+     * small -- and this one does.
+     *
+     * \~spanish
+     * Cuantos bytes pueden ocupar las cabeceras de un mensaje una vez
+     * descomprimidas, contadas como dice la especificacion: nombre mas valor
+     * mas treinta y dos, por cabecera.  Se anuncia como
      * `SETTINGS_MAX_HEADER_LIST_SIZE`.
+     *
+     * **Este es el que acota la bomba.**  Un bloque de unos cientos de bytes
+     * puede nombrar miles de veces una cabecera recordada, y cada mencion
+     * cuesta un byte en el cable y lo que valga la cabecera una vez escrita.
+     * El limite de arriba no salta nunca con eso -- el bloque es pequeno de
+     * verdad -- y este si.
      * \~
      */
     uint32_t max_header_list_size = 32768;

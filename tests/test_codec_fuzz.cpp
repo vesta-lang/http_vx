@@ -128,7 +128,7 @@ void report(Breach b, const uint8_t *data, size_t size) {
  *
  * \~
  */
-enum class Reader { Head, Body, Frames };
+enum class Reader { Head, Body, Frames, Hpack };
 
 void check_input(Reader which, const uint8_t *data, size_t size) {
     Breach b = Breach::None;
@@ -141,6 +141,9 @@ void check_input(Reader which, const uint8_t *data, size_t size) {
         break;
     case Reader::Frames:
         b = http_vx::fuzz::check_frames(data, size);
+        break;
+    case Reader::Hpack:
+        b = http_vx::fuzz::check_hpack(data, size);
         break;
     }
     if (b != Breach::None) report(b, data, size);
@@ -307,6 +310,51 @@ const uint8_t kFramesSplitBlock[] = {
     0, 0, 1, 0x09, 0x04, 0, 0, 0, 1, 0x0F,
 };
 
+/**
+ * @brief
+ * \~english The header blocks the mutations start from.
+ * \~spanish Los bloques de cabeceras de los que parten las mutaciones.
+ * \~
+ *
+ * \~english
+ * The specification's own examples, which are worth starting from for the same
+ * reason they are worth testing against: they exercise every kind of
+ * representation there is -- an index, a literal with a new name, a literal
+ * with an indexed one, Huffman and not -- in a handful of bytes.
+ *
+ * \~spanish
+ * Los ejemplos de la propia especificacion, que merecen ser el punto de partida
+ * por la misma razon por la que merecen ser la prueba: ejercitan todas las
+ * clases de representacion que hay -- un indice, un literal con nombre nuevo,
+ * uno con nombre indexado, Huffman y no -- en un punado de bytes.
+ *
+ * \~
+ */
+const uint8_t kHpackPlain[] = {
+    0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+    0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+};
+
+const uint8_t kHpackHuffman[] = {
+    0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5,
+    0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+};
+
+const uint8_t kHpackLiteral[] = {
+    0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b,
+    0x65, 0x79, 0x0c, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d,
+    0x76, 0x61, 0x6c, 0x75, 0x65,
+};
+
+const uint8_t kHpackSizeUpdate[] = {0x3f, 0xe1, 0x1f, 0x82, 0x86, 0x84};
+
+const Seed kHpackSeeds[] = {
+    seed(kHpackPlain),
+    seed(kHpackHuffman),
+    seed(kHpackLiteral),
+    seed(kHpackSizeUpdate),
+};
+
 const Seed kFrameSeeds[] = {
     seed(kFramesSettings),
     seed(kFramesRequest),
@@ -317,17 +365,20 @@ const Seed kFrameSeeds[] = {
 constexpr size_t kHeadSeedCount = sizeof(kHeadSeeds) / sizeof(kHeadSeeds[0]);
 constexpr size_t kBodySeedCount = sizeof(kBodySeeds) / sizeof(kBodySeeds[0]);
 constexpr size_t kFrameSeedCount = sizeof(kFrameSeeds) / sizeof(kFrameSeeds[0]);
+constexpr size_t kHpackSeedCount = sizeof(kHpackSeeds) / sizeof(kHpackSeeds[0]);
 
 const Seed *seeds_of(Reader which) noexcept {
     if (which == Reader::Head) return kHeadSeeds;
     if (which == Reader::Body) return kBodySeeds;
-    return kFrameSeeds;
+    if (which == Reader::Frames) return kFrameSeeds;
+    return kHpackSeeds;
 }
 
 size_t seed_count_of(Reader which) noexcept {
     if (which == Reader::Head) return kHeadSeedCount;
     if (which == Reader::Body) return kBodySeedCount;
-    return kFrameSeedCount;
+    if (which == Reader::Frames) return kFrameSeedCount;
+    return kHpackSeedCount;
 }
 
 /**
@@ -497,6 +548,11 @@ int main() {
     test_every_prefix(Reader::Frames);
     test_mutations(Reader::Frames, 0x2545F4914F6CDD1Dull, 20000);
     test_noise(Reader::Frames, 0xA24BAED4963EE407ull, 5000);
+
+    test_the_seeds(Reader::Hpack);
+    test_every_prefix(Reader::Hpack);
+    test_mutations(Reader::Hpack, 0x9E6C63D0676A9A99ull, 20000);
+    test_noise(Reader::Hpack, 0x1CE4E5B9BF584769ull, 5000);
 
     if (failures != 0) {
         std::fprintf(stderr, "test_codec_fuzz: %d failures\n", failures);
