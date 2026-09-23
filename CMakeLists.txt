@@ -102,8 +102,10 @@ endif ()
 # ---------------------------------------------------------------------------
 
 add_library(http_vx_proto STATIC
+        proto/semantics/chars.cpp
         proto/semantics/field.cpp
         proto/semantics/fields.cpp
+        proto/semantics/method.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -114,7 +116,9 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 if (HTTP_VX_BUILD_TESTS)
     enable_testing()
     include(cmake/http_vx_tests.cmake)
+    http_vx_add_test(test_chars tests/test_chars.cpp proto/semantics/chars.cpp)
     http_vx_add_test(test_field tests/test_field.cpp proto/semantics/field.cpp)
     http_vx_add_test(test_fields tests/test_fields.cpp
             proto/semantics/field.cpp proto/semantics/fields.cpp)
+    http_vx_add_test(test_method tests/test_method.cpp proto/semantics/method.cpp)
 endif ()
