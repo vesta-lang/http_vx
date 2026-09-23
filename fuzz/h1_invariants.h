@@ -110,6 +110,35 @@ enum class Breach : uint8_t {
      * \~
      */
     SplittingChangedTheAnswer,
+
+    /**
+     * \~english
+     * A piece of the body was handed over that starts before the previous one
+     * ended.  The pieces of a body are a partition of it in order, and one
+     * that goes backwards means the same bytes are delivered twice -- which a
+     * handler counting or hashing them cannot see and cannot recover from.
+     * \~spanish
+     * Se entrego un pedazo de cuerpo que empieza antes de que acabara el
+     * anterior.  Los pedazos de un cuerpo son una particion de el en orden, y
+     * uno que retroceda quiere decir que los mismos bytes se entregan dos
+     * veces -- que un manejador que los cuente o los resuma no puede ver ni
+     * remediar.
+     * \~
+     */
+    PieceWentBackwards,
+
+    /**
+     * \~english
+     * The body's length does not match the pieces that were handed over.  One
+     * of the two is what a handler believes and the other is what it received,
+     * and nothing downstream can tell which.
+     * \~spanish
+     * La longitud del cuerpo no coincide con los pedazos entregados.  Una de
+     * las dos es lo que cree un manejador y la otra lo que recibio, y nada de
+     * mas abajo puede decir cual.
+     * \~
+     */
+    BodyLengthDisagrees,
 };
 
 /**
@@ -151,6 +180,37 @@ const char *breach_name(Breach b) noexcept;
  *             \~spanish que se rompio, o @c Breach::None  \~
  */
 Breach check_parse(const uint8_t *data, size_t size) noexcept;
+
+/**
+ * @brief
+ * \~english Reads @p data as a chunked body twice and checks every property.
+ * \~spanish Lee @p data como cuerpo troceado dos veces y comprueba todas las
+ *           propiedades.
+ * \~
+ *
+ * \~english
+ * The same two passes, and three properties more that only a body has: the
+ * pieces handed over must go forwards, they must add up to the length that is
+ * reported, and the two passes must hand over the SAME BYTES -- which is not
+ * the same as the same pieces.  A chunk split across two reads comes back as
+ * two pieces rather than one, so the passes are allowed to differ in how the
+ * body is divided and in nothing else.
+ *
+ * \~spanish
+ * Las mismas dos pasadas, y tres propiedades mas que solo tiene un cuerpo: los
+ * pedazos entregados tienen que ir hacia delante, tienen que sumar la longitud
+ * que se informa, y las dos pasadas tienen que entregar LOS MISMOS BYTES -- que
+ * no es lo mismo que los mismos pedazos.  Un trozo partido entre dos lecturas
+ * vuelve como dos pedazos y no como uno, asi que las pasadas pueden diferir en
+ * como se divide el cuerpo y en nada mas.
+ *
+ * \~
+ * @param data \~english the bytes  \~spanish los bytes  \~
+ * @param size \~english how many  \~spanish cuantos  \~
+ * @return     \~english what was broken, or @c Breach::None
+ *             \~spanish que se rompio, o @c Breach::None  \~
+ */
+Breach check_chunked(const uint8_t *data, size_t size) noexcept;
 
 } // namespace fuzz
 } // namespace http_vx

@@ -59,6 +59,7 @@
 #ifndef HTTP_VX_H1_PARSER_H
 #define HTTP_VX_H1_PARSER_H
 
+#include "http_vx/h1_limits.h"
 #include "http_vx/message.h"
 
 #include <cstddef>
@@ -219,71 +220,6 @@ enum class ParseError : uint8_t {
     /// \~english More than one `Host`, which names two sites.
     /// \~spanish Mas de un `Host`, que nombra dos sitios.  \~
     MultipleHosts,
-};
-
-/**
- * @brief
- * \~english What the parser refuses to exceed.
- * \~spanish Lo que el analizador se niega a pasar.
- * \~
- *
- * \~english
- * These are the real limits, the ones that answer a status code instead of
- * dropping a connection.  They are here and not in the buffer because they
- * differ between the versions and because a refusal at this level can still be
- * explained to the peer.
- *
- * The defaults are what the common servers use, which matters more than what
- * is defensible in the abstract: a limit nobody else has is a limit that makes
- * requests fail here and nowhere else.
- *
- * \~spanish
- * Estos son los limites de verdad, los que contestan un codigo de estado en
- * vez de tirar una conexion.  Estan aqui y no en el buffer porque difieren
- * entre las versiones y porque una negativa a este nivel todavia se le puede
- * explicar al otro extremo.
- *
- * Los valores por defecto son los que usan los servidores corrientes, que
- * importa mas que lo que sea defendible en abstracto: un limite que no tiene
- * nadie mas es un limite que hace que las peticiones fallen aqui y en ningun
- * otro sitio.
- *
- * \~
- */
-struct Limits {
-    /// \~english How long the request line may be.  \~spanish Cuanto puede medir la linea de peticion.  \~
-    uint32_t max_request_line = 8192;
-    /// \~english How many bytes the field section may take.
-    /// \~spanish Cuantos bytes puede ocupar la seccion de cabeceras.  \~
-    uint32_t max_header_bytes = 32768;
-    /// \~english How many fields there may be.  \~spanish Cuantas cabeceras puede haber.  \~
-    uint16_t max_fields = 128;
-
-    /**
-     * \~english
-     * Whether to ignore an empty line before the request line.  The
-     * specification says a server SHOULD, for clients that used to write a
-     * spare CRLF after a body -- which is the point: those bytes come after a
-     * body, so accepting them is accepting bytes that could not be attributed
-     * to the message that carried them.
-     *
-     * So it is off, and it is an option rather than a decision made for
-     * everybody: a server talking to something old may need it, and a server
-     * behind an untrusted chain must not have it.
-     *
-     * \~spanish
-     * Si ignorar una linea vacia antes de la linea de peticion.  La
-     * especificacion dice que un servidor DEBERIA, por los clientes que
-     * escribian un CRLF de mas tras un cuerpo -- que es justo lo que importa:
-     * esos bytes vienen DESPUES de un cuerpo, asi que aceptarlos es aceptar
-     * bytes que no se pudieron atribuir al mensaje que los llevaba.
-     *
-     * Asi que esta apagado, y es una opcion y no una decision tomada por todos:
-     * un servidor que hable con algo antiguo puede necesitarlo, y uno que este
-     * detras de una cadena en la que no confia no debe tenerlo.
-     * \~
-     */
-    bool allow_leading_crlf = false;
 };
 
 /**

@@ -119,6 +119,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/method.cpp
         proto/semantics/status.cpp
 
+        proto/h1/chunked.cpp
         proto/h1/framing.cpp
         proto/h1/parser.cpp
 )
@@ -143,6 +144,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_content_length tests/test_content_length.cpp)
     http_vx_add_test(test_field tests/test_field.cpp)
     http_vx_add_test(test_fields tests/test_fields.cpp)
+    http_vx_add_test(test_h1_chunked tests/test_h1_chunked.cpp)
     http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp)
     http_vx_add_test(test_h1_fuzz tests/test_h1_fuzz.cpp fuzz/h1_invariants.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
@@ -159,8 +161,16 @@ endif ()
 # objetivo de fuzzing es una que corre cuando alguien se acuerda.
 # ---------------------------------------------------------------------------
 if (HTTP_VX_BUILD_FUZZ)
-    add_executable(fuzz_h1_parser fuzz/fuzz_h1_parser.cpp fuzz/h1_invariants.cpp)
-    target_include_directories(fuzz_h1_parser PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz)
-    target_compile_options(fuzz_h1_parser PRIVATE -Wall -Wextra -pedantic-errors)
-    target_link_libraries(fuzz_h1_parser PRIVATE http_vx_proto http_vx_core)
+    # Uno por lector, no uno con una bandera dentro: un fuzzer aprende la forma
+    # de lo que se le da, y unos bytes que son una cabeza de peticion no son
+    # unos bytes que sean un cuerpo troceado.
+    foreach (_target h1_parser h1_chunked)
+        add_executable(fuzz_${_target}
+                fuzz/fuzz_${_target}.cpp fuzz/h1_invariants.cpp)
+        target_include_directories(fuzz_${_target}
+                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz)
+        target_compile_options(fuzz_${_target}
+                PRIVATE -Wall -Wextra -pedantic-errors)
+        target_link_libraries(fuzz_${_target} PRIVATE http_vx_proto http_vx_core)
+    endforeach ()
 endif ()

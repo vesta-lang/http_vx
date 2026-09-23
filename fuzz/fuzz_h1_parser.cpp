@@ -87,3 +87,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     return 0;
 }
+
+/*
+ * \~english
+ * The body has a target of its own rather than a flag inside this one.  A
+ * fuzzer learns the shape of what it is given, and bytes that are a request
+ * head are not bytes that are a chunked body: mixing them would spend the run
+ * on inputs that one of the two readers refuses at the first byte, and would
+ * make a corpus that means one thing for half its entries.
+ *
+ * \~spanish
+ * El cuerpo tiene objetivo propio en vez de una bandera dentro de este.  Un
+ * fuzzer aprende la forma de lo que se le da, y unos bytes que son una cabeza
+ * de peticion no son unos bytes que sean un cuerpo troceado: mezclarlos
+ * gastaria la corrida en entradas que uno de los dos lectores rechaza al primer
+ * byte, y haria un corpus que significa una cosa para la mitad de sus entradas.
+ * \~
+ */

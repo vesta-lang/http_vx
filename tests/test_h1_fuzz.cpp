@@ -108,8 +108,32 @@ void report(Breach b, const uint8_t *data, size_t size) {
     ++failures;
 }
 
-void check_input(const uint8_t *data, size_t size) {
-    const Breach b = http_vx::fuzz::check_parse(data, size);
+/**
+ * @brief
+ * \~english Which reader an input is meant for.
+ * \~spanish Para cual de los dos lectores es una entrada.
+ * \~
+ *
+ * \~english
+ * The two are exercised from separate seeds rather than by giving every input
+ * to both.  A request head is not a chunked body: handing one to the other
+ * spends the run on inputs that are refused at the first byte, which explores
+ * one state instead of the machine.
+ *
+ * \~spanish
+ * Los dos se ejercitan desde semillas separadas y no dando cada entrada a los
+ * dos.  Una cabeza de peticion no es un cuerpo troceado: darle una al otro
+ * gasta la corrida en entradas que se rechazan al primer byte, que explora un
+ * estado en vez de la maquina.
+ *
+ * \~
+ */
+enum class Reader { Head, Body };
+
+void check_input(Reader which, const uint8_t *data, size_t size) {
+    const Breach b = which == Reader::Head
+                         ? http_vx::fuzz::check_parse(data, size)
+                         : http_vx::fuzz::check_chunked(data, size);
     if (b != Breach::None) report(b, data, size);
 }
 
@@ -135,7 +159,7 @@ void check_input(const uint8_t *data, size_t size) {
  *
  * \~
  */
-const char *const kSeeds[] = {
+const char *const kHeadSeeds[] = {
     "GET / HTTP/1.1\r\nHost: h\r\n\r\n",
     "POST /a/b?c=d HTTP/1.1\r\nHost: example.com\r\n"
     "Content-Length: 12\r\nContent-Type: text/plain\r\n\r\nhello world!",
@@ -145,7 +169,45 @@ const char *const kSeeds[] = {
     "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
 };
 
-constexpr size_t kSeedCount = sizeof(kSeeds) / sizeof(kSeeds[0]);
+/**
+ * @brief
+ * \~english The bodies the mutations start from.
+ * \~spanish Los cuerpos de los que parten las mutaciones.
+ * \~
+ *
+ * \~english
+ * Small on purpose.  What is interesting about a chunked body is the grammar
+ * between the pieces -- the sizes, the extensions, the endings, the
+ * trailers -- and a body with many short chunks has more of that per byte than
+ * one with a single long one.
+ *
+ * \~spanish
+ * Pequenos a proposito.  Lo interesante de un cuerpo troceado es la gramatica
+ * que hay entre los pedazos -- los tamanos, las extensiones, los finales, los
+ * remolques -- y un cuerpo con muchos trozos cortos tiene mas de eso por byte
+ * que uno con un solo trozo largo.
+ *
+ * \~
+ */
+const char *const kBodySeeds[] = {
+    "0\r\n\r\n",
+    "5\r\nhello\r\n0\r\n\r\n",
+    "1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n",
+    "a;x=y\r\n0123456789\r\n0;last\r\n\r\n",
+    "5\r\nhello\r\n0\r\nX-Sum: abc\r\nX-Other: 1\r\n\r\n",
+    "0005\r\nhello\r\n000\r\n\r\n",
+};
+
+constexpr size_t kHeadSeedCount = sizeof(kHeadSeeds) / sizeof(kHeadSeeds[0]);
+constexpr size_t kBodySeedCount = sizeof(kBodySeeds) / sizeof(kBodySeeds[0]);
+
+const char *const *seeds_of(Reader which) noexcept {
+    return which == Reader::Head ? kHeadSeeds : kBodySeeds;
+}
+
+size_t seed_count_of(Reader which) noexcept {
+    return which == Reader::Head ? kHeadSeedCount : kBodySeedCount;
+}
 
 /**
  * @brief
@@ -182,10 +244,11 @@ constexpr size_t kInterestingCount =
  * \~spanish Las propias semillas, sin cambiar.
  * \~
  */
-void test_the_seeds() {
-    for (size_t i = 0; i < kSeedCount; ++i)
-        check_input(reinterpret_cast<const uint8_t *>(kSeeds[i]),
-                    std::strlen(kSeeds[i]));
+void test_the_seeds(Reader which) {
+    const char *const *seeds = seeds_of(which);
+    for (size_t i = 0; i < seed_count_of(which); ++i)
+        check_input(which, reinterpret_cast<const uint8_t *>(seeds[i]),
+                    std::strlen(seeds[i]));
 }
 
 /**
@@ -206,11 +269,12 @@ void test_the_seeds() {
  *
  * \~
  */
-void test_every_prefix() {
-    for (size_t i = 0; i < kSeedCount; ++i) {
-        const uint8_t *d = reinterpret_cast<const uint8_t *>(kSeeds[i]);
-        const size_t len = std::strlen(kSeeds[i]);
-        for (size_t n = 0; n <= len; ++n) check_input(d, n);
+void test_every_prefix(Reader which) {
+    const char *const *seeds = seeds_of(which);
+    for (size_t i = 0; i < seed_count_of(which); ++i) {
+        const uint8_t *d = reinterpret_cast<const uint8_t *>(seeds[i]);
+        const size_t len = std::strlen(seeds[i]);
+        for (size_t n = 0; n <= len; ++n) check_input(which, d, n);
     }
 }
 
@@ -220,13 +284,15 @@ void test_every_prefix() {
  * \~spanish Semillas con bytes cambiados, metidos y quitados.
  * \~
  */
-void test_mutations() {
-    Rng rng(0x9E3779B97F4A7C15ull);
+void test_mutations(Reader which, uint64_t seed_value, int rounds) {
+    Rng rng(seed_value);
     uint8_t buf[512];
 
-    for (int round = 0; round < 20000; ++round) {
-        const size_t which = rng.below(kSeedCount);
-        const char *seed = kSeeds[which];
+    const char *const *seeds = seeds_of(which);
+    const size_t count = seed_count_of(which);
+
+    for (int round = 0; round < rounds; ++round) {
+        const char *seed = seeds[rng.below(static_cast<uint32_t>(count))];
         size_t len = std::strlen(seed);
         if (len > sizeof(buf)) len = sizeof(buf);
         std::memcpy(buf, seed, len);
@@ -254,7 +320,7 @@ void test_mutations() {
             }
         }
 
-        check_input(buf, len);
+        check_input(which, buf, len);
         if (failures > 4) return;
     }
 }
@@ -265,18 +331,18 @@ void test_mutations() {
  * \~spanish Bytes sin ningun mensaje detras.
  * \~
  */
-void test_noise() {
-    Rng rng(0xD1B54A32D192ED03ull);
+void test_noise(Reader which, uint64_t seed_value, int rounds) {
+    Rng rng(seed_value);
     uint8_t buf[256];
 
-    for (int round = 0; round < 5000; ++round) {
+    for (int round = 0; round < rounds; ++round) {
         const size_t len = rng.below(sizeof(buf) + 1);
         for (size_t i = 0; i < len; ++i) {
             buf[i] = rng.below(3) == 0
                          ? kInteresting[rng.below(kInterestingCount)]
                          : static_cast<uint8_t>(rng.next());
         }
-        check_input(buf, len);
+        check_input(which, buf, len);
         if (failures > 4) return;
     }
 }
@@ -284,10 +350,30 @@ void test_noise() {
 } // namespace
 
 int main() {
-    test_the_seeds();
-    test_every_prefix();
-    test_mutations();
-    test_noise();
+    /* \~english
+     * Each reader gets its own seeds and its own stream of numbers.  Sharing
+     * one stream would make the second reader's inputs depend on how many the
+     * first one took, so adding a case to one of them would silently change
+     * every input the other sees -- and a property test whose coverage moves
+     * when an unrelated case is added cannot say what it has covered.
+     *
+     * \~spanish
+     * Cada lector tiene sus semillas y su propia tirada de numeros.  Compartir
+     * una haria que las entradas del segundo dependieran de cuantas cogiera el
+     * primero, asi que anadir un caso a uno cambiaria calladamente todas las
+     * entradas que ve el otro -- y una prueba de propiedades cuya cobertura se
+     * mueve al anadir un caso que no tiene que ver no puede decir que ha
+     * cubierto.
+     * \~ */
+    test_the_seeds(Reader::Head);
+    test_every_prefix(Reader::Head);
+    test_mutations(Reader::Head, 0x9E3779B97F4A7C15ull, 20000);
+    test_noise(Reader::Head, 0xD1B54A32D192ED03ull, 5000);
+
+    test_the_seeds(Reader::Body);
+    test_every_prefix(Reader::Body);
+    test_mutations(Reader::Body, 0xBF58476D1CE4E5B9ull, 20000);
+    test_noise(Reader::Body, 0x94D049BB133111EBull, 5000);
 
     if (failures != 0) {
         std::fprintf(stderr, "test_h1_fuzz: %d failures\n", failures);

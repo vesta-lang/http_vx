@@ -15,6 +15,7 @@
 
 #include "h1_invariants.h"
 
+#include "http_vx/h1_chunked.h"
 #include "http_vx/h1_parser.h"
 
 namespace http_vx {
@@ -166,6 +167,10 @@ const char *breach_name(Breach b) noexcept {
         return "a piece of the request names bytes outside it";
     case Breach::SplittingChangedTheAnswer:
         return "the same bytes answered differently whole and in pieces";
+    case Breach::PieceWentBackwards:
+        return "a piece of the body starts before the previous one ended";
+    case Breach::BodyLengthDisagrees:
+        return "the body length does not match the pieces handed over";
     }
     return "unknown";
 }
@@ -210,6 +215,147 @@ Breach check_parse(const uint8_t *data, size_t size) noexcept {
             whole_req.authority.len != drip_req.authority.len)
             return Breach::SplittingChangedTheAnswer;
     }
+
+    return Breach::None;
+}
+
+namespace {
+
+/**
+ * @brief
+ * \~english What one pass over a chunked body came to.
+ * \~spanish A que llego una pasada sobre un cuerpo troceado.
+ * \~
+ *
+ * \~english
+ * The body is summarised and not kept.  A hash and a count say whether two
+ * passes delivered the same bytes without either pass having to hold them,
+ * which is the property the reader itself is built around: nothing here needs
+ * a whole body at once, and a check that needed one would be checking a
+ * different program.
+ *
+ * \~spanish
+ * El cuerpo se resume y no se guarda.  Un resumen y una cuenta dicen si las dos
+ * pasadas entregaron los mismos bytes sin que ninguna tenga que tenerlos, que
+ * es la propiedad sobre la que esta construido el propio lector: aqui nada
+ * necesita un cuerpo entero de una vez, y una comprobacion que lo necesitara
+ * estaria comprobando otro programa.
+ *
+ * \~
+ */
+struct BodyOutcome {
+    h1::ChunkResult result;
+    h1::ChunkError error;
+    size_t consumed;
+    uint64_t reported;
+    uint64_t delivered;
+    uint64_t hash;
+};
+
+/**
+ * @brief
+ * \~english Folds @p n bytes into @p h.  FNV-1a.
+ * \~spanish Mezcla @p n bytes en @p h.  FNV-1a.
+ * \~
+ */
+void fold(uint64_t &h, const uint8_t *p, size_t n) noexcept {
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001B3ull;
+    }
+}
+
+Breach run_body(const uint8_t *data, size_t size, size_t step,
+                BodyOutcome &out) noexcept {
+    h1::ChunkedReader r;
+    r.reset(0);
+    Fields trailers;
+
+    out.hash = 0xCBF29CE484222325ull;
+    out.delivered = 0;
+
+    size_t given = step == 0 ? size : 0;
+    size_t last_end = 0;
+
+    for (;;) {
+        const h1::ChunkResult res = r.read(data, given, trailers);
+
+        if (res == h1::ChunkResult::Data) {
+            const Span s = r.chunk();
+            if (!inside(s, given)) return Breach::PieceOutsideTheMessage;
+            if (s.off < last_end) return Breach::PieceWentBackwards;
+            last_end = static_cast<size_t>(s.off) + s.len;
+            fold(out.hash, data + s.off, s.len);
+            out.delivered += s.len;
+            continue;
+        }
+
+        if (res == h1::ChunkResult::NeedMore) {
+            if (r.consumed() != given) return Breach::AskedForMoreWithInputLeft;
+            if (given == size) {
+                out.result = res;
+                break;
+            }
+            given += step == 0 ? size : step;
+            if (given > size) given = size;
+            continue;
+        }
+
+        out.result = res;
+        break;
+    }
+
+    out.error = r.error();
+    out.consumed = r.consumed();
+    out.reported = r.body_bytes();
+
+    if (out.consumed > size) return Breach::ConsumedPastTheEnd;
+    if (out.result == h1::ChunkResult::Done &&
+        out.error != h1::ChunkError::None)
+        return Breach::DoneWithAReason;
+    if (out.result == h1::ChunkResult::Error &&
+        out.error == h1::ChunkError::None)
+        return Breach::RefusedWithoutAReason;
+
+    /* \~english
+     * What it says it read and what it handed over are two numbers a handler
+     * can act on, and nothing downstream can tell which of them is the body.
+     * \~spanish
+     * Lo que dice haber leido y lo que entrego son dos numeros sobre los que
+     * puede actuar un manejador, y nada de mas abajo puede decir cual de los
+     * dos es el cuerpo.
+     * \~ */
+    if (out.reported != out.delivered) return Breach::BodyLengthDisagrees;
+
+    return Breach::None;
+}
+
+} // namespace
+
+Breach check_chunked(const uint8_t *data, size_t size) noexcept {
+    BodyOutcome whole{};
+    const Breach a = run_body(data, size, 0, whole);
+    if (a != Breach::None) return a;
+
+    BodyOutcome drip{};
+    const Breach b = run_body(data, size, 1, drip);
+    if (b != Breach::None) return b;
+
+    if (whole.result != drip.result || whole.error != drip.error ||
+        whole.consumed != drip.consumed)
+        return Breach::SplittingChangedTheAnswer;
+
+    /* \~english
+     * And the same bytes, which is not the same as the same pieces: a chunk
+     * split across two reads comes back as two, so the division may differ and
+     * the content may not.
+     * \~spanish
+     * Y los mismos bytes, que no es lo mismo que los mismos pedazos: un trozo
+     * partido entre dos lecturas vuelve como dos, asi que la division puede
+     * diferir y el contenido no.
+     * \~ */
+    if (whole.delivered != drip.delivered || whole.hash != drip.hash)
+        return Breach::SplittingChangedTheAnswer;
 
     return Breach::None;
 }
