@@ -425,7 +425,25 @@ class RequestParser {
         Failed,
     };
 
-    ParseResult fail(ParseError e) noexcept;
+    /**
+     * \~english
+     * Refusing, which is called from a dozen places inside the state machine
+     * and taken by none of them in an ordinary request.  Out of line and cold
+     * so that those dozen call sites stay a call each instead of a copy each:
+     * the switch is the only hot loop in the whole parse, and what it costs is
+     * measured in how much of it fits in the instruction cache.
+     *
+     * \~spanish
+     * Rechazar, que se llama desde una docena de sitios de la maquina de
+     * estados y no lo coge ninguno en una peticion corriente.  Fuera de linea y
+     * en frio para que esa docena de sitios sean una llamada cada uno y no una
+     * copia cada uno: el switch es el unico bucle caliente de todo el analisis,
+     * y lo que cuesta se mide en cuanto de el cabe en la cache de
+     * instrucciones.
+     * \~
+     */
+    [[gnu::noinline, gnu::cold]] ParseResult fail(ParseError e) noexcept;
+
     ParseResult finish(Request &out) noexcept;
 
     Limits limits_;

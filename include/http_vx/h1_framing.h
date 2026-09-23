@@ -255,7 +255,7 @@ Framing frame_request_body(const Request &req, const uint8_t *base) noexcept;
  * @return  \~english the status code, or 0 if there is nothing to answer
  *          \~spanish el codigo de estado, o 0 si no hay nada que contestar  \~
  */
-StatusCode framing_status(FramingError e) noexcept;
+[[gnu::cold]] StatusCode framing_status(FramingError e) noexcept;
 
 } // namespace h1
 } // namespace http_vx

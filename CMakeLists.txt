@@ -131,30 +131,36 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 if (HTTP_VX_BUILD_TESTS)
     enable_testing()
     include(cmake/http_vx_tests.cmake)
-    http_vx_add_test(test_buffer tests/test_buffer.cpp core/buffer.cpp)
-    http_vx_add_test(test_chars tests/test_chars.cpp proto/semantics/chars.cpp)
-    http_vx_add_test(test_content_length tests/test_content_length.cpp
-            proto/semantics/chars.cpp proto/semantics/content_length.cpp
-            proto/semantics/field.cpp proto/semantics/fields.cpp)
-    http_vx_add_test(test_field tests/test_field.cpp proto/semantics/field.cpp)
-    http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp
-            proto/h1/framing.cpp proto/h1/parser.cpp
-            proto/semantics/chars.cpp proto/semantics/content_length.cpp
-            proto/semantics/field.cpp proto/semantics/fields.cpp
-            proto/semantics/message.cpp proto/semantics/method.cpp
-            proto/semantics/status.cpp)
-    http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp
-            proto/h1/parser.cpp
-            proto/semantics/chars.cpp proto/semantics/field.cpp
-            proto/semantics/fields.cpp proto/semantics/message.cpp
-            proto/semantics/method.cpp proto/semantics/status.cpp)
-    http_vx_add_test(test_fields tests/test_fields.cpp
-            proto/semantics/field.cpp proto/semantics/fields.cpp)
-    http_vx_add_test(test_message tests/test_message.cpp
-            proto/semantics/field.cpp proto/semantics/fields.cpp
-            proto/semantics/message.cpp proto/semantics/method.cpp
-            proto/semantics/status.cpp)
-    http_vx_add_test(test_method tests/test_method.cpp proto/semantics/method.cpp)
-    http_vx_add_test(test_status tests/test_status.cpp
-            proto/semantics/method.cpp proto/semantics/status.cpp)
+    # Cada prueba es SU fichero y nada mas: lo que necesite sale de las dos
+    # librerias, que es lo que las hace.  Antes cada una listaba los fuentes que
+    # usaba, y siete de ellas repetian las mismas siete lineas de `semantics/`:
+    # siete listas que mantener de acuerdo entre si y con el fichero de al lado,
+    # y cuyo modo de fallo es que anadir un fuente rompe el enlace de las que se
+    # olvidaron -- o, peor, que quitarlo no rompa nada porque ya no lo usaba
+    # ninguna.
+    http_vx_add_test(test_buffer tests/test_buffer.cpp)
+    http_vx_add_test(test_chars tests/test_chars.cpp)
+    http_vx_add_test(test_content_length tests/test_content_length.cpp)
+    http_vx_add_test(test_field tests/test_field.cpp)
+    http_vx_add_test(test_fields tests/test_fields.cpp)
+    http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp)
+    http_vx_add_test(test_h1_fuzz tests/test_h1_fuzz.cpp fuzz/h1_invariants.cpp)
+    http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
+    http_vx_add_test(test_message tests/test_message.cpp)
+    http_vx_add_test(test_method tests/test_method.cpp)
+    http_vx_add_test(test_status tests/test_status.cpp)
+endif ()
+
+# ---------------------------------------------------------------------------
+# El objetivo de fuzzing.  Apagado por defecto porque necesita un compilador con
+# libFuzzer, que no esta en todas partes; lo que SI corre en todas partes es
+# `test_h1_fuzz`, que comprueba las mismas propiedades contra entrada que genera
+# el.  Ver fuzz/h1_invariants.h: una comprobacion que solo vive dentro de un
+# objetivo de fuzzing es una que corre cuando alguien se acuerda.
+# ---------------------------------------------------------------------------
+if (HTTP_VX_BUILD_FUZZ)
+    add_executable(fuzz_h1_parser fuzz/fuzz_h1_parser.cpp fuzz/h1_invariants.cpp)
+    target_include_directories(fuzz_h1_parser PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz)
+    target_compile_options(fuzz_h1_parser PRIVATE -Wall -Wextra -pedantic-errors)
+    target_link_libraries(fuzz_h1_parser PRIVATE http_vx_proto http_vx_core)
 endif ()

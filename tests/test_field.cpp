@@ -32,7 +32,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <string>
 
 namespace {
 
@@ -127,12 +126,33 @@ void test_no_duplicates() {
  */
 void test_case_insensitive() {
     using http_vx::FieldId;
+
+    /* \~english
+     * A fixed buffer rather than a growing string.  No name reaches this size
+     * -- the assert below says so -- and a test that allocates has a second
+     * way to go red that has nothing to do with what it is testing.
+     * \~spanish
+     * Un buffer fijo en vez de una cadena que crece.  Ningun nombre llega a
+     * este tamano -- lo dice la comprobacion de abajo -- y una prueba que
+     * reserva tiene una segunda forma de ponerse roja que no tiene nada que ver
+     * con lo que prueba.
+     * \~ */
+    char upper[64];
+
     for (uint16_t i = 1; i < static_cast<uint16_t>(FieldId::Count); ++i) {
         const FieldId id = static_cast<FieldId>(i);
-        std::string upper = http_vx::field_name(id);
-        for (char &c : upper)
-            if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
-        check(http_vx::field_id_of(upper.data(), upper.size()) == id,
+        const char *name = http_vx::field_name(id);
+        const size_t len = http_vx::field_name_len(id);
+
+        check(len < sizeof(upper), "a field name does not fit the test's buffer");
+        if (len >= sizeof(upper)) continue;
+
+        for (size_t j = 0; j < len; ++j) {
+            const char c = name[j];
+            upper[j] = c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c;
+        }
+
+        check(http_vx::field_id_of(upper, len) == id,
               "the upper-case spelling does not resolve to the identifier");
     }
 }

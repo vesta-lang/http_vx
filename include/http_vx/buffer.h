@@ -300,12 +300,23 @@ class Buffer {
      * \~english
      * Slides the live bytes to the front.  Called only from @c reserve, and
      * only when it buys the room that was asked for.
+     *
+     * Cold, like @c grow below and for the same reason: what runs on every
+     * read is @c reserve finding the room already there, and these two are
+     * what it does when it does not.  Keeping them out of that path is a
+     * matter of what shares a cache line with the loop that reads the bytes.
+     *
      * \~spanish
      * Desliza los bytes vivos hacia delante.  Se llama solo desde @c reserve, y
      * solo cuando compra el sitio que se pidio.
+     *
+     * En frio, como @c grow de abajo y por lo mismo: lo que corre en cada
+     * lectura es @c reserve encontrando el sitio ya puesto, y estas dos son lo
+     * que hace cuando no.  Mantenerlas fuera de ese camino es cuestion de que
+     * comparte linea de cache con el bucle que lee los bytes.
      * \~
      */
-    void compact() noexcept;
+    [[gnu::noinline, gnu::cold]] void compact() noexcept;
 
     /**
      * \~english
@@ -314,7 +325,7 @@ class Buffer {
      * Pide un bloque mayor y traslada a el los bytes vivos.
      * \~
      */
-    bool grow(size_t want) noexcept;
+    [[gnu::noinline, gnu::cold]] bool grow(size_t want) noexcept;
 
     uint8_t *base_ = nullptr;
     size_t cap_ = 0;
