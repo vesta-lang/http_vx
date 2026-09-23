@@ -127,6 +127,7 @@ add_library(http_vx_proto STATIC
         proto/h2/frame.cpp
         proto/h2/hpack.cpp
         proto/h2/huffman.cpp
+        proto/h2/table.cpp
         proto/h2/reader.cpp
 )
 target_include_directories(http_vx_proto
@@ -159,6 +160,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_frame tests/test_h2_frame.cpp)
     http_vx_add_test(test_h2_hpack tests/test_h2_hpack.cpp)
     http_vx_add_test(test_h2_huffman tests/test_h2_huffman.cpp)
+    http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)

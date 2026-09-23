@@ -162,6 +162,42 @@ struct Limits {
      * \~
      */
     uint32_t max_concurrent_streams = 128;
+
+    /**
+     * \~english
+     * How many bytes of remembered fields this server will keep per
+     * connection, and what it announces as `SETTINGS_HEADER_TABLE_SIZE`.
+     *
+     * **This is the one limit that is about the MACHINE and not about a
+     * message.**  Four kilobytes is the value the specification starts every
+     * connection at, and it is four kilobytes EACH: at the million connections
+     * this project is built for, a table on every one of them is four
+     * gigabytes of remembered headers.
+     *
+     * Which is why the table is not made until a peer uses it.  A connection
+     * whose headers all come out of the static table -- which is most of a
+     * `GET` -- never needs one, and never pays for one.  Announcing a size is
+     * not the same as reserving it, and the difference is the difference
+     * between a number and a gigabyte.
+     *
+     * \~spanish
+     * Cuantos bytes de cabeceras recordadas guarda este servidor por conexion,
+     * y lo que anuncia como `SETTINGS_HEADER_TABLE_SIZE`.
+     *
+     * **Este es el unico limite que habla de la MAQUINA y no de un mensaje.**
+     * Cuatro kilobytes es el valor con el que la especificacion empieza todas
+     * las conexiones, y son cuatro kilobytes CADA UNA: al millon de conexiones
+     * para el que esta hecho este proyecto, una tabla en cada una son cuatro
+     * gigabytes de cabeceras recordadas.
+     *
+     * Que es la razon de que la tabla no se haga hasta que un extremo la use.
+     * Una conexion cuyas cabeceras salgan todas de la tabla estatica -- que es
+     * casi todo un `GET` -- no necesita una nunca, y no la paga nunca.
+     * Anunciar un tamano no es lo mismo que reservarlo, y la diferencia es la
+     * que hay entre un numero y un gigabyte.
+     * \~
+     */
+    uint32_t header_table_size = 4096;
 };
 
 } // namespace h2
