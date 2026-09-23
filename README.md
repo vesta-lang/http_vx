@@ -1,8 +1,8 @@
 # http_vx
 
-Un servidor HTTP/1.1 para sostener del orden de un millon de conexiones en una
-maquina, con la parte que toca la red escrita de forma que se pueda probar y
-fuzzear **sin abrir un socket**.
+Un servidor HTTP -- **1.1, 2 y 3** -- para sostener del orden de un millon de
+conexiones en una maquina, con la parte que toca la red escrita de forma que se
+pueda probar y fuzzear **sin abrir un socket**.
 
 Este fichero responde a **donde vive cada cosa y como se construye**. El porque
 de cada decision esta en [`doc/`](doc/), indexado al final.
@@ -22,7 +22,8 @@ Suelto o dentro de otro proyecto (`add_subdirectory`), como `vesta_alloc` y
 http_vx/
   include/   el contrato publico
   core/      slab, rueda de tiempos, pozo de buffers
-  proto/     HTTP/1.1: analizador y maquina de conexion
+  proto/     semantics/ h1/ h2/ h3/: la semantica y un codec por version
+  quic/      el transporte de HTTP/3: paquetes, perdida, congestion
   reactor/   la interfaz por finalizacion
   windows/   IOCP
   linux/     io_uring y epoll
@@ -40,9 +41,19 @@ bytes torcidos desde `fuzz/`, sin red y sin permisos.
 
 Es la misma regla que sostiene `common/` en `vesta_prof`.
 
-**`reactor/` no incluye nada de `proto/`.** Un bucle de eventos por
-finalizacion vale sin HTTP, y el analizador vale sobre cualquier cosa que le
+**`reactor/` no incluye nada de `proto/` ni de `quic/`.** Un bucle de eventos
+por finalizacion vale sin HTTP, y los codecs valen sobre cualquier cosa que les
 entregue bytes. Mezclarlos daria un servidor mas corto y una pieza inseparable.
+
+**`quic/` no esta debajo de `proto/`: es un TRANSPORTE**, al nivel de TCP. Que
+naciera para HTTP/3 no lo hace parte de HTTP, y meterlo ahi impediria usarlo
+para otra cosa -- que es lo contrario de para lo que existe este proyecto.
+
+**Una version del protocolo es un codec, no un servidor.** La semantica -- que
+significa una peticion: metodo, cabeceras, estado, cuerpo -- es la misma en las
+tres, y vive en `proto/semantics/`. Lo que cambia entre 1.1, 2 y 3 es como se
+escriben los bytes. Por eso un manejador no necesita saber por donde llego la
+peticion.
 
 **`bench/` no es opcional.** Un servidor que promete un millon de conexiones
 tiene que poder ensenar cuanto ocupa cada una en la maquina de quien pregunta.
