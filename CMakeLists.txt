@@ -118,6 +118,8 @@ add_library(http_vx_proto STATIC
         proto/semantics/message.cpp
         proto/semantics/method.cpp
         proto/semantics/status.cpp
+
+        proto/h1/parser.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -134,6 +136,11 @@ if (HTTP_VX_BUILD_TESTS)
             proto/semantics/chars.cpp proto/semantics/content_length.cpp
             proto/semantics/field.cpp proto/semantics/fields.cpp)
     http_vx_add_test(test_field tests/test_field.cpp proto/semantics/field.cpp)
+    http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp
+            proto/h1/parser.cpp
+            proto/semantics/chars.cpp proto/semantics/field.cpp
+            proto/semantics/fields.cpp proto/semantics/message.cpp
+            proto/semantics/method.cpp proto/semantics/status.cpp)
     http_vx_add_test(test_fields tests/test_fields.cpp
             proto/semantics/field.cpp proto/semantics/fields.cpp)
     http_vx_add_test(test_message tests/test_message.cpp
