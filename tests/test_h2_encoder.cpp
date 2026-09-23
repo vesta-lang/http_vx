@@ -128,12 +128,16 @@ void test_the_common_answer_is_one_byte() {
     e.reset(4096);
 
     http_vx::Buffer out;
-    check(e.write_status(out, 200) == WriteStatus::Ok, "200 se escribe");
-    check(out.size() == 1 && out.data()[0] == 0x88, "200 es el indice 8");
+    check(e.write_status(out, 200) == WriteStatus::Ok,
+          "a status of 200 was refused");
+    check(out.size() == 1 && out.data()[0] == 0x88,
+          "a status of 200 is not one byte naming entry eight");
 
     out.clear();
-    check(e.write_status(out, 404) == WriteStatus::Ok, "404 se escribe");
-    check(out.size() == 1 && out.data()[0] == 0x8D, "404 es el indice 13");
+    check(e.write_status(out, 404) == WriteStatus::Ok,
+          "a status of 404 was refused");
+    check(out.size() == 1 && out.data()[0] == 0x8D,
+          "a status of 404 is not one byte naming entry thirteen");
 
     /* \~english
      * Not one of the seven the table has, so the name is an index and the three
@@ -145,8 +149,10 @@ void test_the_common_answer_is_one_byte() {
      * entrada ocho, y detras una cadena de tres bytes.
      * \~ */
     out.clear();
-    check(e.write_status(out, 451) == WriteStatus::Ok, "451 se escribe");
-    check(out.size() > 1, "451 no esta en la tabla");
+    check(e.write_status(out, 451) == WriteStatus::Ok,
+          "a status of 451 was refused");
+    check(out.size() > 1,
+          "a status the static table does not have came out in one byte");
 
     /* \~english
      * `accept-encoding: gzip, deflate` is entry sixteen with its value, so the
@@ -158,9 +164,9 @@ void test_the_common_answer_is_one_byte() {
     out.clear();
     check(put(e, out, FieldId::AcceptEncoding, "gzip, deflate") ==
               WriteStatus::Ok,
-          "accept-encoding se escribe");
+          "accept-encoding was refused");
     check(out.size() == 1 && out.data()[0] == 0x90,
-          "accept-encoding: gzip, deflate es el indice 16");
+          "accept-encoding: gzip, deflate is not one byte naming entry sixteen");
 }
 
 /**
@@ -198,33 +204,33 @@ void test_the_two_tables_stay_in_step() {
 
         check(put(e, block, FieldId::ContentType, "text/html; charset=utf-8",
                   Indexing::Incremental) == WriteStatus::Ok,
-              "content-type se escribe");
+              "content-type was refused");
         check(put(e, block, "x-request-id", "abc123def456",
                   Indexing::Incremental) == WriteStatus::Ok,
-              "x-request-id se escribe");
+              "x-request-id was refused");
         check(put(e, block, FieldId::ContentLength, "1024") == WriteStatus::Ok,
-              "content-length se escribe");
+              "content-length was refused");
 
         if (round == 0) {
             first_size = block.size();
         } else {
             check(block.size() < first_size,
-                  "la repeticion cuesta menos que la primera vez");
+                  "saying the same fields again did not cost less");
         }
 
         http_vx::Buffer out;
         http_vx::Request req;
         const ErrorCode ec = d.decode(block.data(), block.size(), out, req);
-        check(ec == ErrorCode::NoError, "el bloque se descodifica");
+        check(ec == ErrorCode::NoError, "the block did not decode");
 
-        check(req.fields.size() == 3, "salen tres cabeceras");
+        check(req.fields.size() == 3, "three fields did not come out");
         check(field_is(req, out, 0, "content-type",
                        "text/html; charset=utf-8"),
-              "la primera es content-type");
+              "the first field is not content-type");
         check(field_is(req, out, 1, "x-request-id", "abc123def456"),
-              "la segunda es x-request-id");
+              "the second field is not x-request-id");
         check(field_is(req, out, 2, "content-length", "1024"),
-              "la tercera es content-length");
+              "the third field is not content-length");
     }
 
     /* \~english
@@ -239,9 +245,9 @@ void test_the_two_tables_stay_in_step() {
      * distinta antes de salir como una cabecera equivocada.
      * \~ */
     check(e.table().count() == d.table().count(),
-          "las dos tablas recuerdan lo mismo");
+          "the two tables remember a different number of fields");
     check(e.table().size() == d.table().size(),
-          "las dos tablas gastan lo mismo");
+          "the two tables spend a different number of bytes");
 }
 
 /**
@@ -272,14 +278,14 @@ void test_a_secret_is_never_remembered() {
 
     check(put(e, out, FieldId::Authorization, "Bearer s3cr3t",
               Indexing::Incremental) == WriteStatus::MustNotBeIndexed,
-          "authorization no se puede recordar");
-    check(out.size() == 0, "y no se escribio nada");
-    check(e.table().count() == 0, "ni se recordo nada");
+          "authorization was allowed to be remembered");
+    check(out.size() == 0, "a refused field still wrote bytes");
+    check(e.table().count() == 0, "a refused field still went in the table");
 
     check(put(e, out, "cookie", "session=abc", Indexing::Incremental) ==
               WriteStatus::MustNotBeIndexed,
-          "cookie escrita con letras tampoco");
-    check(out.size() == 0, "y tampoco se escribio nada");
+          "cookie spelled out was allowed to be remembered");
+    check(out.size() == 0, "a refused spelled-out field still wrote bytes");
 
     /* \~english
      * Written the right way it goes out, and the first byte says what it is:
@@ -290,10 +296,11 @@ void test_a_secret_is_never_remembered() {
      * \~ */
     check(put(e, out, FieldId::Authorization, "Bearer s3cr3t",
               Indexing::Never) == WriteStatus::Ok,
-          "authorization se manda sin indexar nunca");
+          "authorization was refused in the never-indexed form");
     check(out.size() > 0 && (out.data()[0] & 0xF0) == 0x10,
-          "y va en la forma que nadie recuerda");
-    check(e.table().count() == 0, "sigue sin recordarse nada");
+          "it did not go out in the form nobody remembers");
+    check(e.table().count() == 0,
+          "the never-indexed form still went in the table");
 
     /* \~english
      * Sent without being remembered is the ordinary way, and it must not be
@@ -305,7 +312,7 @@ void test_a_secret_is_never_remembered() {
      * \~ */
     check(put(e, out, FieldId::Authorization, "Bearer s3cr3t") ==
               WriteStatus::Ok,
-          "y sin indexar tambien vale");
+          "authorization was refused without indexing");
 }
 
 /**
@@ -334,16 +341,16 @@ void test_huffman_only_when_it_helps() {
     e.reset(4096);
 
     /* \~english
-     * Lower-case letters are what the code was measured on, so a path comes out
-     * shorter coded.
+     * Lower-case letters are what the code was measured on, so a value of them
+     * comes out shorter coded.
      * \~spanish
-     * Las minusculas son sobre lo que se midio el codigo, asi que un camino sale
-     * mas corto codificado.
+     * Las minusculas son sobre lo que se midio el codigo, asi que un valor de
+     * ellas sale mas corto codificado.
      * \~ */
     http_vx::Buffer out;
     check(put(e, out, "x-thing", "aaaaaaaaaaaaaaaaaaaaaaaa") ==
               WriteStatus::Ok,
-          "un valor de letras se escribe");
+          "a value of letters was refused");
 
     /* \~english
      * The first byte is the representation, then the name's length, then the
@@ -368,7 +375,7 @@ void test_huffman_only_when_it_helps() {
      * codificador elegia mal.
      * \~ */
     const size_t vlen_at = 2 + (out.data()[1] & 0x7F);
-    check((out.data()[vlen_at] & 0x80) != 0, "las letras van codificadas");
+    check((out.data()[vlen_at] & 0x80) != 0, "a value of letters was not coded");
 
     /* \~english
      * Bytes the code was not measured on take more than eight bits each, so
@@ -383,8 +390,9 @@ void test_huffman_only_when_it_helps() {
     out.clear();
     check(e.write_field(out, bytes_of("x-thing"), std::strlen("x-thing"), high,
                         sizeof high) == WriteStatus::Ok,
-          "un valor binario se escribe");
-    check((out.data()[vlen_at] & 0x80) == 0, "lo binario va tal cual");
+          "a binary value was refused");
+    check((out.data()[vlen_at] & 0x80) == 0,
+          "a binary value was coded, which makes it longer");
 
     /* \~english
      * And it survives the trip either way, which is what says the choice is
@@ -400,13 +408,13 @@ void test_huffman_only_when_it_helps() {
     http_vx::Buffer decoded;
     http_vx::Request req;
     check(d.decode(out.data(), out.size(), decoded, req) == ErrorCode::NoError,
-          "el bloque binario se descodifica");
-    check(req.fields.size() == 1, "sale una cabecera");
+          "the block with the binary value did not decode");
+    check(req.fields.size() == 1, "one field did not come out");
 
     const http_vx::Field &f = req.fields.begin()[0];
     check(f.value_len == sizeof high &&
               std::memcmp(decoded.data() + f.value_off, high, sizeof high) == 0,
-          "y el valor binario vuelve igual");
+          "the binary value did not come back the same");
 }
 
 /**
@@ -443,8 +451,8 @@ void test_a_field_too_big_empties_both() {
     http_vx::Buffer block;
     check(put(e, block, "x-small", "v", Indexing::Incremental) ==
               WriteStatus::Ok,
-          "la pequena se escribe");
-    check(e.table().count() == 1, "y se recuerda");
+          "the small field was refused");
+    check(e.table().count() == 1, "the small field was not remembered");
 
     char big[128];
     std::memset(big, 'a', sizeof big - 1);
@@ -452,16 +460,18 @@ void test_a_field_too_big_empties_both() {
 
     check(put(e, block, "x-big", big, Indexing::Incremental) ==
               WriteStatus::Ok,
-          "la grande se escribe igual");
-    check(e.table().count() == 0, "y vacia la tabla sin entrar");
+          "a field bigger than the whole table was refused");
+    check(e.table().count() == 0,
+          "a field bigger than the whole table did not empty it");
 
     http_vx::Buffer out;
     http_vx::Request req;
     check(d.decode(block.data(), block.size(), out, req) == ErrorCode::NoError,
-          "el bloque se descodifica");
-    check(field_is(req, out, 0, "x-small", "v"), "la pequena llega");
-    check(field_is(req, out, 1, "x-big", big), "la grande llega");
-    check(d.table().count() == 0, "y el otro extremo tambien se vacio");
+          "the block did not decode");
+    check(field_is(req, out, 0, "x-small", "v"),
+          "the small field did not arrive");
+    check(field_is(req, out, 1, "x-big", big), "the big field did not arrive");
+    check(d.table().count() == 0, "the peer's table was not emptied too");
 }
 
 } // namespace
@@ -474,7 +484,7 @@ int main() {
     test_a_field_too_big_empties_both();
 
     if (failures != 0) {
-        std::fprintf(stderr, "%d fallos\n", failures);
+        std::fprintf(stderr, "%d failures\n", failures);
         return 1;
     }
     std::printf("ok\n");

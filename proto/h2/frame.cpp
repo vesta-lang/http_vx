@@ -160,39 +160,6 @@ static_assert(kTypeCount == static_cast<size_t>(FrameType::Continuation) + 1,
               "the frame table and FrameType disagree: every type needs "
               "exactly one row, at its own wire value");
 
-/**
- * @brief
- * \~english Reads a big-endian number of @p n bytes.
- * \~spanish Lee un numero big-endian de @p n bytes.
- * \~
- *
- * \~english
- * Byte by byte rather than by reading a word and swapping it.  The header is
- * nine bytes and its fields are three and four long and not aligned to
- * anything, so a word read would be unaligned and a swap would still be
- * needed; this way there is nothing to get wrong on a machine of either
- * byte order.
- *
- * \~spanish
- * Byte a byte y no leyendo una palabra y dandole la vuelta.  La cabecera mide
- * nueve bytes y sus campos miden tres y cuatro y no estan alineados a nada, asi
- * que una lectura de palabra estaria desalineada y seguiria haciendo falta
- * darle la vuelta; asi no hay nada que errar en una maquina de cualquiera de
- * los dos ordenes de byte.
- *
- * \~
- */
-inline uint32_t be24(const uint8_t *p) noexcept {
-    return (static_cast<uint32_t>(p[0]) << 16) |
-           (static_cast<uint32_t>(p[1]) << 8) | static_cast<uint32_t>(p[2]);
-}
-
-inline uint32_t be32(const uint8_t *p) noexcept {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-}
-
 } // namespace
 
 void decode_frame_header(const uint8_t *p, FrameHeader &out) noexcept {
@@ -220,9 +187,7 @@ void decode_frame_header(const uint8_t *p, FrameHeader &out) noexcept {
 }
 
 void encode_frame_header(uint8_t *p, const FrameHeader &h) noexcept {
-    p[0] = static_cast<uint8_t>((h.length >> 16) & 0xFF);
-    p[1] = static_cast<uint8_t>((h.length >> 8) & 0xFF);
-    p[2] = static_cast<uint8_t>(h.length & 0xFF);
+    put_be24(p, h.length);
     p[3] = h.type;
     p[4] = h.flags;
 
@@ -234,11 +199,7 @@ void encode_frame_header(uint8_t *p, const FrameHeader &h) noexcept {
      * identificador.  Escribirlo puesto seria reclamar un significado que nadie
      * ha definido.
      * \~ */
-    const uint32_t id = h.stream_id & 0x7FFFFFFFu;
-    p[5] = static_cast<uint8_t>((id >> 24) & 0xFF);
-    p[6] = static_cast<uint8_t>((id >> 16) & 0xFF);
-    p[7] = static_cast<uint8_t>((id >> 8) & 0xFF);
-    p[8] = static_cast<uint8_t>(id & 0xFF);
+    put_be32(p + 5, h.stream_id & 0x7FFFFFFFu);
 }
 
 const char *frame_type_name(uint8_t type) noexcept {

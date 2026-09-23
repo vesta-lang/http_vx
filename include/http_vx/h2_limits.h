@@ -237,6 +237,46 @@ struct Limits {
      * \~
      */
     uint32_t header_table_size = 4096;
+
+    /**
+     * \~english
+     * How many bytes of a request body this server will take on a stream
+     * before it has said anything back, and what it announces as
+     * `SETTINGS_INITIAL_WINDOW_SIZE`.
+     *
+     * **It is the only limit here that is also an allowance**, and that makes
+     * it read the wrong way round: raising it does not protect anything, it
+     * offers more.  Sixty-four kilobytes per stream, times the concurrency
+     * above, is what one connection can have in flight before the server has
+     * agreed to any of it.
+     *
+     * The default is the specification's, which is 65535 and not 65536 -- one
+     * byte short of the round number, because the field is the one that also
+     * has to hold a window that has gone into debt.  Copying it out of the
+     * specification rather than writing the round number is the difference
+     * between a connection that agrees with its peer and one that is off by
+     * one byte for its whole life.
+     *
+     * \~spanish
+     * Cuantos bytes de cuerpo de peticion acepta este servidor en un flujo
+     * antes de haber contestado nada, y lo que anuncia como
+     * `SETTINGS_INITIAL_WINDOW_SIZE`.
+     *
+     * **Es el unico limite de aqui que es ademas un credito**, y eso lo hace
+     * leerse al reves: subirlo no protege nada, ofrece mas.  Sesenta y cuatro
+     * kilobytes por flujo, por la concurrencia de arriba, es lo que puede tener
+     * en vuelo una sola conexion antes de que el servidor haya consentido nada
+     * de ello.
+     *
+     * El valor por defecto es el de la especificacion, que es 65535 y no 65536
+     * -- un byte menos que el numero redondo, porque el campo es el que tiene
+     * que guardar ademas una ventana que se haya quedado en deuda --.  Copiarlo
+     * de la especificacion en vez de escribir el numero redondo es la diferencia
+     * entre una conexion que esta de acuerdo con su extremo y una que va
+     * desfasada un byte toda su vida.
+     * \~
+     */
+    uint32_t initial_window_size = 65535;
 };
 
 } // namespace h2

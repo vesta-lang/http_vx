@@ -69,6 +69,77 @@ constexpr size_t kFrameHeaderSize = 9;
 
 /**
  * @brief
+ * \~english How this protocol's numbers are read and written.
+ * \~spanish Como se leen y se escriben los numeros de este protocolo.
+ * \~
+ *
+ * \~english
+ * Byte by byte, not by reading a word and turning it round.  Every one of
+ * these fields is three or four bytes at an offset that is aligned to nothing,
+ * so a word read would be unaligned AND would still need turning round; this
+ * way there is nothing to get wrong on a machine of either byte order.
+ *
+ * They are here rather than beside the first thing that needed them because
+ * everything in this protocol uses them -- frame headers, settings, window
+ * updates, stream identifiers -- and byte order is exactly the kind of thing
+ * that must be stated once.  A second copy does not fail when it is written;
+ * it fails on the one field somebody read with the other one.
+ *
+ * \~spanish
+ * Byte a byte, no leyendo una palabra y dandole la vuelta.  Todos estos campos
+ * miden tres o cuatro bytes en un desplazamiento que no esta alineado a nada,
+ * asi que una lectura de palabra estaria desalineada Y seguiria haciendo falta
+ * darle la vuelta; asi no hay nada que errar en una maquina de cualquiera de
+ * los dos ordenes de byte.
+ *
+ * Estan aqui y no al lado de lo primero que los necesito porque los usa todo
+ * este protocolo -- cabeceras de trama, ajustes, actualizaciones de ventana,
+ * identificadores de flujo -- y el orden de byte es justo de lo que hay que
+ * decir una sola vez.  Una segunda copia no falla cuando se escribe; falla en
+ * el unico campo que alguien leyo con la otra.
+ *
+ * \~
+ */
+inline uint16_t be16(const uint8_t *p) noexcept {
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+
+/// \~english The same for three bytes.  \~spanish Lo mismo para tres bytes.  \~
+inline uint32_t be24(const uint8_t *p) noexcept {
+    return (static_cast<uint32_t>(p[0]) << 16) |
+           (static_cast<uint32_t>(p[1]) << 8) | static_cast<uint32_t>(p[2]);
+}
+
+/// \~english And for four.  \~spanish Y para cuatro.  \~
+inline uint32_t be32(const uint8_t *p) noexcept {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+/// \~english Writes two bytes.  \~spanish Escribe dos bytes.  \~
+inline void put_be16(uint8_t *p, uint16_t v) noexcept {
+    p[0] = static_cast<uint8_t>(v >> 8);
+    p[1] = static_cast<uint8_t>(v);
+}
+
+/// \~english Writes three.  \~spanish Escribe tres.  \~
+inline void put_be24(uint8_t *p, uint32_t v) noexcept {
+    p[0] = static_cast<uint8_t>(v >> 16);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v);
+}
+
+/// \~english Writes four.  \~spanish Escribe cuatro.  \~
+inline void put_be32(uint8_t *p, uint32_t v) noexcept {
+    p[0] = static_cast<uint8_t>(v >> 24);
+    p[1] = static_cast<uint8_t>(v >> 16);
+    p[2] = static_cast<uint8_t>(v >> 8);
+    p[3] = static_cast<uint8_t>(v);
+}
+
+/**
+ * @brief
  * \~english The bytes a client sends before its first frame.
  * \~spanish Los bytes que manda un cliente antes de su primera trama.
  * \~
