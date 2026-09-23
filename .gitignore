@@ -1,0 +1,29 @@
+# Construccion
+build/
+cmake-build-*/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+
+# Herramientas y editores
+.idea/
+.vs/
+.vscode/
+compile_commands.json
+
+# Notas de asistentes: no entran al repo (ver el arbol del compilador)
+claude*
+CLAUDE.md
+chatgpt*
+copilot*
+deepseck*
+
+# Medidas: las de referencia SI entran (bench/baseline/), las sueltas no
+bench/out/
+*.vprof

@@ -1,0 +1,68 @@
+Licencia de http_vx
+===================
+
+http_vx forma parte de la familia de VestaVM -- nace para dar transporte a su
+servidor MCP --, pero se distribuye bajo la licencia MIT, NO bajo la GPLv2 del
+compilador.
+
+Es deliberado, y es el mismo criterio que ya se aplico a `vesta_alloc`.  Esto es
+un componente REUTILIZABLE: no compila nada, no depende de nada mas que del
+sistema operativo, y esta pensado para que se lo lleve quien quiera.  Con la
+GPLv2 no podria, porque contagia al enlazar: cualquier servicio que enlazara
+este servidor quedaria sujeto a ella.  Una biblioteca de proposito general con
+esa restriccion no es reutilizable, es solo publica.
+
+No hay ningun problema en la otra direccion: codigo MIT se puede incorporar a un
+proyecto GPLv2 sin friccion, que es exactamente lo que hace VestaVM con esto.
+
+Precedente en la misma familia: `vesta_alloc`, `LibPEparse` y
+`DistanciaLevenshtein`, todos del mismo autor y por la misma razon.
+
+Por que no hace falta repartir la licencia por directorios
+----------------------------------------------------------
+
+`vesta_prof` lleva DOS licencias -- MIT en `include/` y GPLv2 en el resto --
+porque alli hay dos restricciones que aqui no existen: su modulo de Linux toca
+un subsistema del nucleo marcado como solo-GPL, y su cabecera publica describe
+un formato de muestras que tiene que poder leer un analizador de terceros.
+
+Aqui no hay modulo de nucleo ni formato que abrir.  Con MIT en todo, incluir las
+cabeceras y enlazar ya es libre, asi que una frontera por directorio seria una
+complicacion que no compra nada.
+
+Y no hay biblioteca de TLS dentro
+---------------------------------
+
+`http_vx` no enlaza ninguna.  El transporte cifrado es un servicio que provee
+quien construye -- una biblioteca, o el propio sistema operativo --, y la razon
+no es solo tecnica: la licencia de esa biblioteca se contagiaria a un proyecto
+que se distribuye bajo MIT precisamente para que no arrastre nada.
+
+Ver `doc/architecture.md`, seccion 11.
+
+
+================================================================================
+Texto de la licencia (MIT):
+================================================================================
+
+MIT License
+
+Copyright (c) 2026 David Lopez T. (DesmonHak)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
