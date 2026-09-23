@@ -6,17 +6,18 @@
  */
 
 /**
- * @file fuzz/h1_invariants.cpp
+ * @file fuzz/codec_invariants.cpp
  * @brief
  * \~english Checking the parser's properties against arbitrary bytes.
  * \~spanish Comprobar las propiedades del analizador contra bytes cualesquiera.
  * \~
  */
 
-#include "h1_invariants.h"
+#include "codec_invariants.h"
 
 #include "http_vx/h1_chunked.h"
 #include "http_vx/h1_parser.h"
+#include "http_vx/h2_reader.h"
 
 namespace http_vx {
 namespace fuzz {
@@ -355,6 +356,142 @@ Breach check_chunked(const uint8_t *data, size_t size) noexcept {
      * diferir y el contenido no.
      * \~ */
     if (whole.delivered != drip.delivered || whole.hash != drip.hash)
+        return Breach::SplittingChangedTheAnswer;
+
+    return Breach::None;
+}
+
+namespace {
+
+/**
+ * @brief
+ * \~english What one pass over an HTTP/2 connection came to.
+ * \~spanish A que llego una pasada sobre una conexion HTTP/2.
+ * \~
+ */
+struct FrameOutcome {
+    h2::ReadResult result;
+    h2::ErrorCode error;
+    size_t consumed;
+    uint64_t frames;
+    uint64_t hash;
+};
+
+Breach run_frames(const uint8_t *data, size_t size, size_t step,
+                  FrameOutcome &out) noexcept {
+    h2::FrameReader r;
+    r.reset(0, true);
+
+    out.hash = 0xCBF29CE484222325ull;
+    out.frames = 0;
+
+    size_t given = step == 0 ? size : 0;
+    size_t last_end = 0;
+
+    for (;;) {
+        const h2::ReadResult res = r.read(data, given);
+
+        if (res == h2::ReadResult::Frame) {
+            const Span s = r.payload();
+            if (!inside(s, given)) return Breach::PieceOutsideTheMessage;
+            if (s.off < last_end) return Breach::PieceWentBackwards;
+            last_end = static_cast<size_t>(s.off) + s.len;
+
+            /* \~english
+             * The header goes into the summary as well as the payload.  Two
+             * passes that handed over the same bytes under different headers
+             * would be two passes that read the same connection as different
+             * messages, and the bytes alone would not show it.
+             * \~spanish
+             * La cabecera entra en el resumen ademas de la carga.  Dos pasadas
+             * que entregaran los mismos bytes bajo cabeceras distintas serian
+             * dos pasadas que leen la misma conexion como mensajes distintos, y
+             * los bytes solos no lo ensenarian.
+             * \~ */
+            const uint8_t head[4] = {
+                r.header().type, r.header().flags,
+                static_cast<uint8_t>(r.header().stream_id >> 8),
+                static_cast<uint8_t>(r.header().stream_id)};
+            fold(out.hash, head, sizeof(head));
+            fold(out.hash, data + s.off, s.len);
+            ++out.frames;
+            continue;
+        }
+
+        if (res == h2::ReadResult::NeedMore) {
+            /* \~english
+             * The property is not the text readers'.  Those advance byte by
+             * byte as they scan, so asking for more while holding any is a
+             * stall; this one advances only at a frame boundary, because it is
+             * waiting for a WHOLE frame and a position inside a partial one
+             * would be a position it has to come back from.
+             *
+             * So what must not happen is asking for more while a whole frame
+             * is sitting there.  Which is checked by reading the header at the
+             * position it stopped at and seeing whether the frame it describes
+             * has all arrived -- and only once the preface is behind it,
+             * because until then those bytes are not a frame header at all.
+             *
+             * \~spanish
+             * La propiedad no es la de los lectores de texto.  Aquellos avanzan
+             * byte a byte segun recorren, asi que pedir mas teniendo algo es un
+             * atasco; este avanza solo en frontera de trama, porque esta
+             * esperando una trama ENTERA y una posicion dentro de una a medias
+             * seria una posicion de la que tiene que volver.
+             *
+             * Asi que lo que no puede pasar es pedir mas teniendo ahi una trama
+             * entera.  Y eso se comprueba leyendo la cabecera en la posicion
+             * donde se paro y viendo si la trama que describe llego entera -- y
+             * solo cuando ya paso el preambulo, porque hasta entonces esos
+             * bytes no son ninguna cabecera de trama.
+             * \~ */
+            const size_t left = given - r.consumed();
+            if (r.consumed() >= sizeof(h2::kClientPreface) &&
+                left >= h2::kFrameHeaderSize) {
+                h2::FrameHeader ahead{};
+                h2::decode_frame_header(data + r.consumed(), ahead);
+                if (h2::kFrameHeaderSize + ahead.length <= left)
+                    return Breach::AskedForMoreWithInputLeft;
+            }
+
+            if (given == size) {
+                out.result = res;
+                break;
+            }
+            given += step == 0 ? size : step;
+            if (given > size) given = size;
+            continue;
+        }
+
+        out.result = res;
+        break;
+    }
+
+    out.error = r.error();
+    out.consumed = r.consumed();
+
+    if (out.consumed > size) return Breach::ConsumedPastTheEnd;
+    if (out.result == h2::ReadResult::Error &&
+        out.error == h2::ErrorCode::NoError)
+        return Breach::RefusedWithoutAReason;
+
+    return Breach::None;
+}
+
+} // namespace
+
+Breach check_frames(const uint8_t *data, size_t size) noexcept {
+    FrameOutcome whole{};
+    const Breach a = run_frames(data, size, 0, whole);
+    if (a != Breach::None) return a;
+
+    FrameOutcome drip{};
+    const Breach b = run_frames(data, size, 1, drip);
+    if (b != Breach::None) return b;
+
+    if (whole.result != drip.result || whole.error != drip.error ||
+        whole.consumed != drip.consumed || whole.frames != drip.frames ||
+        whole.hash != drip.hash)
         return Breach::SplittingChangedTheAnswer;
 
     return Breach::None;

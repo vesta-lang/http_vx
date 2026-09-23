@@ -35,7 +35,7 @@
  * \~
  */
 
-#include "h1_invariants.h"
+#include "codec_invariants.h"
 
 #include <cstdio>
 #include <cstdlib>

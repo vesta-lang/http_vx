@@ -6,7 +6,7 @@
  */
 
 /**
- * @file tests/test_h1_fuzz.cpp
+ * @file tests/test_codec_fuzz.cpp
  * @brief
  * \~english The parser's properties, against input nobody wrote.
  * \~spanish Las propiedades del analizador, contra entrada que no escribio nadie.
@@ -14,7 +14,7 @@
  *
  * \~english
  * This generates its own input and checks the properties in
- * @c fuzz/h1_invariants against every one of them.  It is not a replacement
+ * @c fuzz/codec_invariants against every one of them.  It is not a replacement
  * for a real fuzzer -- it explores far less, and it cannot see a read past the
  * end of a buffer without a sanitiser watching.  What it is for is that the
  * check RUNS.
@@ -30,7 +30,7 @@
  *
  * \~spanish
  * Esto genera su propia entrada y comprueba contra cada una de ellas las
- * propiedades de @c fuzz/h1_invariants.  No sustituye a un fuzzer de verdad --
+ * propiedades de @c fuzz/codec_invariants.  No sustituye a un fuzzer de verdad --
  * explora muchisimo menos, y no puede ver una lectura pasada del final de un
  * buffer sin un sanitizador mirando --.  Para lo que sirve es para que la
  * comprobacion SE EJECUTE.
@@ -48,7 +48,7 @@
  * \~
  */
 
-#include "h1_invariants.h"
+#include "codec_invariants.h"
 
 #include <cstdio>
 #include <cstring>
@@ -128,13 +128,57 @@ void report(Breach b, const uint8_t *data, size_t size) {
  *
  * \~
  */
-enum class Reader { Head, Body };
+enum class Reader { Head, Body, Frames };
 
 void check_input(Reader which, const uint8_t *data, size_t size) {
-    const Breach b = which == Reader::Head
-                         ? http_vx::fuzz::check_parse(data, size)
-                         : http_vx::fuzz::check_chunked(data, size);
+    Breach b = Breach::None;
+    switch (which) {
+    case Reader::Head:
+        b = http_vx::fuzz::check_parse(data, size);
+        break;
+    case Reader::Body:
+        b = http_vx::fuzz::check_chunked(data, size);
+        break;
+    case Reader::Frames:
+        b = http_vx::fuzz::check_frames(data, size);
+        break;
+    }
     if (b != Breach::None) report(b, data, size);
+}
+
+/**
+ * @brief
+ * \~english One input to start from: bytes and how many, never a string.
+ * \~spanish Una entrada de la que partir: bytes y cuantos, nunca una cadena.
+ * \~
+ *
+ * \~english
+ * The length is carried and not measured, because a frame is full of zeros --
+ * a length of five is three zero bytes and a five -- and a seed measured to
+ * its first nul would be a frame cut off at its own header.  The text seeds
+ * are written the same way for the same reason: the day one of them wants to
+ * carry a nul, nothing about it has to change.
+ *
+ * \~spanish
+ * La longitud se lleva y no se mide, porque una trama esta llena de ceros -- un
+ * tamano de cinco son tres bytes a cero y un cinco -- y una semilla medida
+ * hasta su primer nulo seria una trama cortada por su propia cabecera.  Las
+ * semillas de texto se escriben igual por lo mismo: el dia que una quiera
+ * llevar un nulo, no hay que cambiarle nada.
+ *
+ * \~
+ */
+struct Seed {
+    const uint8_t *bytes;
+    size_t len;
+};
+
+template <size_t N> constexpr Seed seed(const char (&text)[N]) {
+    return Seed{reinterpret_cast<const uint8_t *>(text), N - 1};
+}
+
+template <size_t N> constexpr Seed seed(const uint8_t (&bytes)[N]) {
+    return Seed{bytes, N};
 }
 
 /**
@@ -159,14 +203,14 @@ void check_input(Reader which, const uint8_t *data, size_t size) {
  *
  * \~
  */
-const char *const kHeadSeeds[] = {
-    "GET / HTTP/1.1\r\nHost: h\r\n\r\n",
-    "POST /a/b?c=d HTTP/1.1\r\nHost: example.com\r\n"
-    "Content-Length: 12\r\nContent-Type: text/plain\r\n\r\nhello world!",
-    "PUT /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
-    "HEAD / HTTP/1.0\r\n\r\n",
-    "OPTIONS * HTTP/1.1\r\nHost: h\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n",
-    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+const Seed kHeadSeeds[] = {
+    seed("GET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+    seed("POST /a/b?c=d HTTP/1.1\r\nHost: example.com\r\n"
+         "Content-Length: 12\r\nContent-Type: text/plain\r\n\r\nhello world!"),
+    seed("PUT /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
+    seed("HEAD / HTTP/1.0\r\n\r\n"),
+    seed("OPTIONS * HTTP/1.1\r\nHost: h\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n"),
+    seed("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 };
 
 /**
@@ -189,24 +233,101 @@ const char *const kHeadSeeds[] = {
  *
  * \~
  */
-const char *const kBodySeeds[] = {
-    "0\r\n\r\n",
-    "5\r\nhello\r\n0\r\n\r\n",
-    "1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n",
-    "a;x=y\r\n0123456789\r\n0;last\r\n\r\n",
-    "5\r\nhello\r\n0\r\nX-Sum: abc\r\nX-Other: 1\r\n\r\n",
-    "0005\r\nhello\r\n000\r\n\r\n",
+const Seed kBodySeeds[] = {
+    seed("0\r\n\r\n"),
+    seed("5\r\nhello\r\n0\r\n\r\n"),
+    seed("1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n"),
+    seed("a;x=y\r\n0123456789\r\n0;last\r\n\r\n"),
+    seed("5\r\nhello\r\n0\r\nX-Sum: abc\r\nX-Other: 1\r\n\r\n"),
+    seed("0005\r\nhello\r\n000\r\n\r\n"),
+};
+
+/**
+ * @brief
+ * \~english The HTTP/2 connections the mutations start from.
+ * \~spanish Las conexiones HTTP/2 de las que parten las mutaciones.
+ * \~
+ *
+ * \~english
+ * Written as bytes, because that is what they are.  The preface comes first in
+ * every one -- without it the reader refuses at the first byte and every
+ * mutation past it is wasted -- and what follows is a header, nine bytes, then
+ * a payload of exactly the length the header claims.
+ *
+ * The interesting mutations are the ones that change a length so that it no
+ * longer matches what follows, or a padding byte so that it no longer fits.
+ * That is why the seeds carry padding and priority they do not need: a
+ * mutation can only break arithmetic that is there.
+ *
+ * \~spanish
+ * Escritas como bytes, porque es lo que son.  El preambulo va delante en todas
+ * -- sin el, el lector rechaza al primer byte y toda mutacion posterior se
+ * desperdicia -- y detras va una cabecera, nueve bytes, y una carga de
+ * exactamente la longitud que dice la cabecera.
+ *
+ * Las mutaciones interesantes son las que cambian una longitud para que deje de
+ * coincidir con lo que sigue, o un byte de relleno para que deje de caber.  Por
+ * eso las semillas llevan relleno y prioridad que no necesitan: una mutacion
+ * solo puede romper la aritmetica que este ahi.
+ *
+ * \~
+ */
+const uint8_t kFramesSettings[] = {
+    'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2',
+    '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n',
+    // SETTINGS, vacia, en la conexion.
+    0, 0, 0, 0x04, 0, 0, 0, 0, 0,
+    // PING, ocho bytes, en la conexion.
+    0, 0, 8, 0x06, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+};
+
+const uint8_t kFramesRequest[] = {
+    'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2',
+    '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n',
+    // HEADERS con END_HEADERS, cuatro bytes de bloque, flujo 1.
+    0, 0, 4, 0x01, 0x04, 0, 0, 0, 1, 0x82, 0x86, 0x84, 0x41,
+    // DATA con END_STREAM, cinco bytes, flujo 1.
+    0, 0, 5, 0x00, 0x01, 0, 0, 0, 1, 'h', 'e', 'l', 'l', 'o',
+};
+
+const uint8_t kFramesPadded[] = {
+    'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2',
+    '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n',
+    // HEADERS con relleno y prioridad: 1 + 5 + 2 de bloque + 2 de relleno.
+    0, 0, 10, 0x01, 0x04 | 0x08 | 0x20, 0, 0, 0, 1,
+    2, 0, 0, 0, 1, 16, 'a', 'b', 0, 0,
+};
+
+const uint8_t kFramesSplitBlock[] = {
+    'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2',
+    '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n',
+    // HEADERS sin END_HEADERS, y dos CONTINUATION detras.
+    0, 0, 2, 0x01, 0x00, 0, 0, 0, 1, 0x82, 0x86,
+    0, 0, 2, 0x09, 0x00, 0, 0, 0, 1, 0x84, 0x41,
+    0, 0, 1, 0x09, 0x04, 0, 0, 0, 1, 0x0F,
+};
+
+const Seed kFrameSeeds[] = {
+    seed(kFramesSettings),
+    seed(kFramesRequest),
+    seed(kFramesPadded),
+    seed(kFramesSplitBlock),
 };
 
 constexpr size_t kHeadSeedCount = sizeof(kHeadSeeds) / sizeof(kHeadSeeds[0]);
 constexpr size_t kBodySeedCount = sizeof(kBodySeeds) / sizeof(kBodySeeds[0]);
+constexpr size_t kFrameSeedCount = sizeof(kFrameSeeds) / sizeof(kFrameSeeds[0]);
 
-const char *const *seeds_of(Reader which) noexcept {
-    return which == Reader::Head ? kHeadSeeds : kBodySeeds;
+const Seed *seeds_of(Reader which) noexcept {
+    if (which == Reader::Head) return kHeadSeeds;
+    if (which == Reader::Body) return kBodySeeds;
+    return kFrameSeeds;
 }
 
 size_t seed_count_of(Reader which) noexcept {
-    return which == Reader::Head ? kHeadSeedCount : kBodySeedCount;
+    if (which == Reader::Head) return kHeadSeedCount;
+    if (which == Reader::Body) return kBodySeedCount;
+    return kFrameSeedCount;
 }
 
 /**
@@ -245,10 +366,9 @@ constexpr size_t kInterestingCount =
  * \~
  */
 void test_the_seeds(Reader which) {
-    const char *const *seeds = seeds_of(which);
+    const Seed *seeds = seeds_of(which);
     for (size_t i = 0; i < seed_count_of(which); ++i)
-        check_input(which, reinterpret_cast<const uint8_t *>(seeds[i]),
-                    std::strlen(seeds[i]));
+        check_input(which, seeds[i].bytes, seeds[i].len);
 }
 
 /**
@@ -270,12 +390,10 @@ void test_the_seeds(Reader which) {
  * \~
  */
 void test_every_prefix(Reader which) {
-    const char *const *seeds = seeds_of(which);
-    for (size_t i = 0; i < seed_count_of(which); ++i) {
-        const uint8_t *d = reinterpret_cast<const uint8_t *>(seeds[i]);
-        const size_t len = std::strlen(seeds[i]);
-        for (size_t n = 0; n <= len; ++n) check_input(which, d, n);
-    }
+    const Seed *seeds = seeds_of(which);
+    for (size_t i = 0; i < seed_count_of(which); ++i)
+        for (size_t n = 0; n <= seeds[i].len; ++n)
+            check_input(which, seeds[i].bytes, n);
 }
 
 /**
@@ -288,14 +406,14 @@ void test_mutations(Reader which, uint64_t seed_value, int rounds) {
     Rng rng(seed_value);
     uint8_t buf[512];
 
-    const char *const *seeds = seeds_of(which);
+    const Seed *seeds = seeds_of(which);
     const size_t count = seed_count_of(which);
 
     for (int round = 0; round < rounds; ++round) {
-        const char *seed = seeds[rng.below(static_cast<uint32_t>(count))];
-        size_t len = std::strlen(seed);
+        const Seed &from = seeds[rng.below(static_cast<uint32_t>(count))];
+        size_t len = from.len;
         if (len > sizeof(buf)) len = sizeof(buf);
-        std::memcpy(buf, seed, len);
+        std::memcpy(buf, from.bytes, len);
 
         const uint32_t edits = 1 + rng.below(4);
         for (uint32_t e = 0; e < edits; ++e) {
@@ -375,10 +493,15 @@ int main() {
     test_mutations(Reader::Body, 0xBF58476D1CE4E5B9ull, 20000);
     test_noise(Reader::Body, 0x94D049BB133111EBull, 5000);
 
+    test_the_seeds(Reader::Frames);
+    test_every_prefix(Reader::Frames);
+    test_mutations(Reader::Frames, 0x2545F4914F6CDD1Dull, 20000);
+    test_noise(Reader::Frames, 0xA24BAED4963EE407ull, 5000);
+
     if (failures != 0) {
-        std::fprintf(stderr, "test_h1_fuzz: %d failures\n", failures);
+        std::fprintf(stderr, "test_codec_fuzz: %d failures\n", failures);
         return 1;
     }
-    std::printf("test_h1_fuzz: ok\n");
+    std::printf("test_codec_fuzz: ok\n");
     return 0;
 }

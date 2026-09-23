@@ -123,6 +123,9 @@ add_library(http_vx_proto STATIC
         proto/h1/framing.cpp
         proto/h1/parser.cpp
         proto/h1/writer.cpp
+
+        proto/h2/frame.cpp
+        proto/h2/reader.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -147,9 +150,10 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_fields tests/test_fields.cpp)
     http_vx_add_test(test_h1_chunked tests/test_h1_chunked.cpp)
     http_vx_add_test(test_h1_framing tests/test_h1_framing.cpp)
-    http_vx_add_test(test_h1_fuzz tests/test_h1_fuzz.cpp fuzz/h1_invariants.cpp)
+    http_vx_add_test(test_codec_fuzz tests/test_codec_fuzz.cpp fuzz/codec_invariants.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
+    http_vx_add_test(test_h2_frame tests/test_h2_frame.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
@@ -158,17 +162,17 @@ endif ()
 # ---------------------------------------------------------------------------
 # El objetivo de fuzzing.  Apagado por defecto porque necesita un compilador con
 # libFuzzer, que no esta en todas partes; lo que SI corre en todas partes es
-# `test_h1_fuzz`, que comprueba las mismas propiedades contra entrada que genera
-# el.  Ver fuzz/h1_invariants.h: una comprobacion que solo vive dentro de un
+# `test_codec_fuzz`, que comprueba las mismas propiedades contra entrada que genera
+# el.  Ver fuzz/codec_invariants.h: una comprobacion que solo vive dentro de un
 # objetivo de fuzzing es una que corre cuando alguien se acuerda.
 # ---------------------------------------------------------------------------
 if (HTTP_VX_BUILD_FUZZ)
     # Uno por lector, no uno con una bandera dentro: un fuzzer aprende la forma
     # de lo que se le da, y unos bytes que son una cabeza de peticion no son
     # unos bytes que sean un cuerpo troceado.
-    foreach (_target h1_parser h1_chunked)
+    foreach (_target h1_parser h1_chunked h2_frame)
         add_executable(fuzz_${_target}
-                fuzz/fuzz_${_target}.cpp fuzz/h1_invariants.cpp)
+                fuzz/fuzz_${_target}.cpp fuzz/codec_invariants.cpp)
         target_include_directories(fuzz_${_target}
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz)
         target_compile_options(fuzz_${_target}

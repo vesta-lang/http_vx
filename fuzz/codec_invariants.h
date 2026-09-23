@@ -6,7 +6,7 @@
  */
 
 /**
- * @file fuzz/h1_invariants.h
+ * @file fuzz/codec_invariants.h
  * @brief
  * \~english What must hold of the parser for ANY bytes at all.
  * \~spanish Lo que tiene que cumplir el analizador para CUALESQUIERA bytes.
@@ -39,8 +39,8 @@
  *
  * \~
  */
-#ifndef HTTP_VX_FUZZ_H1_INVARIANTS_H
-#define HTTP_VX_FUZZ_H1_INVARIANTS_H
+#ifndef HTTP_VX_FUZZ_CODEC_INVARIANTS_H
+#define HTTP_VX_FUZZ_CODEC_INVARIANTS_H
 
 #include <cstddef>
 #include <cstdint>
@@ -212,7 +212,37 @@ Breach check_parse(const uint8_t *data, size_t size) noexcept;
  */
 Breach check_chunked(const uint8_t *data, size_t size) noexcept;
 
+/**
+ * @brief
+ * \~english Reads @p data as an HTTP/2 connection twice and checks every
+ *           property.
+ * \~spanish Lee @p data como una conexion HTTP/2 dos veces y comprueba todas
+ *           las propiedades.
+ * \~
+ *
+ * \~english
+ * The same properties as the other two, which is the point of them living in
+ * one file: a frame reader and a text parser fail in different ways and lie in
+ * the same ones.  A payload that names bytes outside the connection, an answer
+ * that depends on how the bytes were split, a reader that asks for more while
+ * holding some -- none of that is about the format.
+ *
+ * \~spanish
+ * Las mismas propiedades que los otros dos, que es de lo que va tenerlas en un
+ * fichero: un lector de tramas y un analizador de texto fallan de formas
+ * distintas y mienten de las mismas.  Una carga que nombra bytes de fuera de la
+ * conexion, una respuesta que depende de como se partieran los bytes, un lector
+ * que pide mas teniendo todavia -- nada de eso es del formato.
+ *
+ * \~
+ * @param data \~english the bytes  \~spanish los bytes  \~
+ * @param size \~english how many  \~spanish cuantos  \~
+ * @return     \~english what was broken, or @c Breach::None
+ *             \~spanish que se rompio, o @c Breach::None  \~
+ */
+Breach check_frames(const uint8_t *data, size_t size) noexcept;
+
 } // namespace fuzz
 } // namespace http_vx
 
-#endif // HTTP_VX_FUZZ_H1_INVARIANTS_H
+#endif // HTTP_VX_FUZZ_CODEC_INVARIANTS_H

@@ -14,7 +14,7 @@
  *
  * \~english
  * Four lines, and that is the point: what is worth checking is in
- * @c h1_invariants, where an ordinary test checks the same things without
+ * @c codec_invariants, where an ordinary test checks the same things without
  * needing a toolchain that has a fuzzer.  This file only hands the bytes over.
  *
  * It is also all that R6 buys, made concrete.  The parser includes nothing
@@ -32,8 +32,8 @@
  *
  * \~spanish
  * Cuatro lineas, y de eso se trata: lo que merece comprobarse esta en
- * @c h1_invariants, donde una prueba corriente comprueba lo mismo sin necesitar
- * un entorno que tenga fuzzer.  Este fichero solo entrega los bytes.
+ * @c codec_invariants, donde una prueba corriente comprueba lo mismo sin
+ * necesitar un entorno que tenga fuzzer.  Este fichero solo entrega los bytes.
  *
  * Es ademas todo lo que compra R6, hecho concreto.  El analizador no incluye
  * nada del sistema operativo, asi que un fuzzer lo gobierna como a cualquier
@@ -52,7 +52,7 @@
  * \~
  */
 
-#include "h1_invariants.h"
+#include "codec_invariants.h"
 
 #include <cstdio>
 #include <cstdlib>
