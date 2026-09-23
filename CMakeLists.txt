@@ -109,6 +109,7 @@ add_library(http_vx_core STATIC
         core/buffer.cpp
         reactor/buffer_pool.cpp
         reactor/conn_table.cpp
+        reactor/memory_backend.cpp
         reactor/timer_wheel.cpp
 )
 target_include_directories(http_vx_core
@@ -184,6 +185,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
+    http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
     http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
 endif ()
