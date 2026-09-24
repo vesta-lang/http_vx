@@ -279,6 +279,41 @@ class Buffer {
 
     /// \~english The live bytes.  \~spanish Los bytes vivos.  \~
     const uint8_t *data() const noexcept { return base_ + head_; }
+
+    /**
+     * @brief
+     * \~english The same bytes, to be written over.
+     * \~spanish Los mismos bytes, para escribir encima.
+     * \~
+     *
+     * \~english
+     * For un-framing in place: a chunked body arrives with its own size lines
+     * interleaved through it, so the bytes that MEAN something are not next to
+     * each other until somebody moves them.  Moving them where they already
+     * are is the cheapest place, and it is the owner of the buffer rewriting
+     * its own pending bytes rather than anybody reaching in.
+     *
+     * It is a separate call from @c data and not a loosening of it, so that
+     * writing into the live region is something a caller asks for by name.
+     * The one rule is the obvious one: only where the caller has already read.
+     * A reader that is still going to look at a byte must not have it changed
+     * underneath it.
+     *
+     * \~spanish
+     * Para desentramar en el sitio: un cuerpo por trozos llega con sus propias
+     * lineas de tamano intercaladas, asi que los bytes que SIGNIFICAN algo no
+     * estan seguidos hasta que alguien los mueve.  Moverlos donde ya estan es el
+     * sitio mas barato, y es el dueno del buffer reescribiendo sus propios bytes
+     * pendientes y no alguien metiendo mano.
+     *
+     * Es una llamada aparte de @c data y no un aflojamiento de ella, para que
+     * escribir en la region viva sea algo que quien llama pide por su nombre.
+     * La unica regla es la evidente: solo donde ya ha leido.  A un lector que
+     * todavia va a mirar un byte no se le puede cambiar por debajo.
+     *
+     * \~
+     */
+    uint8_t *writable() noexcept { return base_ + head_; }
     /// \~english How many there are.  \~spanish Cuantos hay.  \~
     size_t size() const noexcept { return tail_ - head_; }
     /// \~english Whether there is none.  \~spanish Si no hay ninguno.  \~

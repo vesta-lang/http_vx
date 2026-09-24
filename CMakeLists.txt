@@ -131,6 +131,7 @@ add_library(http_vx_proto STATIC
         proto/h1/chunked.cpp
         proto/h1/framing.cpp
         proto/h1/parser.cpp
+        proto/h1/service.cpp
         proto/h1/writer.cpp
 
         proto/h2/connection.cpp
@@ -173,6 +174,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_codec_fuzz tests/test_codec_fuzz.cpp fuzz/codec_invariants.cpp)
     http_vx_add_test(test_conn_table tests/test_conn_table.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
+    http_vx_add_test(test_http1_service tests/test_http1_service.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
     http_vx_add_test(test_h2_connection tests/test_h2_connection.cpp)
     http_vx_add_test(test_h2_decoder tests/test_h2_decoder.cpp)

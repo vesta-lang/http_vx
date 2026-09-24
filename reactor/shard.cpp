@@ -114,7 +114,18 @@ void Shard::let_go(ConnHandle c, ConnHot &h) noexcept {
 }
 
 bool Shard::leave_if_done(ConnHandle c, ConnHot &h) noexcept {
-    if (!closing(h) || busy(h)) return false;
+    /* \~english
+     * Nothing outstanding AND nothing left to say.  The second half is what
+     * makes closing graceful: a connection that has been told to end still
+     * owes whatever answers were already written, and going before they are
+     * out is the same as not having written them.
+     * \~spanish
+     * Nada pendiente Y nada que decir.  La segunda mitad es lo que hace que
+     * cerrar sea con cortesia: una conexion a la que se le ha dicho que se acabe
+     * sigue debiendo las respuestas que ya estaban escritas, e irse antes de que
+     * salgan es lo mismo que no haberlas escrito.
+     * \~ */
+    if (!closing(h) || busy(h) || h.queue != kNoBuffer) return false;
     let_go(c, h);
     return true;
 }
@@ -301,18 +312,35 @@ void Shard::close(ConnHandle c) noexcept {
     h->flags |= kClosing;
 
     /* \~english
-     * Everything that is only WAITING goes back now -- those buffers are this
-     * shard's and holding them would be holding them for nobody.  What is with
-     * the operating system stays with it: giving that back is a use-after-free
-     * the kernel performs, into memory that by then belongs to somebody else.
+     * **What is already written still goes out.**  Closing is not the same as
+     * throwing away, and the difference is the whole of how a client finds out
+     * what happened: a refusal that is decided and then dropped leaves a
+     * client whose socket simply died, and a client that cannot tell a bad
+     * request from a fallen-over server retries -- so a request refused every
+     * time becomes a request sent every time.
+     *
+     * So this stops the reading and lets the writing finish.  The connection
+     * goes when there is nothing left of it in either place, which
+     * @c leave_if_done decides.
+     *
      * \~spanish
-     * Todo lo que solo ESTA ESPERANDO vuelve ahora -- esos buffers son de este
-     * fragmento y guardarlos seria guardarlos para nadie --.  Lo que esta en el
-     * sistema operativo se queda con el: devolver eso es un uso despues de
-     * liberar que hace el nucleo, sobre una memoria que para entonces es de
-     * otro.
+     * **Lo que ya esta escrito sale igual.**  Cerrar no es lo mismo que tirar,
+     * y la diferencia es todo lo que le permite a un cliente enterarse de lo que
+     * paso: un rechazo que se decide y luego se tira deja a un cliente cuyo
+     * socket se murio sin mas, y un cliente que no puede distinguir una peticion
+     * mala de un servidor caido reintenta -- asi que una peticion rechazada
+     * siempre se convierte en una peticion mandada siempre.
+     *
+     * Asi que esto para la lectura y deja que acabe la escritura.  La conexion
+     * se va cuando no quede nada de ella en ninguno de los dos sitios, que es lo
+     * que decide @c leave_if_done.
      * \~ */
-    drop_queue(*h);
+    if (h->reading != kNoBuffer) {
+        pool_.release(h->reading);
+        h->reading = kNoBuffer;
+    }
+
+    send_next(c, *h);
     leave_if_done(c, *h);
 }
 
@@ -437,16 +465,26 @@ void Shard::on_read(const Completion &done) noexcept {
 
     if (h->reading == kNoBuffer) pool_.release(done.buffer);
 
-    if (!keep) {
+    /* \~english
+     * The answer goes out BEFORE the connection is ended, whether or not the
+     * service wants to carry on.  A service that refuses a request has usually
+     * written the refusal, and throwing it away here is the difference between
+     * a client that is told why and a client whose socket simply died.
+     * \~spanish
+     * La respuesta sale ANTES de acabar la conexion, quiera seguir el servicio o
+     * no.  Un servicio que rechaza una peticion normalmente ha escrito el
+     * rechazo, y tirarlo aqui es la diferencia entre un cliente al que se le
+     * dice por que y uno cuyo socket se murio sin mas.
+     * \~ */
+    if (empty) {
+        pool_.release(wb);
+    } else if (!want_write(done.conn, *h, wb)) {
         pool_.release(wb);
         close(done.conn);
         return;
     }
 
-    if (empty) {
-        pool_.release(wb);
-    } else if (!want_write(done.conn, *h, wb)) {
-        pool_.release(wb);
+    if (!keep) {
         close(done.conn);
         return;
     }
@@ -476,14 +514,21 @@ void Shard::on_write(const Completion &done) noexcept {
 
     Buffer *out = pool_.at(done.buffer);
 
-    if (closing(*h)) {
-        pool_.release(done.buffer);
-        leave_if_done(done.conn, *h);
-        return;
-    }
-
+    /* \~english
+     * A write that failed means nothing more can go out, so the rest is
+     * dropped rather than tried.  It is the one place the queue is thrown
+     * away, and it is the honest one: the socket is gone, and pretending
+     * otherwise would be a connection that keeps submitting writes nobody can
+     * receive.
+     * \~spanish
+     * Una escritura que fallo quiere decir que ya no puede salir nada, asi que
+     * el resto se tira en vez de intentarlo.  Es el unico sitio donde se tira la
+     * cola, y es el honesto: el socket se fue, y fingir otra cosa seria una
+     * conexion entregando escrituras que no puede recibir nadie.
+     * \~ */
     if (!done.ok() || out == nullptr) {
         pool_.release(done.buffer);
+        drop_queue(*h);
         close(done.conn);
         return;
     }
@@ -529,18 +574,28 @@ void Shard::on_write(const Completion &done) noexcept {
     }
 
     pool_.release(done.buffer);
-    wheel_.arm(done.conn.slot, cfg_.idle_ticks);
 
     /* \~english
      * The next answer goes out, and reading starts again -- room in the queue
      * has just appeared, so a connection that was being held back for sending
-     * faster than it reads is let go of here.
+     * faster than it reads is let go of here.  Both refuse by themselves on a
+     * connection that is ending, which is what lets one path serve the
+     * ordinary case and the graceful close.
      * \~spanish
      * Sale la respuesta siguiente, y se vuelve a leer -- acaba de aparecer sitio
      * en la cola, asi que una conexion a la que se estaba frenando por mandar
-     * mas deprisa de lo que lee se suelta aqui.
+     * mas deprisa de lo que lee se suelta aqui.  Las dos se niegan solas en una
+     * conexion que se esta acabando, que es lo que permite que un mismo camino
+     * sirva al caso corriente y al cierre con cortesia.
      * \~ */
     send_next(done.conn, *h);
+
+    if (closing(*h)) {
+        leave_if_done(done.conn, *h);
+        return;
+    }
+
+    wheel_.arm(done.conn.slot, cfg_.idle_ticks);
     want_read(done.conn, *h);
 }
 
