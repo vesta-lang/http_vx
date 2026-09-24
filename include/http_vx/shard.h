@@ -171,30 +171,49 @@ class Service {
 
     /**
      * @brief
-     * \~english Bytes arrived on @p c; write any answer into @p out.
-     * \~spanish Llegaron bytes por @p c; escribe la respuesta en @p out.
+     * \~english Bytes arrived on @p c; consume what you used, answer into @p out.
+     * \~spanish Llegaron bytes por @p c; consume lo que uses, contesta en @p out.
      * \~
      *
      * \~english
-     * @p in points into the connection's read buffer and stops being valid
-     * when this returns -- R13: the body is not copied, so what is handed over
-     * is a view and the service either uses it or keeps its own copy.
+     * **The service consumes, and what it leaves stays.**  A request arrives
+     * in as many reads as the network feels like -- a head split across two
+     * packets is the ordinary case, not a corner -- so a service that was
+     * handed a view that died on return would have to copy the leftover
+     * somewhere of its own, and then every protocol would carry its own
+     * buffer beside the one it was just given.
+     *
+     * So what comes in is the BUFFER.  The service takes what makes a whole
+     * message, @c Buffer::consume says so, and whatever is left is still
+     * there when the next read lands after it.  The shard keeps the buffer for
+     * exactly as long as something is left in it, which is also what R1 means:
+     * a connection mid-message legitimately holds one, and a connection
+     * between messages does not.
      *
      * \~spanish
-     * @p in apunta al buffer de lectura de la conexion y deja de valer cuando
-     * esto vuelve -- R13: el cuerpo no se copia, asi que lo que se entrega es
-     * una vista y el servicio la usa o se guarda su propia copia.
+     * **El servicio consume, y lo que deja se queda.**  Una peticion llega en
+     * tantas lecturas como le apetezca a la red -- una cabeza partida entre dos
+     * paquetes es el caso corriente, no una esquina -- asi que un servicio al
+     * que se le diera una vista que muere al volver tendria que copiar el resto
+     * a un sitio suyo, y entonces cada protocolo llevaria su propio buffer al
+     * lado del que le acaban de dar.
+     *
+     * Asi que lo que entra es el BUFFER.  El servicio coge lo que forme un
+     * mensaje entero, lo dice con @c Buffer::consume, y lo que quede sigue ahi
+     * cuando caiga detras la lectura siguiente.  El fragmento se queda el buffer
+     * exactamente mientras quede algo dentro, que es ademas lo que quiere decir
+     * la R1: una conexion a mitad de mensaje tiene uno con todo derecho, y una
+     * entre mensajes no.
      *
      * \~
      * @param c   \~english which connection  \~spanish que conexion  \~
-     * @param in  \~english the bytes  \~spanish los bytes  \~
-     * @param n   \~english how many  \~spanish cuantos  \~
+     * @param in  \~english what has arrived and not been used yet
+     *            \~spanish lo que ha llegado y no se ha usado todavia  \~
      * @param out \~english where an answer goes  \~spanish donde va una respuesta  \~
      * @return    \~english false to end the connection
      *            \~spanish false para acabar la conexion  \~
      */
-    virtual bool on_bytes(ConnHandle c, const uint8_t *in, size_t n,
-                          Buffer &out) noexcept = 0;
+    virtual bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept = 0;
 
     /// \~english A connection arrived.  \~spanish Llego una conexion.  \~
     virtual void on_open(ConnHandle c) noexcept { (void)c; }

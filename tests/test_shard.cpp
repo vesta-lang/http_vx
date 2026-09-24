@@ -92,19 +92,36 @@ void check(bool ok, const char *what) {
  */
 class Echo final : public Service {
   public:
-    bool on_bytes(ConnHandle c, const uint8_t *in, size_t n,
-                  Buffer &out) noexcept override {
+    bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override {
         (void)c;
         ++calls;
+
+        const size_t n = in.size();
         seen += n;
 
-        if (silent) return true;
         if (refuse) return false;
+
+        /* \~english
+         * A silent service takes the bytes and says nothing, which is what a
+         * protocol does with half a message.  It still consumes them here,
+         * because what it is standing in for is a service that HAS used them
+         * -- leaving them would be testing the other case.
+         * \~spanish
+         * Un servicio callado coge los bytes y no dice nada, que es lo que hace
+         * un protocolo con medio mensaje.  Los consume igual, porque lo que
+         * esta representando es un servicio que SI los ha usado -- dejarlos
+         * seria probar el otro caso.
+         * \~ */
+        if (silent) {
+            in.consume(n);
+            return true;
+        }
 
         uint8_t *room = out.reserve(n);
         if (room == nullptr) return false;
-        std::memcpy(room, in, n);
+        std::memcpy(room, in.data(), n);
         out.commit(n);
+        in.consume(n);
         return true;
     }
 
@@ -591,9 +608,157 @@ void test_both_directions_at_once() {
           "the second answer did not follow the first");
 }
 
+/**
+ * @brief
+ * \~english What a read leaves behind is there when the rest lands.
+ * \~spanish Lo que deja una lectura esta ahi cuando cae el resto.
+ * \~
+ *
+ * \~english
+ * A request arrives in as many reads as the network feels like, and a head
+ * split across two packets is the ordinary case rather than a corner.  So a
+ * service that has only half of one consumes nothing, and what it left has to
+ * be waiting in the same buffer when the rest arrives after it.
+ *
+ * A loop that released the buffer here would make every request that came in
+ * pieces unparseable -- which is most of the large ones, and none of the ones
+ * a test sends in a single write.
+ *
+ * \~spanish
+ * Una peticion llega en tantas lecturas como le apetezca a la red, y una cabeza
+ * partida entre dos paquetes es el caso corriente y no una esquina.  Asi que un
+ * servicio que solo tiene la mitad no consume nada, y lo que dejo tiene que
+ * estar esperando en el mismo buffer cuando llegue el resto detras.
+ *
+ * Un bucle que soltara el buffer aqui haria ilegible toda peticion que llegara
+ * a trozos -- que son casi todas las grandes, y ninguna de las que manda una
+ * prueba en una sola escritura.
+ *
+ * \~
+ */
+void test_half_a_message_waits_for_the_rest() {
+    /**
+     * \~english
+     * A service that answers only once it has seen a full stop, and consumes
+     * nothing until then.  That is what a protocol does: it cannot act on half
+     * a head, and it must not throw the half away.
+     * \~spanish
+     * Un servicio que solo contesta cuando ha visto un punto, y hasta entonces
+     * no consume nada.  Eso es lo que hace un protocolo: no puede actuar sobre
+     * media cabeza, y no puede tirar la mitad.
+     * \~
+     */
+    class UntilStop final : public Service {
+      public:
+        bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override {
+            (void)c;
+            ++calls;
+
+            size_t end = 0;
+            while (end < in.size() && in.data()[end] != '.') ++end;
+
+            if (end == in.size()) return true;
+
+            ++messages;
+            const size_t whole = end + 1;
+
+            uint8_t *room = out.reserve(whole);
+            if (room == nullptr) return false;
+            std::memcpy(room, in.data(), whole);
+            out.commit(whole);
+            in.consume(whole);
+            return true;
+        }
+
+        int calls = 0;
+        int messages = 0;
+    };
+
+    UntilStop service;
+    Shard shard;
+    MemoryBackend io(shard.buffers());
+
+    ShardConfig cfg;
+    cfg.connections = 4;
+    cfg.buffers = 4;
+    cfg.idle_ticks = 10;
+    cfg.wheel_slots = 64;
+    check(shard.reset(cfg, io, service, 0), "the shard would not start");
+
+    const ConnHandle c = shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    /* \~english
+     * The first half.  Nothing is consumed and nothing is answered, and the
+     * buffer stays with the connection.
+     * \~spanish
+     * La primera mitad.  No se consume nada ni se contesta nada, y el buffer se
+     * queda con la conexion.
+     * \~ */
+    const char *first = "GET /some";
+    io.feed(reinterpret_cast<const uint8_t *>(first), std::strlen(first));
+    check(shard.poll(1, 0) == 1, "the first read did not come back");
+
+    check(service.calls == 1, "the service was not asked");
+    check(service.messages == 0, "half a message was answered");
+    check(io.written_size() == 0, "half a message produced an answer");
+
+    /* \~english
+     * One buffer, still.  It is the same one -- the next read was submitted
+     * into it rather than into a fresh one -- and that cannot be read off a
+     * field afterwards, because submitting the read hands it back to the
+     * operating system.  What says it is the count: a shard that had thrown
+     * the half away and taken a new buffer would show one here too, and would
+     * then fail to put the message back together below.
+     * \~spanish
+     * Un buffer, todavia.  Es el mismo -- la lectura siguiente se entrego sobre
+     * el y no sobre uno nuevo -- y eso no se puede leer de un campo despues,
+     * porque entregar la lectura se lo devuelve al sistema operativo.  Lo que lo
+     * dice es la cuenta: un fragmento que hubiera tirado la mitad y cogido un
+     * buffer nuevo tambien ensenaria uno aqui, y luego no sabria recomponer el
+     * mensaje mas abajo.
+     * \~ */
+    check(shard.buffers().lent() == 1,
+          "a connection holding half a message is not holding one buffer");
+
+    /* \~english
+     * The rest.  It has to land AFTER what was already there, in the same
+     * buffer, or the service sees a message that never arrived.
+     * \~spanish
+     * El resto.  Tiene que caer DETRAS de lo que ya habia, en el mismo buffer, o
+     * el servicio ve un mensaje que no llego nunca.
+     * \~ */
+    const char *rest = "thing.";
+    io.feed(reinterpret_cast<const uint8_t *>(rest), std::strlen(rest));
+    check(shard.poll(2, 0) == 1, "the second read did not come back");
+
+    check(service.messages == 1, "the whole message was not put back together");
+
+    for (int i = 0; i < 4; ++i) shard.poll(3, 0);
+
+    const char *whole = "GET /something.";
+    check(io.written_size() == std::strlen(whole),
+          "the answer is not the whole message");
+    check(std::memcmp(io.written(), whole, std::strlen(whole)) == 0,
+          "the message was not put back together in order");
+
+    /* \~english
+     * And with nothing left over there is one buffer out, the one the next
+     * request will arrive in -- not two, which is what a shard that kept the
+     * spent half as well would show.
+     * \~spanish
+     * Y sin nada que sobre hay un buffer fuera, aquel en el que llegara la
+     * peticion siguiente -- no dos, que es lo que ensenaria un fragmento que se
+     * hubiera quedado ademas la mitad ya gastada.
+     * \~ */
+    check(shard.buffers().lent() == 1,
+          "a connection between messages is holding more than the next read");
+}
+
 } // namespace
 
 int main() {
+    test_half_a_message_waits_for_the_rest();
     test_both_directions_at_once();
     test_an_idle_connection_holds_no_buffer();
     test_activity_pushes_the_deadline();

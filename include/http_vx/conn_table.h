@@ -219,6 +219,37 @@ struct ConnHot {
      */
     uint32_t queue;
 
+    /**
+     * \~english
+     * The buffer holding half a message, or @c kNoBuffer.
+     *
+     * A request arrives in as many reads as the network feels like, so what a
+     * read leaves behind has to be there when the rest lands after it.  The
+     * next read goes into this same buffer rather than a fresh one, which is
+     * what makes a head split across two packets a thing that simply works.
+     *
+     * It is the field that took the record past sixteen bytes, and it was
+     * worth it: without it the only ways to keep half a message are to copy it
+     * somewhere else -- which is the copy R13 exists to avoid -- or to refuse
+     * requests that arrive in pieces, which is most of the large ones.
+     *
+     * \~spanish
+     * El buffer que tiene medio mensaje, o @c kNoBuffer.
+     *
+     * Una peticion llega en tantas lecturas como le apetezca a la red, asi que
+     * lo que deje una lectura tiene que estar ahi cuando caiga detras el resto.
+     * La lectura siguiente va a este mismo buffer y no a uno nuevo, que es lo
+     * que hace que una cabeza partida entre dos paquetes sea algo que
+     * sencillamente funciona.
+     *
+     * Es el campo que saco el registro de los dieciseis bytes, y valio la pena:
+     * sin el, las unicas formas de guardar medio mensaje son copiarlo a otro
+     * sitio -- que es la copia que la R13 existe para evitar -- o rechazar las
+     * peticiones que lleguen a trozos, que son casi todas las grandes.
+     * \~
+     */
+    uint32_t reading;
+
     /// \~english What is outstanding and whether it is ending; see @c ConnFlag.
     /// \~spanish Que hay pendiente y si se esta acabando; ver @c ConnFlag.  \~
     uint16_t flags;
@@ -226,9 +257,29 @@ struct ConnHot {
     /// \~english How many answers are waiting behind the one going out.
     /// \~spanish Cuantas respuestas esperan detras de la que esta saliendo.  \~
     uint16_t queued;
+
+    uint32_t _pad;
 };
 
-static_assert(sizeof(ConnHot) == 16, "the hot record is meant to be sixteen bytes");
+/**
+ * \~english
+ * Twenty-four bytes, not the sixteen it started at.  The record is not swept
+ * -- nothing walks the table, because the deadlines are a wheel and the work
+ * arrives as completions carrying the slot -- so what the size costs is memory
+ * and not cache lines read for nothing: at a million connections, eight
+ * megabytes more, for the field that lets a request arrive in pieces.
+ *
+ * \~spanish
+ * Veinticuatro bytes, no los dieciseis con los que empezo.  El registro no se
+ * BARRE -- nadie recorre la tabla, porque los plazos son una rueda y el trabajo
+ * llega como finalizaciones que traen la casilla -- asi que lo que cuesta el
+ * tamano es memoria y no lineas de cache leidas para nada: al millon de
+ * conexiones, ocho megabytes mas, por el campo que permite que una peticion
+ * llegue a trozos.
+ * \~
+ */
+static_assert(sizeof(ConnHot) == 24,
+              "the hot record is meant to be twenty-four bytes");
 
 /**
  * @brief

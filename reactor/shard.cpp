@@ -83,6 +83,20 @@ void Shard::release() noexcept {
 }
 
 void Shard::drop_queue(ConnHot &h) noexcept {
+    /* \~english
+     * Half a message goes back too.  It is this shard's buffer -- the read
+     * that filled it came back -- and a connection that is ending will never
+     * see the rest of what it was holding.
+     * \~spanish
+     * Medio mensaje vuelve tambien.  Es un buffer de este fragmento -- la
+     * lectura que lo lleno ya volvio -- y una conexion que se esta acabando no
+     * va a ver nunca el resto de lo que guardaba.
+     * \~ */
+    if (h.reading != kNoBuffer) {
+        pool_.release(h.reading);
+        h.reading = kNoBuffer;
+    }
+
     while (h.queue != kNoBuffer) {
         const uint32_t next = queue_next_[h.queue];
         queue_next_[h.queue] = kNoBuffer;
@@ -124,6 +138,19 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     if (h.queued >= cfg_.max_queued) return;
 
     /* \~english
+     * Half a message from the last read goes back into the SAME buffer, so
+     * the rest lands right after it.  Only a connection between messages takes
+     * a fresh one -- which is also when it had none, because a connection that
+     * finished a message gave its buffer back.
+     * \~spanish
+     * Medio mensaje de la lectura anterior vuelve al MISMO buffer, para que el
+     * resto caiga justo detras.  Solo una conexion entre mensajes coge uno
+     * nuevo -- que es ademas cuando no tenia ninguno, porque una conexion que
+     * acabo un mensaje devolvio su buffer.
+     * \~ */
+    uint32_t b = h.reading;
+
+    /* \~english
      * The buffer is taken HERE, when there is a reason to read, and not when
      * the connection arrived.  That is R1.  Not getting one is not a failure
      * either: the connection does not read this time round, its deadline is
@@ -134,8 +161,10 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
      * no lee esta vuelta, su plazo sigue armado, y TCP frena al otro extremo el
      * solo.
      * \~ */
-    const uint32_t b = pool_.acquire();
-    if (b == kNoBuffer) return;
+    if (b == kNoBuffer) {
+        b = pool_.acquire();
+        if (b == kNoBuffer) return;
+    }
 
     Op op;
     op.conn = c;
@@ -145,10 +174,22 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     op.length = cfg_.read_size;
 
     if (!io_->submit(op)) {
-        pool_.release(b);
+        /* \~english
+         * Only a buffer taken just now is given back.  One that was already
+         * holding half a message is kept, because giving it back would throw
+         * away a message that had started arriving -- and the connection would
+         * then read the REST of it as the beginning of another.
+         * \~spanish
+         * Solo se devuelve un buffer cogido ahora mismo.  Uno que ya tenia medio
+         * mensaje se queda, porque devolverlo tiraria un mensaje que habia
+         * empezado a llegar -- y la conexion leeria despues el RESTO como el
+         * principio de otro.
+         * \~ */
+        if (h.reading == kNoBuffer) pool_.release(b);
         return;
     }
 
+    h.reading = kNoBuffer;
     h.flags |= kReadPending;
 }
 
@@ -367,18 +408,34 @@ void Shard::on_read(const Completion &done) noexcept {
     }
 
     Buffer *out = pool_.at(wb);
-    const bool keep =
-        service_->on_bytes(done.conn, in->data(), in->size(), *out);
+    const bool keep = service_->on_bytes(done.conn, *in, *out);
 
     /* \~english
-     * The read buffer goes back now, whatever happens next.  What the service
-     * wanted from it, it has taken.
+     * **The read buffer goes back only if the service emptied it.**  What is
+     * left is half a message, and it has to be there when the rest lands after
+     * it -- so the buffer stays with the connection and the next read appends
+     * to the same one.
+     *
+     * That is not a hole in R1, it is what R1 says: a connection mid-message
+     * holds a buffer with every right, and a connection between messages does
+     * not.  A shard that released it here would make every request that
+     * arrived in two packets unparseable, which is most of the large ones.
+     *
      * \~spanish
-     * El buffer de lectura vuelve ahora, pase lo que pase despues.  Lo que
-     * quisiera el servicio de el ya lo ha cogido.
+     * **El buffer de lectura vuelve solo si el servicio lo vacio.**  Lo que
+     * queda es medio mensaje, y tiene que estar ahi cuando caiga detras el resto
+     * -- asi que el buffer se queda con la conexion y la lectura siguiente anade
+     * al mismo.
+     *
+     * Eso no es un agujero en la R1, es lo que dice la R1: una conexion a mitad
+     * de mensaje tiene un buffer con todo el derecho, y una entre mensajes no.
+     * Un fragmento que lo soltara aqui haria ilegible toda peticion que llegara
+     * en dos paquetes, que son casi todas las grandes.
      * \~ */
     const bool empty = out->empty();
-    pool_.release(done.buffer);
+    h->reading = in->empty() ? kNoBuffer : done.buffer;
+
+    if (h->reading == kNoBuffer) pool_.release(done.buffer);
 
     if (!keep) {
         pool_.release(wb);

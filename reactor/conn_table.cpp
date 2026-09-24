@@ -103,8 +103,10 @@ bool ConnTable::reset(uint32_t capacity) noexcept {
         hot_[i].fd = -1;
         hot_[i].life = 1;
         hot_[i].queue = kNoBuffer;
+        hot_[i].reading = kNoBuffer;
         hot_[i].flags = 0;
         hot_[i].queued = 0;
+        hot_[i]._pad = 0;
 
         next_free_[i] = i + 1 == capacity_ ? kNoSlot : i + 1;
     }
@@ -124,6 +126,7 @@ ConnHandle ConnTable::open(int32_t fd, uint64_t opened) noexcept {
     ConnHot &h = hot_[slot];
     h.fd = fd;
     h.queue = kNoBuffer;
+    h.reading = kNoBuffer;
     h.flags = 0;
     h.queued = 0;
 
@@ -157,6 +160,7 @@ bool ConnTable::close(ConnHandle h) noexcept {
     ConnHot &slot = hot_[h.slot];
     slot.fd = -1;
     slot.queue = kNoBuffer;
+    slot.reading = kNoBuffer;
     slot.flags = 0;
     slot.queued = 0;
 
