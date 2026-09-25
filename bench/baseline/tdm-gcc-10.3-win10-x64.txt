@@ -5,8 +5,14 @@ http_vx -- medidas
 
   servir (tdm-gcc-10.3 win10-x64)
     peticiones por ronda                    900
-    peticiones por segundo              2517483
-    por peticion                            397 ns
+    peticiones por segundo              2483444
+    por peticion                            403 ns
+
+    SIN llamadas al sistema: el backend entrega los bytes
+    desde memoria.  Es el coste de la maquinaria de HTTP
+    sola.  Sobre un socket, una lectura y una escritura
+    cuestan mas que todo esto junto -- por eso lo que se
+    cuenta arriba es CUANTAS, no cuanto.
 
   llamadas por peticion (tdm-gcc-10.3 win10-x64) -- R15
     lecturas                               1.00
@@ -14,20 +20,20 @@ http_vx -- medidas
     una peticion sencilla deberia ser una y una
 
   partir la entrada (tdm-gcc-10.3 win10-x64) -- R12: sin retroceso
-    (cada fila analiza la MISMA cabeza 200000 veces, entregada
-     en mas o menos trozos)
-    trozos     seg (las 200k)        cab/s vs 1 trozo
-    1                  0.0189     10597149      1.00x
-    2                  0.0191     10448284      1.01x
-    4                  0.0195     10237772      1.04x
-    8                  0.0223      8987552      1.18x
-    16                 0.0266      7524200      1.41x
-    32                 0.0373      5359847      1.98x
+    (cada fila analiza la MISMA cabeza de 82 B, 200000 veces,
+     entregada en mas o menos trozos)
+    trozos     seg (las 200k)        cab/s vs 1 trozo      MB/s
+    1                  0.0199     10071254      1.00x       788
+    2                  0.0201      9936407      1.01x       777
+    4                  0.0215      9323053      1.08x       729
+    8                  0.0231      8657934      1.16x       677
+    16                 0.0267      7488589      1.34x       586
+    32                 0.0367      5447780      1.85x       426
 
     la misma pregunta a una cabeza 16 veces mayor:
     trozos      seg (las 20k)        cab/s vs 1 trozo
-    1                  0.0262       762349      1.00x
-    32                 0.0268       745490      1.02x
+    1                  0.0300       667583      1.00x
+    32                 0.0321       623107      1.07x
 
     la proporcion de la cabeza GRANDE debe ser MENOR o igual
     que la de la pequena.  Si es mayor, el analizador

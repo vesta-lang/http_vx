@@ -410,11 +410,11 @@ void report_slicing(const char *tag) {
      * de otro sitio es un numero que se va a leer mal.
      * \~ */
     std::printf("\n  partir la entrada (%s) -- R12: sin retroceso\n", tag);
-    std::printf("    (cada fila analiza la MISMA cabeza %zu veces, entregada\n"
-                "     en mas o menos trozos)\n",
-                kRounds);
-    std::printf("    %-10s %14s %12s %10s\n", "trozos", "seg (las 200k)",
-                "cab/s", "vs 1 trozo");
+    std::printf("    (cada fila analiza la MISMA cabeza de %zu B, %zu veces,\n"
+                "     entregada en mas o menos trozos)\n",
+                std::strlen(kRequest), kRounds);
+    std::printf("    %-10s %14s %12s %10s %9s\n", "trozos", "seg (las 200k)",
+                "cab/s", "vs 1 trozo", "MB/s");
 
     double first = 0.0;
 
@@ -470,8 +470,23 @@ void report_slicing(const char *tag) {
 
         if (first == 0.0) first = secs;
 
-        std::printf("    %-10zu %14.4f %12.0f %9.2fx\n", pieces, secs,
-                    static_cast<double>(done) / secs, secs / first);
+        /* \~english
+         * Bytes per second as well as heads per second, because bytes is the
+         * unit another parser's number will be in.  A head is whatever size
+         * somebody chose; a byte is a byte, and it is the only one of the two
+         * that can be put next to a figure measured somewhere else.
+         * \~spanish
+         * Bytes por segundo ademas de cabeceras por segundo, porque los bytes
+         * son la unidad en la que estara el numero de otro analizador.  Una
+         * cabecera mide lo que alguien eligio; un byte es un byte, y es la
+         * unica de las dos que se puede poner al lado de una cifra medida en
+         * otro sitio.
+         * \~ */
+        const double mbps = static_cast<double>(done) *
+                            static_cast<double>(n) / secs / (1024.0 * 1024.0);
+
+        std::printf("    %-10zu %14.4f %12.0f %9.2fx %9.0f\n", pieces, secs,
+                    static_cast<double>(done) / secs, secs / first, mbps);
     }
 
     /* \~english
@@ -623,6 +638,36 @@ void report_speed(const char *tag) {
     std::printf("    %-34s %8.0f\n", "peticiones por segundo", best);
     std::printf("    %-34s %8.0f ns\n", "por peticion",
                 best > 0.0 ? 1e9 / best : 0.0);
+
+    /* \~english
+     * And what the number is NOT, said here rather than left to whoever reads
+     * it.  There is no system call in this measurement: the backend hands the
+     * bytes over out of memory.  So this is the cost of the HTTP machinery
+     * alone -- parsing, framing, the loop -- and on a real socket a read and a
+     * write cost more than all of it put together.
+     *
+     * That is not a disclaimer, it is the argument for how this server is
+     * built: if the syscall dominates, then what matters is doing FEWER of
+     * them, which is what R15 counts and R18 batches.  A server that made this
+     * number twice as good and did two syscalls per request would be slower.
+     *
+     * \~spanish
+     * Y lo que el numero NO es, dicho aqui y no dejado a quien lo lea.  En esta
+     * medida no hay ninguna llamada al sistema: el backend entrega los bytes
+     * desde memoria.  Asi que esto es el coste de la maquinaria de HTTP sola --
+     * analizar, trocear, el bucle -- y sobre un socket de verdad una lectura y
+     * una escritura cuestan mas que todo ello junto.
+     *
+     * No es un descargo, es el argumento de como esta hecho este servidor: si
+     * manda la llamada al sistema, lo que importa es hacer MENOS, que es lo que
+     * cuenta la R15 y agrupa la R18.  Un servidor que hiciera este numero el
+     * doble de bueno y dos llamadas por peticion iria mas lento.
+     * \~ */
+    std::printf("\n    SIN llamadas al sistema: el backend entrega los bytes\n"
+                "    desde memoria.  Es el coste de la maquinaria de HTTP\n"
+                "    sola.  Sobre un socket, una lectura y una escritura\n"
+                "    cuestan mas que todo esto junto -- por eso lo que se\n"
+                "    cuenta arriba es CUANTAS, no cuanto.\n");
 }
 
 } // namespace

@@ -32,6 +32,29 @@ coste fijo no, asi que con una cabeza mayor la proporcion **baja**.  Uno que
 volviera a empezar leeria el primer trozo treinta y dos veces, y eso crece CON
 la cabeza: subiria, y seguiria subiendo.
 
+## Con que se compara esto, y con que no
+
+**El numero de `servir` NO se compara con el de nginx ni con un TechEmpower.**
+Aqui no hay ninguna llamada al sistema: el backend entrega los bytes desde
+memoria.  Es el coste de la maquinaria de HTTP sola, y sobre un socket una
+lectura y una escritura cuestan mas que todo ello junto.
+
+Eso no es un descargo.  Es el argumento de como esta hecho este servidor: si
+manda la llamada al sistema, lo que importa es hacer MENOS -- que es lo que
+cuenta la R15 y agrupa la R18 --, no que analizar sea un poco mas rapido.  Un
+servidor que hiciera este numero el doble de bueno y dos llamadas por peticion
+iria mas lento.
+
+**Lo que SI se compara es el MB/s de analizar**, porque los bytes son la unidad
+en la que esta el numero de cualquier otro analizador.  Una cabecera mide lo que
+alguien eligio; un byte es un byte.
+
+Y aun asi, la unica comparacion que vale es la que se corre **en la misma
+maquina y el mismo dia**.  Una cifra recordada de otro sitio, con otra CPU, otro
+compilador y otra cabecera de ejemplo, no dice quien es mas rapido: dice que dos
+maquinas son distintas.  Por eso aqui no hay una tabla de rivales, y si alguna
+vez la hay tendra que salir de correr al rival con este mismo fichero.
+
 ## Lo que ya ha encontrado
 
 - **33 us por peticion**, que eran 8 KB de operaciones pendientes copiadas a la
