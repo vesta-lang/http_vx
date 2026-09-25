@@ -171,6 +171,7 @@ add_library(http_vx_quic STATIC
         quic/protection.cpp
         quic/recovery.cpp
         quic/stream_recv.cpp
+        quic/stream_send.cpp
         quic/varint.cpp
 )
 target_include_directories(http_vx_quic
@@ -398,6 +399,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_quic_protection tests/test_quic_protection.cpp)
     http_vx_add_test(test_quic_recovery tests/test_quic_recovery.cpp)
     http_vx_add_test(test_quic_stream_recv tests/test_quic_stream_recv.cpp)
+    http_vx_add_test(test_quic_stream_send tests/test_quic_stream_send.cpp)
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
     http_vx_add_test(test_chacha20_poly1305 tests/test_chacha20_poly1305.cpp)
     target_link_libraries(test_chacha20_poly1305 PRIVATE http_vx_chacha)

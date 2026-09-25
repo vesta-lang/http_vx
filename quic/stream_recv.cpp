@@ -15,6 +15,8 @@
 
 #include "http_vx/quic_stream_recv.h"
 
+#include "bitmap.h"
+
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
 #include "util/mem/vesta_memcpy.h"
@@ -33,52 +35,6 @@ struct RecvStream::Chunk {
 namespace {
 
 inline uint64_t min64(uint64_t a, uint64_t b) noexcept { return a < b ? a : b; }
-
-/**
- * @brief
- * \~english Sets @p n bits from @p from and returns how many were not set before.
- * \~spanish Pone @p n bits desde @p from y devuelve cuantos no estaban puestos.
- * \~
- *
- * \~english A word at a time: counting duplicates byte by byte would cost more than copying them.
- * \~spanish Una palabra cada vez: contar duplicados byte a byte costaria mas que copiarlos.  \~
- */
-size_t set_bits(uint64_t *bits, size_t from, size_t n) noexcept {
-    size_t fresh = 0;
-    while (n != 0) {
-        const size_t w = from / 64;
-        const size_t b = from % 64;
-        const size_t take = n < 64 - b ? n : 64 - b;
-        const uint64_t mask = (take == 64 ? ~uint64_t{0} : ((uint64_t{1} << take) - 1)) << b;
-        fresh += static_cast<size_t>(__builtin_popcountll(mask & ~bits[w]));
-        bits[w] |= mask;
-        from += take;
-        n -= take;
-    }
-    return fresh;
-}
-
-/// \~english How many consecutive bits are set from @p from, up to the end of the chunk.
-/// \~spanish Cuantos bits seguidos estan puestos desde @p from, hasta el final del trozo.  \~
-size_t run_of_ones(const uint64_t *bits, size_t from) noexcept {
-    size_t run = 0;
-    while (from < kRecvChunk) {
-        const size_t w = from / 64;
-        const size_t b = from % 64;
-        const uint64_t word = bits[w] >> b;
-        const uint64_t zeros = ~word;
-        const size_t avail = 64 - b;
-
-        // \~english The first zero, or the whole rest of the word if it is all ones.
-        // \~spanish El primer cero, o el resto entero de la palabra si es todo unos.  \~
-        size_t ones = zeros == 0 ? avail : static_cast<size_t>(__builtin_ctzll(zeros));
-        if (ones > avail) ones = avail;
-        run += ones;
-        if (ones < avail) break;
-        from += avail;
-    }
-    return run;
-}
 
 } // namespace
 
@@ -237,7 +193,7 @@ StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, b
          * bytes (2.2), asi que reescribirlos es mas barato que saltarselos.
          * \~ */
         util::vesta_memcpy(c->data + in, p + (pos - offset), n);
-        buffered_ += set_bits(c->bits, in, n);
+        buffered_ += bits::set(c->bits, in, n);
         pos += n;
     }
 
@@ -298,7 +254,7 @@ size_t RecvStream::peek(const uint8_t *&p) const noexcept {
     if (c == nullptr) return 0;
 
     const size_t in = static_cast<size_t>(read_ % kRecvChunk);
-    const size_t n = run_of_ones(c->bits, in);
+    const size_t n = bits::run(c->bits, in, kRecvChunk, true);
     p = c->data + in;
     return n;
 }
