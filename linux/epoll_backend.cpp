@@ -370,40 +370,32 @@ int EpollBackend::try_now(const Op &op) noexcept {
         return taken;
     }
 
-    case OpKind::Ready: {
+    case OpKind::Ready:
         /* \~english
-         * One byte looked at and left where it was.  `MSG_PEEK` is the whole
-         * answer here: there is no buffer to read into -- not having one is the
-         * point -- and what is being asked is only whether a read would find
-         * anything.
+         * It is ready, and NOTHING was asked to find that out.  This is only
+         * ever reached from @c wait, where the queue has just said the
+         * descriptor has something -- so the answer was already in hand, and a
+         * system call here would be buying it a second time.
          *
-         * A zero would have been simpler and is wrong: a receive of zero bytes
-         * returns zero on Linux whatever the socket is doing, so it would say
-         * "ready" about every socket in the server, for ever.
-         *
-         * Zero from a real peek IS the answer though -- it is the peer having
-         * closed -- and it is reported as ready on purpose: the read that
-         * follows finds the end of the stream, which is a thing the loop above
-         * needs to be told about the ordinary way.
+         * It bought it twice for a while: a one-byte `MSG_PEEK`, once when the
+         * notice was asked for and again when it was reported.  The first one
+         * almost always came back with "not yet", because a @c Ready is only
+         * asked for when this end has nothing -- which is exactly when the
+         * socket is most likely to have nothing either.
          *
          * \~spanish
-         * Un byte mirado y dejado donde estaba.  `MSG_PEEK` es toda la respuesta
-         * aqui: no hay buffer en el que leer -- no tenerlo es de lo que se trata
-         * -- y lo unico que se pregunta es si una lectura encontraria algo.
+         * Esta listo, y no se pregunto NADA para averiguarlo.  Aqui solo se llega
+         * desde @c wait, donde la cola acaba de decir que el descriptor tiene algo
+         * -- asi que la respuesta ya estaba en la mano, y una llamada al sistema
+         * aqui seria comprarla por segunda vez.
          *
-         * Un cero habria sido mas simple y esta mal: una recepcion de cero bytes
-         * devuelve cero en Linux haga lo que haga el socket, asi que diria "listo"
-         * de todos los sockets del servidor, para siempre.
-         *
-         * Un cero de un vistazo de verdad SI es la respuesta -- es el otro extremo
-         * habiendo cerrado -- y se dice que esta listo a proposito: la lectura que
-         * viene detras encuentra el fin del flujo, que es algo de lo que hay que
-         * avisar al bucle de encima por la via corriente.
+         * La compro dos veces durante un tiempo: un `MSG_PEEK` de un byte, una al
+         * pedir el aviso y otra al informarlo.  La primera volvia casi siempre con
+         * "todavia no", porque un @c Ready solo se pide cuando este extremo no
+         * tiene nada -- que es justo cuando es mas probable que el socket tampoco
+         * tenga.
          * \~ */
-        uint8_t peek = 0;
-        const ssize_t n = ::recv(op.fd, &peek, 1, MSG_PEEK);
-        return n < 0 ? -1 : 0;
-    }
+        return 0;
 
     case OpKind::Recv:
     case OpKind::RecvFrom: {
@@ -515,6 +507,31 @@ bool EpollBackend::submit(const Op &want) noexcept {
         last_error_ = EBADF;
         return remember(op, -1, -1);
     }
+
+    /* \~english
+     * **A notice is never tried.**  What it asks is "tell me when there is
+     * something", and that is the queue's question: trying it here would be a
+     * system call spent asking a socket what the queue is already watching it
+     * to find out -- and spent, overwhelmingly, to be told "not yet", because a
+     * notice is only ever asked for when this end has nothing left.
+     *
+     * So it goes straight to waiting.  What that costs, when the socket DID
+     * already have something, is one turn of the loop; what it saves is a
+     * system call on every request that ever waits, which is most of them.
+     *
+     * \~spanish
+     * **Un aviso no se intenta nunca.**  Lo que pregunta es "avisame cuando haya
+     * algo", y esa es la pregunta de la cola: intentarlo aqui seria una llamada
+     * al sistema gastada en preguntarle a un socket lo que la cola ya esta
+     * vigilando para averiguar -- y gastada, en la inmensa mayoria de los casos,
+     * para que le digan "todavia no", porque un aviso solo se pide cuando a este
+     * extremo no le queda nada.
+     *
+     * Asi que va directo a esperar.  Lo que eso cuesta, cuando el socket SI tenia
+     * algo, es una vuelta del bucle; lo que ahorra es una llamada al sistema en
+     * cada peticion que espere, que son casi todas.
+     * \~ */
+    if (op.kind == OpKind::Ready) return park(op);
 
     /* \~english
      * With no room to report a completion, the operation is PARKED rather than
