@@ -62,6 +62,17 @@ public:
     const char *name() const noexcept override { return "fake"; }
     bool supports(Aead) const noexcept override { return true; }
 
+    /// \~english Deterministic on purpose: a test run is repeatable.
+    /// \~spanish Determinista a proposito: una corrida de prueba se puede repetir.  \~
+    bool random(uint8_t *out, size_t n) noexcept override {
+        if (broken) return false;
+        for (size_t i = 0; i < n; ++i) {
+            seed_ = seed_ * 6364136223846793005ull + 1442695040888963407ull;
+            out[i] = static_cast<uint8_t>(seed_ >> 56);
+        }
+        return true;
+    }
+
     bool extract(Hash h, const uint8_t *salt, size_t salt_len, const uint8_t *ikm,
                  size_t ikm_len, uint8_t *prk) noexcept override {
         if (broken) return false;
@@ -119,6 +130,8 @@ public:
     }
 
 private:
+    uint64_t seed_ = 0x0123456789abcdefull;
+
     static uint64_t mix(uint64_t a, const uint8_t *p, size_t n) {
         a ^= 1469598103934665603ull;
         for (size_t i = 0; i < n; ++i) a = (a ^ p[i]) * 1099511628211ull;

@@ -208,6 +208,18 @@ const char *CngCrypto::name() const noexcept {
     return "cng";
 }
 
+bool CngCrypto::random(uint8_t *out, size_t n) noexcept {
+    // \~english The system's preferred generator: no algorithm handle to keep.
+    // \~spanish El generador preferido del sistema: sin manejador de algoritmo que guardar.  \~
+    while (n != 0) {
+        const ULONG take = n > (1u << 20) ? (1u << 20) : static_cast<ULONG>(n);
+        if (!ok(BCryptGenRandom(nullptr, out, take, BCRYPT_USE_SYSTEM_PREFERRED_RNG))) return false;
+        out += take;
+        n -= take;
+    }
+    return true;
+}
+
 bool CngCrypto::supports(quic::Aead a) const noexcept {
     // \~english ChaCha20 comes from `providers/common`, not from the system.
     // \~spanish ChaCha20 sale de `providers/common`, no del sistema.  \~

@@ -216,6 +216,25 @@ public:
 
     /**
      * @brief
+     * \~english Fills @p out with @p n unpredictable bytes: connection IDs, token nonces.
+     * \~spanish Llena @p out con @p n bytes impredecibles: identificadores de conexion, nonces de testigos.
+     * \~
+     *
+     * \~english
+     * From the provider, like every other primitive: a connection ID an
+     * attacker can predict lets it route or reset connections it never saw,
+     * so "random enough" is a cryptographic property, not a convenience.
+     * \~spanish
+     * Del proveedor, como cualquier otra primitiva: un identificador de conexion
+     * que un atacante puede predecir le deja encaminar o reiniciar conexiones
+     * que nunca vio, asi que "suficientemente aleatorio" es una propiedad
+     * criptografica, no una comodidad.
+     * \~
+     */
+    virtual bool random(uint8_t *out, size_t n) noexcept = 0;
+
+    /**
+     * @brief
      * \~english HKDF-Extract (RFC 5869): writes `hash_size(h)` bytes to @p prk.
      * \~spanish HKDF-Extract (RFC 5869): escribe `hash_size(h)` bytes en @p prk.
      * \~

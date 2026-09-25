@@ -167,6 +167,15 @@ struct DropCounts {
     /// \~english Packets kept until their keys arrived, and then opened.
     /// \~spanish Paquetes guardados hasta que llegaron sus claves, y luego abiertos.  \~
     uint64_t buffered = 0;
+    /// \~english A Version Negotiation that came too late, or listed the version in use (6.2).
+    /// \~spanish Un Version Negotiation que llego tarde, o que lista la version en uso (6.2).  \~
+    uint64_t version_negotiation = 0;
+    /// \~english A Retry that came too late, repeated, empty, or naming the ID it answers (17.2.5.2).
+    /// \~spanish Un Retry que llego tarde, repetido, vacio, o con el identificador al que contesta (17.2.5.2).  \~
+    uint64_t retry = 0;
+    /// \~english A long header whose source ID is not the one the server first gave (7.2).
+    /// \~spanish Una cabecera larga cuyo identificador de origen no es el que dio primero el servidor (7.2).  \~
+    uint64_t changed_source = 0;
 };
 
 /**
@@ -205,11 +214,59 @@ public:
 
     /**
      * @brief
-     * \~english Derives the Initial keys from the client's original destination ID.
-     * \~spanish Saca las claves Initial del identificador de destino original del cliente.
+     * \~english Derives the Initial keys from the destination ID of the client's first Initial.
+     * \~spanish Saca las claves Initial del identificador de destino del primer Initial del cliente.
+     * \~
+     *
+     * \~english
+     * A client passes the ID it chose.  A server passes the destination of the
+     * Initial the acceptor admitted -- after a Retry, the Retry's own ID, which
+     * is what the client derives its keys from by then.
+     * \~spanish
+     * Un cliente pasa el identificador que eligio.  Un servidor pasa el destino
+     * del Initial que admitio el acceptor -- tras un Retry, el del propio Retry,
+     * que es del que saca el cliente sus claves para entonces.
      * \~
      */
     bool set_initial_keys(const uint8_t *odcid, size_t len) noexcept;
+
+    /**
+     * @brief
+     * \~english A server whose client came back with a valid Retry token: no amplification limit (8.1.2).
+     * \~spanish Un servidor cuyo cliente volvio con un testigo de Retry valido: sin limite de amplificacion (8.1.2).
+     * \~
+     */
+    void set_address_validated(uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english A client's attempt ended in Version Negotiation: the versions the server offered.
+     * \~spanish El intento de un cliente acabo en Version Negotiation: las versiones que ofrecio el servidor.
+     * \~
+     *
+     * \~english
+     * The connection is Closed, silently (6.2): no version in common with
+     * this one.  Starting again with one of these is a decision for whoever
+     * created the connection -- and it has to be a new connection.
+     * \~spanish
+     * La conexion queda Closed, en silencio (6.2): ninguna version en comun con
+     * esta.  Empezar de nuevo con una de estas es una decision de quien creo la
+     * conexion -- y tiene que ser una conexion nueva.
+     * \~
+     *
+     * @return \~english how many were offered; at most @p room are written
+     *         \~spanish cuantas se ofrecieron; se escriben como mucho @p room  \~
+     */
+    size_t offered_versions(uint32_t *out, size_t room) const noexcept;
+    bool ended_in_version_negotiation() const noexcept { return vn_received_; }
+
+    /// \~english Whether a Retry was accepted, and the ID it came from (for retry_source_connection_id).
+    /// \~spanish Si se acepto un Retry, y el identificador del que llego (para retry_source_connection_id).  \~
+    bool retried() const noexcept { return retried_; }
+    const uint8_t *retry_source_cid(size_t &len) const noexcept {
+        len = retry_scid_len_;
+        return retry_scid_;
+    }
 
     /**
      * @brief
@@ -334,6 +391,9 @@ private:
 
     void fail(TransportError e, uint64_t frame_type, uint64_t now_us) noexcept;
     bool process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn, uint64_t now_us) noexcept;
+    void process_version_negotiation(const uint8_t *p, const PacketHeader &h) noexcept;
+    void process_retry(const uint8_t *p, const PacketHeader &h, uint64_t now_us) noexcept;
+    bool derive_initial_keys(const uint8_t *dcid, size_t len) noexcept;
     bool process_frames(Space s, const uint8_t *payload, size_t n, PacketType type,
                         bool &eliciting, uint64_t now_us) noexcept;
     /// \~english When a packet is padded to a full datagram (14.1).  \~spanish Cuando un paquete se rellena a un datagrama entero (14.1).  \~
@@ -399,6 +459,29 @@ private:
     bool peer_cid_known_ = false;
     uint8_t odcid_[kMaxConnectionId] = {};
     size_t odcid_len_ = 0;
+
+    /**
+     * \~english
+     * What happens before the server's first real packet, on the client.  Once
+     * any packet from the server has been processed, neither a Version
+     * Negotiation nor a Retry is believed any more (6.2, 17.2.5.2).
+     * \~spanish
+     * Lo que pasa antes del primer paquete de verdad del servidor, en el
+     * cliente.  En cuanto se proceso cualquier paquete del servidor, ya no se
+     * cree ni un Version Negotiation ni un Retry (6.2, 17.2.5.2).
+     * \~
+     */
+    bool received_any_ = false;
+    bool vn_received_ = false;
+    static constexpr size_t kOfferedVersions = 8;
+    uint32_t offered_[kOfferedVersions] = {};
+    size_t offered_count_ = 0;
+    bool retried_ = false;
+    uint8_t retry_scid_[kMaxConnectionId] = {};
+    size_t retry_scid_len_ = 0;
+    /// \~english The Retry token, repeated in every Initial from then on.  \~spanish El testigo del Retry, repetido en cada Initial desde entonces.  \~
+    uint8_t *token_ = nullptr;
+    size_t token_len_ = 0;
 
     bool confirmed_ = false;
     bool validated_ = false;

@@ -529,6 +529,27 @@ void Recovery::discard_space(Space s, uint64_t now_us) noexcept {
     set_timer(now_us);
 }
 
+void Recovery::on_retry(uint64_t now_us, RecoveryListener &l) noexcept {
+    const Ring &r = ring_[idx(Space::Initial)];
+    for (uint32_t k = 0; k < r.size; ++k) {
+        const SentPacket &p = r.at(k);
+        if (p.state == kOutstanding) l.on_lost(Space::Initial, p);
+    }
+
+    // \~english The flight empties like a discarded space, but the numbering goes on.
+    // \~spanish El vuelo se vacia como en un espacio tirado, pero la numeracion sigue.  \~
+    discard_space(Space::Initial, now_us);
+
+    cwnd_ = initial_window();
+    ssthresh_ = kNever;
+    bytes_acked_ca_ = 0;
+    recovery_start_ = 0;
+    in_recovery_period_ = false;
+    probes_ = 0;
+    pto_count_ = 0;
+    set_timer(now_us);
+}
+
 void Recovery::set_handshake_confirmed(uint64_t now_us) noexcept {
     handshake_confirmed_ = true;
     set_timer(now_us);

@@ -150,6 +150,7 @@ Connection::~Connection() {
     }
     if (records_ != nullptr) util::host_free(records_);
     if (pending_ != nullptr) util::host_free(pending_);
+    if (token_ != nullptr) util::host_free(token_);
 }
 
 bool Connection::ready() const noexcept {
@@ -162,9 +163,30 @@ bool Connection::set_initial_keys(const uint8_t *odcid, size_t len) noexcept {
     if (len > kMaxConnectionId) return false;
     util::vesta_memcpy(odcid_, odcid, len);
     odcid_len_ = len;
+    return derive_initial_keys(odcid, len);
+}
+
+bool Connection::derive_initial_keys(const uint8_t *dcid, size_t len) noexcept {
+    // \~english The old keys first: re-deriving must not leak the states behind them.
+    // \~spanish Primero las claves viejas: volver a derivar no debe perder los estados de detras.  \~
     Keys &k = keys_[idx(Space::Initial)];
-    k.have = make_initial_keys(crypto_, cfg_.version, odcid, len, cfg_.is_server, k.read, k.write);
+    if (k.have) {
+        forget_keys(crypto_, k.read);
+        forget_keys(crypto_, k.write);
+    }
+    k.have = make_initial_keys(crypto_, cfg_.version, dcid, len, cfg_.is_server, k.read, k.write);
     return k.have;
+}
+
+void Connection::set_address_validated(uint64_t now_us) noexcept {
+    validated_ = true;
+    recovery_.set_amplification_blocked(false, now_us);
+}
+
+size_t Connection::offered_versions(uint32_t *out, size_t room) const noexcept {
+    const size_t kept = offered_count_ < kOfferedVersions ? offered_count_ : kOfferedVersions;
+    for (size_t i = 0; i < kept && i < room; ++i) out[i] = offered_[i];
+    return offered_count_;
 }
 
 bool Connection::install_keys(Space s, KeyMaterial &read, KeyMaterial &write,
@@ -442,9 +464,15 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     case PacketType::Initial:   s = Space::Initial; break;
     case PacketType::Handshake: s = Space::Handshake; break;
     case PacketType::OneRtt:    s = Space::Application; break;
+    case PacketType::VersionNegotiation:
+        process_version_negotiation(p, h);
+        return false;
+    case PacketType::Retry:
+        process_retry(p, h, now_us);
+        return false;
     default:
-        // \~english 0-RTT, Retry and Version Negotiation come in later steps.
-        // \~spanish 0-RTT, Retry y Version Negotiation llegan en pasos posteriores.  \~
+        // \~english 0-RTT comes in a later step; an unknown version is the acceptor's business.
+        // \~spanish 0-RTT llega en un paso posterior; una version desconocida es cosa del acceptor.  \~
         ++drops_.unsupported;
         return false;
     }
@@ -458,6 +486,15 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
                           bytes_equal(dcid, odcid_, odcid_len_);
     if (!ours && !original) {
         ++drops_.wrong_cid;
+        return false;
+    }
+
+    // \~english Once the server gave its ID, a long header naming another is not from it (7.2).
+    // \~spanish Una vez que el servidor dio su identificador, una cabecera larga con otro no es suya (7.2).  \~
+    if (!cfg_.is_server && peer_cid_known_ && s != Space::Application &&
+        (h.scid.len != cfg_.peer_cid_len ||
+         !bytes_equal(p + h.scid.off, cfg_.peer_cid, cfg_.peer_cid_len))) {
+        ++drops_.changed_source;
         return false;
     }
 
@@ -495,6 +532,7 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
         ++drops_.duplicate;
         return false;
     }
+    received_any_ = true;
 
     // \~english The peer's real ID comes with its first long header.
     // \~spanish El identificador de verdad del otro extremo llega con su primera cabecera larga.  \~
@@ -529,6 +567,131 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
         discard_keys(Space::Initial, now_us);
     }
     return true;
+}
+
+void Connection::process_version_negotiation(const uint8_t *p, const PacketHeader &h) noexcept {
+    // \~english Only a client starts a connection, so only a client is answered with one.
+    // \~spanish Solo un cliente empieza una conexion, asi que solo a un cliente se le contesta con uno.  \~
+    if (cfg_.is_server) {
+        ++drops_.unsupported;
+        return;
+    }
+
+    /* \~english
+     * Believed only before anything else from the server (6.2): after that,
+     * the server has shown it speaks this version, and a VN can only be
+     * forged -- one that ended the connection would be an attack.
+     * \~spanish
+     * Solo se cree antes de cualquier otra cosa del servidor (6.2): despues, el
+     * servidor ya demostro que habla esta version, y un VN solo puede ser
+     * falsificado -- uno que acabara con la conexion seria un ataque.
+     * \~ */
+    if (received_any_ || retried_) {
+        ++drops_.version_negotiation;
+        return;
+    }
+
+    // \~english Both IDs echoed, swapped: an off-path attacker never saw them.
+    // \~spanish Los dos identificadores devueltos, cruzados: un atacante fuera del camino no los vio.  \~
+    if (h.dcid.len != cfg_.local_cid_len || !bytes_equal(p + h.dcid.off, cfg_.local_cid, h.dcid.len) ||
+        h.scid.len != odcid_len_ || !bytes_equal(p + h.scid.off, odcid_, odcid_len_)) {
+        ++drops_.wrong_cid;
+        return;
+    }
+
+    const uint8_t *v = p + h.versions.off;
+    const size_t count = h.versions.len / 4;
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t offered = static_cast<uint32_t>(v[4 * i]) << 24 |
+                                 static_cast<uint32_t>(v[4 * i + 1]) << 16 |
+                                 static_cast<uint32_t>(v[4 * i + 2]) << 8 | v[4 * i + 3];
+        // \~english Listing the version in use contradicts itself: ignored (6.2).
+        // \~spanish Listar la version en uso se contradice: se ignora (6.2).  \~
+        if (offered == cfg_.version) {
+            ++drops_.version_negotiation;
+            offered_count_ = 0;
+            return;
+        }
+        if (offered_count_ < kOfferedVersions) offered_[offered_count_] = offered;
+        ++offered_count_;
+    }
+
+    // \~english No version in common: the attempt is abandoned, without a word (6.2).
+    // \~spanish Ninguna version en comun: se abandona el intento, sin decir nada (6.2).  \~
+    vn_received_ = true;
+    state_ = ConnState::Closed;
+}
+
+void Connection::process_retry(const uint8_t *p, const PacketHeader &h, uint64_t now_us) noexcept {
+    if (cfg_.is_server) {
+        ++drops_.unsupported;
+        return;
+    }
+
+    // \~english One Retry per attempt, and none once the server has spoken (17.2.5.2).
+    // \~spanish Un Retry por intento, y ninguno una vez que hablo el servidor (17.2.5.2).  \~
+    if (received_any_ || retried_ || h.version != cfg_.version) {
+        ++drops_.retry;
+        return;
+    }
+    if (h.dcid.len != cfg_.local_cid_len || !bytes_equal(p + h.dcid.off, cfg_.local_cid, h.dcid.len)) {
+        ++drops_.wrong_cid;
+        return;
+    }
+
+    // \~english An empty token, or the server naming the ID being answered: not a Retry (17.2.5.2).
+    // \~spanish Un testigo vacio, o el servidor con el identificador al que contesta: no es un Retry (17.2.5.2).  \~
+    if (h.token.len == 0 || h.scid.len > kMaxConnectionId ||
+        (h.scid.len == cfg_.peer_cid_len && bytes_equal(p + h.scid.off, cfg_.peer_cid, h.scid.len))) {
+        ++drops_.retry;
+        return;
+    }
+
+    // \~english The tag proves the server saw the first Initial (RFC 9001, 5.8).
+    // \~spanish La marca prueba que el servidor vio el primer Initial (RFC 9001, 5.8).  \~
+    uint8_t scratch[1 + kMaxConnectionId + 1500];
+    uint8_t tag[kRetryTagSize];
+    if (!retry_tag(crypto_, cfg_.version, odcid_, odcid_len_, p, h.tag.off, scratch, sizeof scratch,
+                   tag)) {
+        fail(TransportError::InternalError, 0, now_us);
+        return;
+    }
+    if (!bytes_equal(tag, p + h.tag.off, kRetryTagSize)) {
+        ++drops_.forged;
+        return;
+    }
+
+    const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
+                                 util::AllocFill::Dense);
+    token_ = static_cast<uint8_t *>(util::host_alloc(h.token.len));
+    if (token_ == nullptr) {
+        fail(TransportError::InternalError, 0, now_us);
+        return;
+    }
+    util::vesta_memcpy(token_, p + h.token.off, h.token.len);
+    token_len_ = h.token.len;
+
+    /* \~english
+     * From now on the client speaks to the Retry's ID, and the Initial keys
+     * come from it; the original ID stays for the transport parameters.
+     * Whatever was sent goes out again, with the token.
+     * \~spanish
+     * Desde ahora el cliente le habla al identificador del Retry, y las claves
+     * Initial salen de el; el original se queda para los parametros de
+     * transporte.  Lo que se mando sale otra vez, con el testigo.
+     * \~ */
+    // \~english Out of line: at most once per connection, and at most twenty bytes.
+    // \~spanish Fuera de linea: como mucho una vez por conexion, y como mucho veinte bytes.  \~
+    util::vesta_memcpy_noinline(retry_scid_, p + h.scid.off, h.scid.len);
+    retry_scid_len_ = h.scid.len;
+    util::vesta_memcpy_noinline(cfg_.peer_cid, p + h.scid.off, h.scid.len);
+    cfg_.peer_cid_len = h.scid.len;
+    if (!derive_initial_keys(retry_scid_, retry_scid_len_)) {
+        fail(TransportError::InternalError, 0, now_us);
+        return;
+    }
+    retried_ = true;
+    recovery_.on_retry(now_us, *this);
 }
 
 bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, PacketType type,
@@ -856,6 +1019,10 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     size_t length_at = 0;
     const bool is_long = s != Space::Application;
     if (room < 64) return 0;
+    // \~english After a Retry an Initial header carries the token: it has to fit first.
+    // \~spanish Tras un Retry la cabecera de un Initial lleva el testigo: primero tiene que caber.  \~
+    const size_t token_room = s == Space::Initial ? varint_size(token_len_) + token_len_ : 0;
+    if (token_room + 64 > room) return 0;
     if (is_long) {
         out[h++] = static_cast<uint8_t>(0xc0 | (long_type_bits(s, cfg_.version) << 4));
         out[h++] = static_cast<uint8_t>(cfg_.version >> 24);
@@ -868,7 +1035,11 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
         out[h++] = static_cast<uint8_t>(cfg_.local_cid_len);
         util::vesta_memcpy(out + h, cfg_.local_cid, cfg_.local_cid_len);
         h += cfg_.local_cid_len;
-        if (s == Space::Initial) out[h++] = 0;  // \~english no token  \~spanish sin testigo  \~
+        if (s == Space::Initial) {
+            h += encode_varint(out + h, room - h, token_len_);
+            if (token_len_ != 0) util::vesta_memcpy(out + h, token_, token_len_);
+            h += token_len_;
+        }
         length_at = h;
         h += 2;
     } else {

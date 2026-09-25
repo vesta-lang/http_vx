@@ -23,6 +23,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
+#include <openssl/rand.h>
 
 #include <climits>
 
@@ -158,6 +159,18 @@ OpensslCrypto::~OpensslCrypto() {
 
 const char *OpensslCrypto::name() const noexcept {
     return "openssl";
+}
+
+bool OpensslCrypto::random(uint8_t *out, size_t n) noexcept {
+    // \~english RAND_bytes takes an int; ask in pieces that fit.
+    // \~spanish RAND_bytes toma un int; se pide en trozos que quepan.  \~
+    while (n != 0) {
+        const int take = n > 1u << 20 ? 1 << 20 : static_cast<int>(n);
+        if (RAND_bytes(out, take) != 1) return false;
+        out += take;
+        n -= static_cast<size_t>(take);
+    }
+    return true;
 }
 
 bool OpensslCrypto::supports(quic::Aead a) const noexcept {

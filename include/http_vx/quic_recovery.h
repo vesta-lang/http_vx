@@ -275,6 +275,29 @@ public:
      */
     void discard_space(Space s, uint64_t now_us) noexcept;
 
+    /**
+     * @brief
+     * \~english A client accepted a Retry: congestion control and loss recovery start over (6.3).
+     * \~spanish Un cliente acepto un Retry: el control de congestion y la recuperacion empiezan de nuevo (6.3).
+     * \~
+     *
+     * \~english
+     * The Initial packets in flight were answered with a Retry, not received:
+     * each is handed to @p l as lost, so its CRYPTO goes out again, but none
+     * counts as a loss -- the path lost nothing.  Window, threshold, probe
+     * count and timers go back to their starting values.  Packet numbers do
+     * NOT: they keep growing (RFC 9000, 17.2.5.3).
+     * \~spanish
+     * Los paquetes Initial en vuelo recibieron un Retry por respuesta, no se
+     * recibieron: cada uno se le pasa a @p l como perdido, para que su CRYPTO
+     * salga otra vez, pero ninguno cuenta como perdida -- el camino no perdio
+     * nada.  Ventana, umbral, cuenta de sondeos y temporizadores vuelven a sus
+     * valores de partida.  Los numeros de paquete NO: siguen creciendo
+     * (RFC 9000, 17.2.5.3).
+     * \~
+     */
+    void on_retry(uint64_t now_us, RecoveryListener &l) noexcept;
+
     /* \~english
      * What the connection tells recovery as the handshake advances.  Each
      * re-arms the timer, because each changes which timer applies.
