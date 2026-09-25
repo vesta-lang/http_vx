@@ -27,6 +27,7 @@ http_vx/
   reactor/   la interfaz por finalizacion
   windows/   IOCP
   linux/     io_uring y epoll
+  providers/ criptografia de otros, detras de la interfaz de http_vx
   tests/     sobre core/ y proto/
   fuzz/      el analizador
   bench/     cuanto cuesta, medido aqui
@@ -48,6 +49,11 @@ entregue bytes. Mezclarlos daria un servidor mas corto y una pieza inseparable.
 **`quic/` no esta debajo de `proto/`: es un TRANSPORTE**, al nivel de TCP. Que
 naciera para HTTP/3 no lo hace parte de HTTP, y meterlo ahi impediria usarlo
 para otra cosa -- que es lo contrario de para lo que existe este proyecto.
+
+**`providers/` no lo enlaza nadie por defecto.** `http_vx` no trae
+criptografia, ni propia ni ajena: define lo que necesita y el proveedor lo pone
+quien construye el servidor. Lo que hay en `providers/` son adaptadores --
+cada uno en su propia biblioteca, que se enlaza o no --, no una dependencia.
 
 **Una version del protocolo es un codec, no un servidor.** La semantica -- que
 significa una peticion: metodo, cabeceras, estado, cuerpo -- es la misma en las

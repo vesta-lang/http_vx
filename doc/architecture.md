@@ -345,7 +345,29 @@ Con la segunda forma el camino de lectura y escritura **no cambia**: sin copia
 extra y sin buffer intermedio, y R14 sigue valiendo.  Esa ventaja se pierde
 entera si la interfaz obliga a pasar por una transformacion que ahi no existe.
 
-### 9.2 Sin proveedor no se degrada
+### 9.2 En QUIC, el corte va en las PRIMITIVAS
+
+La tercera forma deja la proteccion de paquetes en manos de quien llama, y eso
+obliga a decidir que parte de ella es de `http_vx` y cual del proveedor.  La
+linea va en las primitivas: **el proveedor sabe hacer HKDF, un AEAD y un cifrado
+de bloque, y nada de QUIC** (`quic_crypto.h`).  Todo lo que es de QUIC -- las
+etiquetas, las sales de cada version, el nonce, que bits del primer byte se
+enmascaran, de donde sale la muestra, en que orden se desprotege -- vive en
+`quic/` (`quic_protection.h`).
+
+Mas abajo seria escribir criptografia aqui, que esta R22 prohibe.  Mas arriba --
+un proveedor que "protege un paquete QUIC" -- seria que cada proveedor
+reimplementara el RFC 9001 con su propia ocasion de equivocarse, y los vectores
+del RFC probarian al proveedor y no a este proyecto.  Con la linea aqui, la
+logica de QUIC se comprueba UNA vez para todos: contra los paquetes enteros de
+los apendices del RFC 9001 y del RFC 9369 cuando hay un proveedor con el que
+sellarlos, y con un proveedor de mentira que no cifra nada cuando no lo hay.
+
+Las claves se PREPARAN una vez y el proveedor devuelve un estado opaco: poner
+una clave AES la expande en una agenda, y hacerlo en cada paquete costaria mas
+que el paquete.
+
+### 9.3 Sin proveedor no se degrada
 
 > **R24. Si se pide transporte cifrado y no hay proveedor, DEBE fallar
 > DICIENDOLO -- al construir o al arrancar --.  NO DEBE caer a texto claro.**

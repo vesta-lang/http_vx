@@ -166,6 +166,7 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 # ---------------------------------------------------------------------------
 add_library(http_vx_quic STATIC
         quic/packet.cpp
+        quic/protection.cpp
         quic/varint.cpp
 )
 target_include_directories(http_vx_quic
@@ -173,6 +174,50 @@ target_include_directories(http_vx_quic
         PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
 target_compile_options(http_vx_quic PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_quic PUBLIC vesta_alloc)
+
+# ---------------------------------------------------------------------------
+# Un proveedor criptografico para QUIC, sobre la libcrypto de OpenSSL.
+#
+# APARTE y OPCIONAL, por la R22: `http_vx_quic` no enlaza ninguna biblioteca de
+# criptografia -- define la interfaz (`quic_crypto.h`) y la logica del RFC 9001
+# encima --, y el proveedor lo elige quien construye el servidor.  Este es UNO
+# de ellos, no el proveedor.
+#
+# Si no se encuentra OpenSSL no se construye, y se DICE: sin proveedor, la
+# prueba contra los paquetes enteros de los RFC no se puede ejecutar, y eso no
+# puede pasar por una suite en verde sin mas.  La logica de QUIC se sigue
+# comprobando igual, con `test_quic_protection`, que no necesita proveedor.
+#
+# Con un OpenSSL estatico: -DOPENSSL_ROOT_DIR=<prefijo> -DOPENSSL_USE_STATIC_LIBS=ON
+# ---------------------------------------------------------------------------
+option(HTTP_VX_OPENSSL_PROVIDER "Construir el proveedor QUIC sobre OpenSSL" ON)
+
+if (HTTP_VX_OPENSSL_PROVIDER)
+    find_package(OpenSSL 3.0 COMPONENTS Crypto)
+endif ()
+
+if (HTTP_VX_OPENSSL_PROVIDER AND OpenSSL_FOUND)
+    add_library(http_vx_crypto_openssl STATIC
+            providers/openssl/openssl_crypto.cpp
+    )
+    target_include_directories(http_vx_crypto_openssl
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/openssl)
+    target_compile_options(http_vx_crypto_openssl PRIVATE -Wall -Wextra -pedantic-errors)
+    target_link_libraries(http_vx_crypto_openssl
+            PUBLIC http_vx_quic
+            PRIVATE OpenSSL::Crypto)
+
+    # Una libcrypto ESTATICA en Windows trae lo suyo: sockets, el almacen de
+    # certificados y el generador de numeros aleatorios del sistema.
+    if (WIN32)
+        target_link_libraries(http_vx_crypto_openssl PRIVATE ws2_32 crypt32 bcrypt)
+    endif ()
+    message(STATUS "[http_vx] QUIC provider: openssl ${OPENSSL_VERSION}")
+elseif (HTTP_VX_OPENSSL_PROVIDER)
+    message(WARNING "[http_vx] OpenSSL 3 was not found: no QUIC crypto provider is "
+                    "built, and the RFC 9001 / RFC 9369 packet vectors are NOT checked. "
+                    "Point -DOPENSSL_ROOT_DIR at one to check them.")
+endif ()
 
 # ---------------------------------------------------------------------------
 # Un servidor que se EJECUTA, y sin red por ningun sitio: lee una peticion de su
@@ -306,7 +351,15 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_writer tests/test_h2_writer.cpp)
     http_vx_add_test(test_http2_service tests/test_http2_service.cpp)
     http_vx_add_test(test_quic_packet tests/test_quic_packet.cpp)
+    http_vx_add_test(test_quic_protection tests/test_quic_protection.cpp)
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
+
+    # Contra los paquetes enteros de los RFC: solo si hay un proveedor con el
+    # que sellarlos.  Si no lo hay ya se dijo arriba, al buscarlo.
+    if (TARGET http_vx_crypto_openssl)
+        http_vx_add_test(test_quic_vectors tests/test_quic_vectors.cpp)
+        target_link_libraries(test_quic_vectors PRIVATE http_vx_crypto_openssl)
+    endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
