@@ -107,6 +107,7 @@ public:
     uint8_t expected_sample[kSampleSize] = {};
 
     const char *name() const noexcept override { return "fake"; }
+    bool supports(Aead) const noexcept override { return true; }
 
     bool extract(Hash, const uint8_t *, size_t, const uint8_t *, size_t,
                  uint8_t *) noexcept override {

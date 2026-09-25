@@ -160,6 +160,12 @@ const char *OpensslCrypto::name() const noexcept {
     return "openssl";
 }
 
+bool OpensslCrypto::supports(quic::Aead a) const noexcept {
+    // \~english libcrypto has all three, AEADs and header protection alike.
+    // \~spanish libcrypto tiene los tres, AEAD y proteccion de cabecera por igual.  \~
+    return aead_cipher(a) != nullptr;
+}
+
 bool OpensslCrypto::extract(quic::Hash h, const uint8_t *salt,
                             size_t salt_len, const uint8_t *ikm,
                             size_t ikm_len, uint8_t *prk) noexcept {

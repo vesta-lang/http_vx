@@ -72,6 +72,7 @@ public:
     bool ready() const noexcept { return kdf_ != nullptr; }
 
     const char *name() const noexcept override;
+    bool supports(quic::Aead a) const noexcept override;
     bool extract(quic::Hash h, const uint8_t *salt, size_t salt_len,
                  const uint8_t *ikm, size_t ikm_len,
                  uint8_t *prk) noexcept override;

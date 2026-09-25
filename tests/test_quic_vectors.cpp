@@ -26,7 +26,9 @@
  * inferred from the first.
  *
  * This test needs a provider, and is only built when one is: `test_quic_protection`
- * is what checks the QUIC logic on a machine without one.
+ * is what checks the QUIC logic on a machine without one.  When there are
+ * several, the SAME cases run against each of them -- a provider that only
+ * some cases were written for would be the one whose bugs nobody meets.
  *
  * \~spanish
  * El apendice A del RFC 9001 (version 1) y del RFC 9369 (version 2) imprimen
@@ -43,14 +45,21 @@
  *
  * Esta prueba necesita un proveedor, y solo se construye cuando lo hay:
  * `test_quic_protection` es lo que comprueba la logica de QUIC en una maquina
- * sin el.
+ * sin el.  Cuando hay varios, los MISMOS casos corren contra cada uno -- un
+ * proveedor para el que solo se escribieran algunos casos seria aquel cuyos
+ * fallos no encuentra nadie.
  * \~
  */
 
 #include "http_vx/quic_packet.h"
 #include "http_vx/quic_protection.h"
 
+#if HTTP_VX_HAVE_OPENSSL
 #include "openssl_crypto.h"
+#endif
+#if HTTP_VX_HAVE_CNG
+#include "cng_crypto.h"
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -61,9 +70,9 @@ using namespace http_vx::quic;
 
 int failures = 0;
 
-/// \~english Which version is being checked, for the messages.
-/// \~spanish Que version se esta comprobando, para los mensajes.  \~
-const char *current = "";
+/// \~english Which version and provider are being checked, for the messages.
+/// \~spanish Que version y que proveedor se estan comprobando, para los mensajes.  \~
+char current[64] = "";
 
 void check(bool ok, const char *what) {
     if (ok) return;
@@ -406,6 +415,30 @@ void test_retry(Crypto &c, const Vectors &v) {
 /// \~english A.5: ChaCha20-Poly1305 and a short header.
 /// \~spanish A.5: ChaCha20-Poly1305 y una cabecera corta.  \~
 void test_chacha(Crypto &c, const Vectors &v) {
+    /* \~english
+     * A provider may not offer ChaCha20.  Then the case is skipped SAYING so,
+     * and what is checked instead is that it refuses the suite outright -- a
+     * provider that said no and still handed out a key would be worse than
+     * one that said yes.
+     * \~spanish
+     * Un proveedor puede no ofrecer ChaCha20.  Entonces el caso se salta
+     * DICIENDOLO, y lo que se comprueba en su lugar es que rechaza el algoritmo
+     * sin mas -- un proveedor que dijera que no y aun asi diera una clave seria
+     * peor que uno que dijera que si.
+     * \~ */
+    if (!c.supports(Aead::ChaCha20Poly1305)) {
+        std::printf("SKIPPED [%s]: ChaCha20-Poly1305, the provider does not offer it\n",
+                    current);
+        const uint8_t key[kMaxKey] = {};
+        void *a = c.prepare_aead(Aead::ChaCha20Poly1305, key);
+        void *h = c.prepare_hp(Aead::ChaCha20Poly1305, key);
+        check(a == nullptr && h == nullptr,
+              "a suite the provider does not offer was prepared anyway");
+        c.forget(a);
+        c.forget(h);
+        return;
+    }
+
     uint8_t secret[32];
     from_hex(kChaChaSecret, secret, sizeof secret);
 
@@ -442,7 +475,11 @@ void test_chacha(Crypto &c, const Vectors &v) {
 }
 
 void run(Crypto &c, const Vectors &v) {
-    current = v.name;
+    std::snprintf(current, sizeof current, "%s/%s", v.name, c.name());
+
+    // \~english Initial packets are AES-128-GCM always: no provider may lack it.
+    // \~spanish Los paquetes Initial son siempre AES-128-GCM: ningun proveedor puede no tenerlo.  \~
+    check(c.supports(Aead::Aes128Gcm), "the provider cannot do the Initial suite");
     test_keys(c, v);
     check_packet(c, v, false, v.client_header, kClientFrame, 1162, v.client_packet, 2,
                  "client Initial");
@@ -452,22 +489,167 @@ void run(Crypto &c, const Vectors &v) {
     test_chacha(c, v);
 }
 
+/**
+ * @brief
+ * \~english The suite the RFC appendices never touch: AES-256-GCM with SHA-384.
+ * \~spanish El algoritmo que no tocan nunca los apendices del RFC: AES-256-GCM con SHA-384.
+ * \~
+ *
+ * \~english
+ * Initial packets are always AES-128 and SHA-256, and the ChaCha20 example
+ * uses SHA-256 too, so nothing above would notice a provider that got
+ * SHA-384 or 256-bit AES wrong -- and TLS_AES_256_GCM_SHA384 is a suite a
+ * handshake may pick for everything after the Initial.  So the three pieces
+ * it uses are checked against vectors from outside QUIC:
+ *
+ *   - HKDF-Extract IS one HMAC, so RFC 4231's HMAC-SHA-384 case 1 is an
+ *     Extract with the key as salt; and each Expand block is an HMAC over
+ *     the previous block, the info and a counter, which pins Expand to that
+ *     Extract.
+ *   - AES-256-GCM: test case 16 of the GCM specification.
+ *   - AES-256 on one block, for header protection: FIPS-197, appendix C.3.
+ * \~spanish
+ * Los paquetes Initial son siempre AES-128 y SHA-256, y el ejemplo de ChaCha20
+ * tambien usa SHA-256, asi que nada de lo de arriba notaria un proveedor que
+ * hiciera mal SHA-384 o AES de 256 bits -- y TLS_AES_256_GCM_SHA384 es un
+ * algoritmo que un handshake puede elegir para todo lo que va tras el Initial.
+ * Asi que las tres piezas que usa se comprueban con vectores de fuera de QUIC:
+ *
+ *   - HKDF-Extract ES un HMAC, asi que el caso 1 de HMAC-SHA-384 del RFC 4231
+ *     es un Extract con la clave como sal; y cada bloque de Expand es un HMAC
+ *     sobre el bloque anterior, la info y un contador, lo que ata Expand a ese
+ *     Extract.
+ *   - AES-256-GCM: el caso de prueba 16 de la especificacion de GCM.
+ *   - AES-256 sobre un bloque, para la proteccion de cabecera: FIPS-197,
+ *     apendice C.3.
+ * \~
+ */
+void test_aes256_sha384(Crypto &c) {
+    std::snprintf(current, sizeof current, "aes256-sha384/%s", c.name());
+
+    if (!c.supports(Aead::Aes256Gcm)) {
+        std::printf("SKIPPED [%s]: the provider does not offer AES-256-GCM\n", current);
+        return;
+    }
+
+    uint8_t key[20];
+    std::memset(key, 0x0b, sizeof key);
+    const uint8_t hi[] = {'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e'};
+    uint8_t prk[48];
+    check(c.extract(Hash::Sha384, key, sizeof key, hi, sizeof hi, prk) &&
+              same_as(prk, 48,
+                      "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c"
+                      "faea9ea9076ede7f4af152e8b2fa9cb6"),
+          "SHA-384 Extract is not RFC 4231's HMAC");
+
+    // \~english Two blocks of Expand, each rebuilt as the HMAC it is by definition.
+    // \~spanish Dos bloques de Expand, cada uno rehecho como el HMAC que es por definicion.  \~
+    const uint8_t info[] = {'q', 'u', 'i', 'c'};
+    uint8_t okm[96];
+    check(c.expand(Hash::Sha384, prk, 48, info, sizeof info, okm, sizeof okm),
+          "SHA-384 Expand could not run");
+    uint8_t msg[48 + sizeof info + 1];
+    uint8_t t[48];
+    std::memcpy(msg, info, sizeof info);
+    msg[sizeof info] = 1;
+    check(c.extract(Hash::Sha384, prk, 48, msg, sizeof info + 1, t) &&
+              std::memcmp(t, okm, 48) == 0,
+          "the first block of SHA-384 Expand is not HMAC(PRK, info | 1)");
+    std::memcpy(msg, t, 48);
+    std::memcpy(msg + 48, info, sizeof info);
+    msg[48 + sizeof info] = 2;
+    check(c.extract(Hash::Sha384, prk, 48, msg, sizeof msg, t) &&
+              std::memcmp(t, okm + 48, 48) == 0,
+          "the second block of SHA-384 Expand is not HMAC(PRK, T1 | info | 2)");
+
+    uint8_t k[32];
+    uint8_t nonce[12];
+    uint8_t ad[20];
+    uint8_t buf[80];
+    from_hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", k, sizeof k);
+    from_hex("cafebabefacedbaddecaf888", nonce, sizeof nonce);
+    from_hex("feedfacedeadbeeffeedfacedeadbeefabaddad2", ad, sizeof ad);
+    const size_t n = from_hex(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        buf, sizeof buf);
+    const char *sealed =
+        "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa"
+        "8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662"
+        "76fc6ece0f4e1768cddf8853bb2d551b";
+
+    void *a = c.prepare_aead(Aead::Aes256Gcm, k);
+    check(a != nullptr, "AES-256-GCM could not be prepared");
+    if (a != nullptr) {
+        check(c.seal(a, nonce, ad, sizeof ad, buf, n, buf) &&
+                  same_as(buf, n + kTagSize, sealed),
+              "AES-256-GCM does not seal GCM test case 16");
+        check(c.open(a, nonce, ad, sizeof ad, buf, n + kTagSize, buf) == OpenResult::Ok,
+              "AES-256-GCM does not open what it sealed");
+        c.forget(a);
+    }
+
+    uint8_t hp[32];
+    uint8_t block[16];
+    uint8_t m[kMaskSize];
+    from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", hp, sizeof hp);
+    from_hex("00112233445566778899aabbccddeeff", block, sizeof block);
+    void *h = c.prepare_hp(Aead::Aes256Gcm, hp);
+    check(h != nullptr && c.mask(h, block, m) && same_as(m, kMaskSize, "8ea2b7ca51"),
+          "the AES-256 header mask is not FIPS-197's block");
+    c.forget(h);
+}
+
+/// \~english Every case against @p c.  \~spanish Todos los casos contra @p c.  \~
+void run_all(Crypto &c) {
+    std::printf("-- %s --\n", c.name());
+    test_aes256_sha384(c);
+    run(c, kVersion1Vectors);
+    run(c, kVersion2Vectors);
+}
+
 } // namespace
 
 int main() {
-    http_vx::OpensslCrypto c;
-    if (!c.ready()) {
-        std::fprintf(stderr, "FAIL: the openssl provider is not ready: no HKDF\n");
+    int providers = 0;
+
+#if HTTP_VX_HAVE_OPENSSL
+    {
+        http_vx::OpensslCrypto c;
+        ++providers;
+        if (c.ready()) {
+            run_all(c);
+        } else {
+            std::fprintf(stderr, "FAIL [openssl]: the provider is not ready: no HKDF\n");
+            ++failures;
+        }
+    }
+#endif
+
+#if HTTP_VX_HAVE_CNG
+    {
+        http_vx::CngCrypto c;
+        ++providers;
+        if (c.ready()) {
+            run_all(c);
+        } else {
+            std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", c.missing());
+            ++failures;
+        }
+    }
+#endif
+
+    // \~english Built with no provider would be a test that checks nothing and passes.
+    // \~spanish Construida sin proveedor seria una prueba que no comprueba nada y pasa.  \~
+    if (providers == 0) {
+        std::fprintf(stderr, "FAIL: built without any provider to check\n");
         return 1;
     }
-
-    run(c, kVersion1Vectors);
-    run(c, kVersion2Vectors);
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);
         return 1;
     }
-    std::printf("quic vectors (%s): OK\n", c.name());
+    std::printf("quic vectors, %d provider(s): OK\n", providers);
     return 0;
 }

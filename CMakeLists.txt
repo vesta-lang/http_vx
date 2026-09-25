@@ -214,9 +214,33 @@ if (HTTP_VX_OPENSSL_PROVIDER AND OpenSSL_FOUND)
     endif ()
     message(STATUS "[http_vx] QUIC provider: openssl ${OPENSSL_VERSION}")
 elseif (HTTP_VX_OPENSSL_PROVIDER)
-    message(WARNING "[http_vx] OpenSSL 3 was not found: no QUIC crypto provider is "
-                    "built, and the RFC 9001 / RFC 9369 packet vectors are NOT checked. "
+    message(WARNING "[http_vx] OpenSSL 3 was not found: the openssl QUIC provider is "
+                    "not built, and the RFC packet vectors are NOT checked against it. "
                     "Point -DOPENSSL_ROOT_DIR at one to check them.")
+endif ()
+
+# ---------------------------------------------------------------------------
+# Y el proveedor del propio SISTEMA en Windows: la CNG (bcrypt.dll).  Es el que
+# la R22 nombra como natural ahi -- nada que distribuir ni que parchear, lo
+# parchea Windows Update -- y por eso se construye siempre que se construye en
+# Windows: no depende de nada que pueda faltar.  Enlazarlo sigue siendo decision
+# de quien construye el servidor.
+#
+# Ofrece AES-GCM y NO ChaCha20: CNG no tiene el flujo ChaCha20 en bruto que pide
+# su proteccion de cabecera, y el proveedor lo dice por `supports` en vez de
+# fallar en el primer paquete.
+# ---------------------------------------------------------------------------
+if (WIN32)
+    add_library(http_vx_crypto_cng STATIC
+            providers/windows/cng_crypto.cpp
+    )
+    target_include_directories(http_vx_crypto_cng
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/windows)
+    target_compile_options(http_vx_crypto_cng PRIVATE -Wall -Wextra -pedantic-errors)
+    target_link_libraries(http_vx_crypto_cng
+            PUBLIC http_vx_quic
+            PRIVATE bcrypt)
+    message(STATUS "[http_vx] QUIC provider: cng (the system's own)")
 endif ()
 
 # ---------------------------------------------------------------------------
@@ -355,10 +379,19 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
 
     # Contra los paquetes enteros de los RFC: solo si hay un proveedor con el
-    # que sellarlos.  Si no lo hay ya se dijo arriba, al buscarlo.
-    if (TARGET http_vx_crypto_openssl)
+    # que sellarlos.  Si no lo hay ya se dijo arriba, al buscarlo.  Con varios,
+    # es UNA prueba que corre los mismos casos contra cada uno (la R8 aplicada
+    # a los proveedores, como `test_socket_backend` a los backends).
+    if (TARGET http_vx_crypto_openssl OR TARGET http_vx_crypto_cng)
         http_vx_add_test(test_quic_vectors tests/test_quic_vectors.cpp)
-        target_link_libraries(test_quic_vectors PRIVATE http_vx_crypto_openssl)
+        if (TARGET http_vx_crypto_openssl)
+            target_link_libraries(test_quic_vectors PRIVATE http_vx_crypto_openssl)
+            target_compile_definitions(test_quic_vectors PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+        endif ()
+        if (TARGET http_vx_crypto_cng)
+            target_link_libraries(test_quic_vectors PRIVATE http_vx_crypto_cng)
+            target_compile_definitions(test_quic_vectors PRIVATE HTTP_VX_HAVE_CNG=1)
+        endif ()
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)

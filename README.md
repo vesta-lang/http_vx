@@ -53,7 +53,9 @@ para otra cosa -- que es lo contrario de para lo que existe este proyecto.
 **`providers/` no lo enlaza nadie por defecto.** `http_vx` no trae
 criptografia, ni propia ni ajena: define lo que necesita y el proveedor lo pone
 quien construye el servidor. Lo que hay en `providers/` son adaptadores --
-cada uno en su propia biblioteca, que se enlaza o no --, no una dependencia.
+cada uno en su propia biblioteca, que se enlaza o no --, no una dependencia:
+uno sobre OpenSSL y otro sobre la CNG del propio Windows, que es el proveedor
+natural ahi porque no hay nada que distribuir ni que parchear.
 
 **Una version del protocolo es un codec, no un servidor.** La semantica -- que
 significa una peticion: metodo, cabeceras, estado, cuerpo -- es la misma en las

@@ -192,6 +192,29 @@ public:
 
     /**
      * @brief
+     * \~english Whether this provider can run @p a -- its AEAD and its header protection.
+     * \~spanish Si este proveedor sabe ejecutar @p a -- su AEAD y su proteccion de cabecera.
+     * \~
+     *
+     * \~english
+     * Not every provider has every suite: the Windows one has no raw ChaCha20,
+     * which ChaCha20's header protection needs.  R23 says the server ASKS
+     * rather than assumes, and this is where: the handshake offers only what
+     * this answers yes to, so a peer can never pick a suite that would fail on
+     * the first packet.
+     * \~spanish
+     * No todos los proveedores tienen todos los algoritmos: el de Windows no
+     * tiene ChaCha20 en bruto, que es lo que necesita la proteccion de cabecera
+     * de ChaCha20.  La R23 dice que el servidor PREGUNTA en vez de suponer, y es
+     * aqui: el handshake ofrece solo aquello a lo que esto dice que si, asi que
+     * el otro extremo nunca puede elegir un algoritmo que fallaria en el primer
+     * paquete.
+     * \~
+     */
+    virtual bool supports(Aead a) const noexcept = 0;
+
+    /**
+     * @brief
      * \~english HKDF-Extract (RFC 5869): writes `hash_size(h)` bytes to @p prk.
      * \~spanish HKDF-Extract (RFC 5869): escribe `hash_size(h)` bytes en @p prk.
      * \~

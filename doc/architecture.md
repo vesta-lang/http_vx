@@ -367,6 +367,15 @@ Las claves se PREPARAN una vez y el proveedor devuelve un estado opaco: poner
 una clave AES la expande en una agenda, y hacerlo en cada paquete costaria mas
 que el paquete.
 
+**No todos los proveedores tienen todos los algoritmos, y eso se PREGUNTA**
+(`supports`).  Hay dos en `providers/`: uno sobre la libcrypto de OpenSSL, con
+los tres, y el del propio sistema en Windows, sobre CNG, que no tiene ChaCha20
+porque CNG no da el flujo ChaCha20 en bruto que pide su proteccion de cabecera.
+El handshake ofrecera solo lo que el proveedor diga que sabe hacer, de modo que
+el otro extremo no pueda elegir un algoritmo que falle en el primer paquete.  Los
+dos pasan los MISMOS casos -- una sola prueba, que corre contra cada proveedor
+que haya --, igual que los backends de E/S con la R8.
+
 ### 9.3 Sin proveedor no se degrada
 
 > **R24. Si se pide transporte cifrado y no hay proveedor, DEBE fallar
