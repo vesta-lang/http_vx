@@ -172,6 +172,7 @@ add_library(http_vx_quic STATIC
         quic/packet.cpp
         quic/protection.cpp
         quic/recovery.cpp
+        quic/reset.cpp
         quic/stream_recv.cpp
         quic/stream_send.cpp
         quic/streams.cpp

@@ -38,12 +38,18 @@
  * kept for late packets; an end that breaks the rules is closed with
  * KEY_UPDATE_ERROR.
  *
+ * **Connection IDs come and go** (5.1): each end hands the other as many as
+ * it takes, each with a stateless reset token from a key, retires what it is
+ * asked to and moves to another ID when the one in use goes.  A datagram that
+ * ends in the token of an ID in use tells this end that the peer lost the
+ * connection (10.3).
+ *
  * This is the core the rest stands on, and it is not the whole of QUIC.  What
- * follows, in this order, each with its own tests: new connection IDs,
- * migration and stateless reset; and the TLS handshake with 0-RTT.  Until
- * the handshake is here, the connection takes secrets through
- * `install_secrets` and learns that the handshake is done through
- * `handshake_confirmed` -- which is exactly what the handshake will call.
+ * follows, in this order, each with its own tests: paths and migration; and
+ * the TLS handshake with 0-RTT.  Until the handshake is here, the connection
+ * takes secrets through `install_secrets` and learns that the handshake is
+ * done through `handshake_confirmed` -- which is exactly what the handshake
+ * will call.
  *
  * \~spanish
  * El objeto que junta las piezas.  Entra un datagrama: sus paquetes pegados se
@@ -71,12 +77,17 @@
  * antemano y las anteriores se guardan para los paquetes tardios; un extremo que
  * rompe las reglas se cierra con KEY_UPDATE_ERROR.
  *
+ * **Los identificadores de conexion van y vienen** (5.1): cada extremo le da al
+ * otro tantos como acepte, cada uno con un testigo de reinicio sin estado sacado
+ * de una clave, retira los que le piden y pasa a otro identificador cuando se va
+ * el que usa.  Un datagrama que acaba en el testigo de un identificador en uso le
+ * dice a este extremo que el otro perdio la conexion (10.3).
+ *
  * Este es el nucleo sobre el que se apoya el resto, y no es todo QUIC.  Lo que
- * sigue, en este orden, cada cosa con sus pruebas: los identificadores de
- * conexion nuevos, la migracion y el reinicio sin estado; y el saludo de TLS con
- * 0-RTT.  Hasta que el saludo este aqui, la conexion recibe los secretos por
- * `install_secrets` y se entera de que el saludo acabo por `handshake_confirmed`
- * -- que es justo lo que llamara el saludo.
+ * sigue, en este orden, cada cosa con sus pruebas: los caminos y la migracion; y
+ * el saludo de TLS con 0-RTT.  Hasta que el saludo este aqui, la conexion recibe
+ * los secretos por `install_secrets` y se entera de que el saludo acabo por
+ * `handshake_confirmed` -- que es justo lo que llamara el saludo.
  * \~
  */
 #ifndef HTTP_VX_QUIC_CONNECTION_H
@@ -88,6 +99,7 @@
 #include "http_vx/quic_packet.h"
 #include "http_vx/quic_protection.h"
 #include "http_vx/quic_recovery.h"
+#include "http_vx/quic_reset.h"
 #include "http_vx/quic_stream_recv.h"
 #include "http_vx/quic_stream_send.h"
 #include "http_vx/quic_streams.h"
@@ -174,6 +186,52 @@ struct ConnectionConfig {
      */
     uint64_t confidentiality_limit = 0;
     uint64_t integrity_limit = 0;
+
+    /**
+     * \~english
+     * The key this end's stateless reset tokens come from (RFC 9000, 10.3.2).
+     * A server gives its connections the same key as its acceptor, so that
+     * the token a connection hands out is the one the acceptor answers with
+     * once the connection is gone.
+     * \~spanish
+     * La clave de la que salen los testigos de reinicio sin estado de este
+     * extremo (RFC 9000, 10.3.2).  Un servidor da a sus conexiones la misma clave
+     * que a su acceptor, para que el testigo que entrega una conexion sea con el
+     * que contesta el acceptor cuando ya no exista.
+     * \~
+     */
+    uint8_t reset_key[kResetKeySize] = {};
+
+    /// \~english This end's active_connection_id_limit: how many of the peer's IDs it keeps (2 to 8).
+    /// \~spanish El active_connection_id_limit de este extremo: cuantos identificadores del otro guarda (2 a 8).  \~
+    size_t active_cid_limit = 4;
+    /// \~english The peer's active_connection_id_limit: how many IDs this end may have handed out at once.
+    /// \~spanish El active_connection_id_limit del otro: cuantos identificadores puede tener repartidos a la vez este extremo.  \~
+    size_t peer_active_cid_limit = 2;
+
+    /// \~english The reset token of the peer's first ID, if known (a server's, from its transport parameters).
+    /// \~spanish El testigo de reinicio del primer identificador del otro, si se sabe (el de un servidor, de sus parametros de transporte).  \~
+    uint8_t peer_reset_token[kResetTokenSize] = {};
+    bool peer_reset_token_known = false;
+};
+
+/**
+ * @brief
+ * \~english What happened to connection IDs, counted.
+ * \~spanish Lo que les paso a los identificadores de conexion, contado.
+ * \~
+ */
+struct CidCounts {
+    /// \~english IDs this end handed out, and how many of them the peer retired.
+    /// \~spanish Identificadores que repartio este extremo, y cuantos de ellos retiro el otro.  \~
+    uint64_t issued = 0;
+    uint64_t retired_by_peer = 0;
+    /// \~english IDs the peer handed out that were kept, and how many this end retired.
+    /// \~spanish Identificadores que repartio el otro y se guardaron, y cuantos retiro este extremo.  \~
+    uint64_t received = 0;
+    uint64_t retired = 0;
+    /// \~english Times the destination ID in use changed.  \~spanish Veces que cambio el identificador de destino en uso.  \~
+    uint64_t switched = 0;
 };
 
 /**
@@ -194,6 +252,9 @@ enum class KeyUpdate : uint8_t {
     /// \~english The previous keys are still kept for late packets (6.5).
     /// \~spanish Las claves anteriores siguen guardadas para paquetes tardios (6.5).  \~
     OldKeysKept,
+    /// \~english Less than three PTO since the ACK that confirmed the previous update (6.5).
+    /// \~spanish Menos de tres PTO desde el ACK que confirmo la actualizacion anterior (6.5).  \~
+    TooSoon,
     /// \~english The provider failed: said, not guessed around.  \~spanish Fallo el proveedor: dicho, no rodeado.  \~
     Failed,
 };
@@ -281,6 +342,8 @@ struct SendCounts {
     uint64_t path_response = 0;
     uint64_t ping = 0;
     uint64_t connection_close = 0;
+    uint64_t new_connection_id = 0;
+    uint64_t retire_connection_id = 0;
 };
 
 /**
@@ -390,6 +453,49 @@ public:
      * \~
      */
     KeyUpdate update_keys(uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english Hands out fresh connection IDs and asks the peer to retire all the earlier ones (19.15).
+     * \~spanish Reparte identificadores de conexion nuevos y pide al otro que retire todos los anteriores (19.15).
+     * \~
+     *
+     * \~english
+     * The old ones keep working until the peer retires them, so nothing is
+     * lost in between; what the peer sees is one Retire Prior To.  Refused
+     * (false) while the peer has not yet retired everything the previous one
+     * asked for (5.1.2).
+     * \~spanish
+     * Los viejos siguen valiendo hasta que el otro los retira, asi que no se
+     * pierde nada por el camino; lo que ve el otro es un Retire Prior To.  Se
+     * niega (falso) mientras el otro no haya retirado todo lo que pidio el
+     * anterior (5.1.2).
+     * \~
+     */
+    bool renew_connection_ids() noexcept;
+
+    /// \~english Whether @p cid is one of this end's active IDs: what a router needs to know.
+    /// \~spanish Si @p cid es uno de los identificadores activos de este extremo: lo que necesita saber un enrutador.  \~
+    bool owns_cid(const uint8_t *cid, size_t len) const noexcept;
+
+    /**
+     * @brief
+     * \~english The @p i-th of this end's active IDs, with its sequence number and reset token.
+     * \~spanish El @p i-esimo de los identificadores activos de este extremo, con su numero de secuencia y su testigo.
+     * \~
+     *
+     * \~english What a router walks to send each ID's packets here.  False past the last one.
+     * \~spanish Lo que recorre un enrutador para mandar aqui los paquetes de cada identificador.  Falso pasado el ultimo.  \~
+     */
+    bool local_cid(size_t i, uint64_t &seq, const uint8_t *&cid, const uint8_t *&token) const noexcept;
+
+    /// \~english The sequence number of the destination ID in use.  \~spanish El numero de secuencia del identificador de destino en uso.  \~
+    uint64_t peer_cid_sequence() const noexcept { return peer_seq_in_use_; }
+    const CidCounts &cids() const noexcept { return cid_counts_; }
+
+    /// \~english The peer said, statelessly, that it has no such connection (10.3.1).
+    /// \~spanish El otro dijo, sin estado, que no tiene esta conexion (10.3.1).  \~
+    bool closed_by_reset() const noexcept { return closed_by_reset_; }
 
     /// \~english The key phase this end seals with.  \~spanish La fase de clave con la que sella este extremo.  \~
     bool key_phase() const noexcept { return one_rtt_.write_phase; }
@@ -608,6 +714,9 @@ private:
         /// \~english The first packet number sealed with the current write keys (6.5).
         /// \~spanish El primer numero de paquete sellado con las claves de escritura actuales (6.5).  \~
         uint64_t first_sent_pn = kNever;
+        /// \~english When a packet of the current write phase was first acknowledged (6.5).
+        /// \~spanish Cuando se confirmo por primera vez un paquete de la fase de escritura actual (6.5).  \~
+        uint64_t phase_acked_at = kNever;
         uint64_t sealed = 0;
         /**
          * \~english
@@ -627,6 +736,83 @@ private:
     };
     OneRtt one_rtt_;
     KeyUpdateCounts key_counts_;
+
+    /**
+     * \~english
+     * Connection IDs (RFC 9000, 5.1).  This end's: the ones handed out, each
+     * with its reset token, owed until a NEW_CONNECTION_ID carrying it is
+     * acknowledged.  The peer's: the ones received, one of them in use as
+     * destination; retiring one owes a RETIRE_CONNECTION_ID.  Both tables are
+     * fixed: the peer cannot make them grow.
+     * \~spanish
+     * Identificadores de conexion (RFC 9000, 5.1).  Los de este extremo: los
+     * repartidos, cada uno con su testigo de reinicio, debidos hasta que se
+     * confirma un NEW_CONNECTION_ID que lo lleve.  Los del otro: los recibidos,
+     * uno de ellos en uso como destino; retirar uno debe un
+     * RETIRE_CONNECTION_ID.  Las dos tablas son fijas: el otro no puede hacerlas
+     * crecer.
+     * \~
+     */
+    static constexpr size_t kMaxCids = 8;
+    struct LocalCid {
+        uint64_t seq = 0;
+        uint8_t cid[kMaxConnectionId] = {};
+        uint8_t token[kResetTokenSize] = {};
+        bool active = false;
+        bool owed = false;
+    };
+    struct PeerCid {
+        uint64_t seq = 0;
+        uint8_t cid[kMaxConnectionId] = {};
+        uint8_t len = 0;
+        uint8_t token[kResetTokenSize] = {};
+        bool active = false;
+        bool has_token = false;
+        /// \~english Packets were sent to it: only then may its token end the connection (10.3.1).
+        /// \~spanish Se mandaron paquetes a el: solo entonces puede su testigo acabar la conexion (10.3.1).  \~
+        bool used = false;
+    };
+    LocalCid local_cids_[kMaxCids];
+    uint64_t next_local_seq_ = 1;
+    uint64_t local_retire_prior_to_ = 0;
+    PeerCid peer_cids_[kMaxCids];
+    uint64_t peer_retire_prior_to_ = 0;
+    uint64_t peer_seq_in_use_ = 0;
+    /**
+     * \~english
+     * RETIRE_CONNECTION_ID frames owed: room for twice the most IDs this end
+     * keeps, as 5.1.2 asks.  An ID is never forgotten without retiring it;
+     * past this room the connection closes instead.
+     * \~spanish
+     * Tramas RETIRE_CONNECTION_ID que se deben: sitio para el doble de los
+     * identificadores que guarda como mucho este extremo, como pide 5.1.2.  Un
+     * identificador nunca se olvida sin retirarlo; pasado este sitio, la
+     * conexion se cierra en su lugar.
+     * \~
+     */
+    uint64_t retire_owed_[2 * kMaxCids] = {};
+    size_t retire_owed_count_ = 0;
+    /// \~english Owed plus sent and not yet acknowledged: what the room is measured against.
+    /// \~spanish Debidas mas mandadas y aun sin confirmar: contra lo que se mide el sitio.  \~
+    size_t retire_outstanding_ = 0;
+    /// \~english The highest sequence number this end has sent (19.16).  \~spanish El numero de secuencia mas alto que ha mandado este extremo (19.16).  \~
+    uint64_t max_sent_local_seq_ = 0;
+    /// \~english The destination ID of the packet being processed: RETIRE_CONNECTION_ID may not name it.
+    /// \~spanish El identificador de destino del paquete que se procesa: RETIRE_CONNECTION_ID no puede nombrarlo.  \~
+    const uint8_t *packet_dcid_ = nullptr;
+    size_t packet_dcid_len_ = 0;
+    bool closed_by_reset_ = false;
+    CidCounts cid_counts_;
+
+    void top_up_cids() noexcept;
+    PeerCid *peer_cid_by_seq(uint64_t seq) noexcept;
+    bool owe_retire(uint64_t seq) noexcept;
+    void requeue_retire(uint64_t seq) noexcept;
+    bool use_peer_cid(PeerCid &c) noexcept;
+    void learn_peer_cid(const uint8_t *cid, size_t len) noexcept;
+    bool on_new_connection_id(const Frame &f, const uint8_t *payload, uint64_t now_us) noexcept;
+    bool on_retire_connection_id(const Frame &f, uint64_t now_us) noexcept;
+    bool check_stateless_reset(const uint8_t *tail) const noexcept;
     AckTracker acks_[kSpaces];
     uint64_t next_pn_[kSpaces] = {0, 0, 0};
     Recovery recovery_;

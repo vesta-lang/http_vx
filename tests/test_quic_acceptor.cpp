@@ -156,12 +156,22 @@ void test_refusals(Crypto &c) {
     check(ad.verdict == Admit::Drop && ad.reason == AdmitReason::NotInitial,
           "a Handshake packet with no connection is dropped");
 
+    // \~english With resets switched off, a short header nobody owns is just dropped.
+    // \~spanish Con los reinicios apagados, una cabecera corta que no es de nadie simplemente se tira.  \~
+    AcceptorConfig no_reset = r.cfg;
+    no_reset.send_stateless_reset = false;
+    Acceptor quiet(c, no_reset);
     uint8_t shorth[64];
     shorth[0] = 0x41;
     for (size_t i = 1; i < sizeof shorth; ++i) shorth[i] = static_cast<uint8_t>(i);
-    ad = a.on_datagram(shorth, sizeof shorth, kAddrA, 6, 0, r.reply, sizeof r.reply);
+    ad = quiet.on_datagram(shorth, sizeof shorth, kAddrA, 6, 0, r.reply, sizeof r.reply);
     check(ad.verdict == Admit::Drop && ad.reason == AdmitReason::UnknownConnection,
-          "a short header for no connection is dropped");
+          "a short header for no connection was not dropped");
+    // \~english Too short to be a packet at all: 1 + 8 + 4 + 16 bytes are needed to sample it.
+    // \~spanish Demasiado corto para ser siquiera un paquete: hacen falta 1 + 8 + 4 + 16 bytes para muestrearlo.  \~
+    ad = a.on_datagram(shorth, 28, kAddrA, 6, 0, r.reply, sizeof r.reply);
+    check(ad.verdict == Admit::Drop && ad.reason == AdmitReason::BadHeader,
+          "a short header too short to be a packet was answered");
 
     const uint8_t vn[] = {0x80, 0, 0, 0, 0, 1, 0xaa, 1, 0xbb, 0, 0, 0, 1};
     ad = a.on_datagram(vn, sizeof vn, kAddrA, 6, 0, r.reply, sizeof r.reply);
@@ -175,9 +185,9 @@ void test_refusals(Crypto &c) {
 
     check(a.count(AdmitReason::TooSmall) == 1 && a.count(AdmitReason::ShortDestination) == 1 &&
               a.count(AdmitReason::NotInitial) == 1 &&
-              a.count(AdmitReason::UnknownConnection) == 1 &&
+              quiet.count(AdmitReason::UnknownConnection) == 1 &&
               a.count(AdmitReason::VersionNegotiationReceived) == 1 &&
-              a.count(AdmitReason::BadHeader) == 1,
+              a.count(AdmitReason::BadHeader) == 2,
           "every drop is counted under its reason");
 }
 
@@ -430,6 +440,81 @@ void test_token_without_requiring(Crypto &c) {
           "a token is honoured even when Retry is not required");
 }
 
+/// \~english A short header nobody owns gets a stateless reset the peer can recognise.
+/// \~spanish Una cabecera corta que no es de nadie recibe un reinicio sin estado que el otro puede reconocer.  \~
+void test_stateless_reset(Crypto &c) {
+    Rig r(c);
+    for (size_t i = 0; i < kResetKeySize; ++i) r.cfg.reset_key[i] = static_cast<uint8_t>(0x90 + i);
+    Acceptor a(c, r.cfg);
+
+    // \~english The token is a function of key and ID: the same twice, different for either change.
+    // \~spanish El testigo es funcion de clave e identificador: el mismo dos veces, distinto si cambia cualquiera.  \~
+    uint8_t t1[kResetTokenSize], t2[kResetTokenSize], t3[kResetTokenSize], t4[kResetTokenSize];
+    uint8_t other_key[kResetKeySize];
+    std::memcpy(other_key, r.cfg.reset_key, kResetKeySize);
+    other_key[5] ^= 1;
+    uint8_t other_cid[8];
+    std::memcpy(other_cid, kDcid, 8);
+    other_cid[7] ^= 1;
+    check(reset_token(c, r.cfg.reset_key, kDcid, 8, t1) && reset_token(c, r.cfg.reset_key, kDcid, 8, t2) &&
+              reset_token(c, other_key, kDcid, 8, t3) && reset_token(c, r.cfg.reset_key, other_cid, 8, t4),
+          "reset tokens could not be computed");
+    check(std::memcmp(t1, t2, kResetTokenSize) == 0, "the same key and ID gave two tokens");
+    check(std::memcmp(t1, t3, kResetTokenSize) != 0, "another key gave the same token");
+    check(std::memcmp(t1, t4, kResetTokenSize) != 0, "another ID gave the same token");
+
+    // \~english One byte shorter than a small trigger (29 is the smallest short packet with an 8-byte ID);
+    // \~english capped for a large one; always ending in the token.
+    // \~spanish Un byte mas corto que un paquete pequeno (29 es el paquete corto mas pequeno con un
+    // \~spanish identificador de 8 bytes); con tope para uno grande; siempre acabado en el testigo.  \~
+    const size_t sizes[3][2] = {{29, 28}, {40, 39}, {1200, 43}};
+    for (const auto &sz : sizes) {
+        uint8_t in[1200];
+        in[0] = 0x43;
+        std::memcpy(in + 1, kDcid, 8);
+        for (size_t i = 9; i < sz[0]; ++i) in[i] = static_cast<uint8_t>(i * 13);
+        const Admission ad = a.on_datagram(in, sz[0], kAddrA, 6, 0, r.reply, sizeof r.reply);
+        check(ad.verdict == Admit::Reply && ad.reason == AdmitReason::SentStatelessReset,
+              "a short header for no connection was not answered with a reset");
+        check(ad.reply_len == sz[1], "the reset does not have the expected size");
+        check(ad.reply_len < sz[0], "the reset is not smaller than what caused it");
+        check((r.reply[0] & 0xc0) == 0x40, "the reset does not look like a short header");
+        check(is_stateless_reset(r.reply, ad.reply_len, t1), "the reset does not end in the ID's token");
+        check(!is_stateless_reset(r.reply, ad.reply_len, t4), "the reset matches another ID's token");
+    }
+
+    // \~english Recognition: the form matters, and so does every token byte.
+    // \~spanish Reconocerlo: la forma importa, y cada byte del testigo tambien.  \~
+    uint8_t pkt[43];
+    check(write_stateless_reset(c, t1, 44, pkt, sizeof pkt) == 43, "a reset could not be written");
+    check(write_stateless_reset(c, t1, kMinStatelessReset, pkt, sizeof pkt) == 0,
+          "a reset was written that could not be smaller than its trigger");
+    check(write_stateless_reset(c, t1, 44, pkt, 20) == 0, "a reset was written past its room");
+    check(write_stateless_reset(c, t1, 44, pkt, sizeof pkt) == 43, "a reset could not be written");
+    check(is_stateless_reset(pkt, 43, t1), "a reset was not recognised");
+    check(!is_stateless_reset(pkt, kMinStatelessReset - 1, t1), "a datagram under 21 bytes was taken for a reset");
+    for (size_t i = 0; i < kResetTokenSize; ++i) {
+        uint8_t bad[43];
+        std::memcpy(bad, pkt, 43);
+        bad[43 - kResetTokenSize + i] ^= 0x10;
+        check(!is_stateless_reset(bad, 43, t1), "a reset with one token byte changed was recognised");
+    }
+    // \~english Sent as a short header, but recognised in any form: other versions may use long ones (10.3).
+    // \~spanish Se manda como cabecera corta, pero se reconoce en cualquier forma: otras versiones pueden usar la larga (10.3).  \~
+    pkt[0] |= 0x80;
+    check(is_stateless_reset(pkt, 43, t1), "a long header ending in the token was not taken for a reset");
+
+    // \~english Switched off, the acceptor answers nothing.
+    // \~spanish Apagado, el acceptor no contesta nada.  \~
+    AcceptorConfig off = r.cfg;
+    off.send_stateless_reset = false;
+    Acceptor quiet(c, off);
+    uint8_t in[64] = {0x41};
+    const Admission ad = quiet.on_datagram(in, sizeof in, kAddrA, 6, 0, r.reply, sizeof r.reply);
+    check(ad.verdict == Admit::Drop && ad.reason == AdmitReason::UnknownConnection,
+          "a reset was sent with resets switched off");
+}
+
 void test_broken_provider() {
     test_support::FakeCrypto c;
     Rig r(c);
@@ -477,6 +562,7 @@ void run_all(Crypto &c) {
     test_retry(c, kVersion1);
     test_retry(c, kVersion2);
     test_token_without_requiring(c);
+    test_stateless_reset(c);
 }
 
 } // namespace

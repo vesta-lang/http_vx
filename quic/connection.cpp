@@ -38,6 +38,8 @@ enum : uint8_t {
     kRecMaxStreams,
     kRecMaxStreamData,
     kRecHandshakeDone,
+    kRecNewCid,
+    kRecRetireCid,
 };
 
 /// \~english The smallest datagram that may carry an Initial (14.1).
@@ -135,6 +137,27 @@ Connection::Connection(Crypto &crypto, const ConnectionConfig &config) noexcept
         for (size_t i = 0; i < record_cap_; ++i) records_[i].tag = 0;
 
     if (!cfg_.is_server) validated_ = true;
+
+    /* \~english
+     * Sequence 0 on each side is the ID the handshake already uses.  Ours
+     * gets its reset token like any other; the peer's has one only if it was
+     * given (a server's comes in its transport parameters).
+     * \~spanish
+     * La secuencia 0 de cada lado es el identificador que ya usa el saludo.  El
+     * nuestro recibe su testigo de reinicio como cualquier otro; el del otro solo
+     * lo tiene si se dio (el de un servidor llega en sus parametros de
+     * transporte).
+     * \~ */
+    LocalCid &l = local_cids_[0];
+    util::vesta_memcpy_noinline(l.cid, cfg_.local_cid, cfg_.local_cid_len);
+    l.active = cfg_.local_cid_len <= kMaxConnectionId &&
+               reset_token(crypto_, cfg_.reset_key, cfg_.local_cid, cfg_.local_cid_len, l.token);
+    PeerCid &p = peer_cids_[0];
+    learn_peer_cid(cfg_.peer_cid, cfg_.peer_cid_len);
+    p.active = true;
+    p.used = true;
+    p.has_token = cfg_.peer_reset_token_known;
+    util::vesta_memcpy_noinline(p.token, cfg_.peer_reset_token, kResetTokenSize);
 }
 
 Connection::~Connection() {
@@ -157,7 +180,11 @@ Connection::~Connection() {
 bool Connection::ready() const noexcept {
     for (size_t s = 0; s < kSpaces; ++s)
         if (crypto_recv_[s] == nullptr || crypto_send_[s] == nullptr) return false;
-    return records_ != nullptr && recovery_.ready() && streams_.ready();
+    // \~english Limits that do not fit the fixed tables are refused, not clamped (18.2: at least 2).
+    // \~spanish Los limites que no caben en las tablas fijas se rechazan, no se recortan (18.2: al menos 2).  \~
+    if (cfg_.active_cid_limit < 2 || cfg_.active_cid_limit > kMaxCids || cfg_.peer_active_cid_limit < 2)
+        return false;
+    return records_ != nullptr && recovery_.ready() && streams_.ready() && local_cids_[0].active;
 }
 
 bool Connection::set_initial_keys(const uint8_t *odcid, size_t len) noexcept {
@@ -237,6 +264,9 @@ bool Connection::install_secrets(Space s, Aead a, const uint8_t *read_secret,
         }
     }
     k.have = true;
+    // \~english With 1-RTT keys, NEW_CONNECTION_ID can travel: hand out as many IDs as the peer takes.
+    // \~spanish Con claves 1-RTT, NEW_CONNECTION_ID puede viajar: repartir tantos identificadores como acepte el otro.  \~
+    if (s == Space::Application) top_up_cids();
     if (s == Space::Handshake) recovery_.set_has_handshake_keys(now_us);
 
     // \~english Whatever arrived before these keys can be opened now.
@@ -252,6 +282,7 @@ const char *key_update_name(KeyUpdate k) noexcept {
     case KeyUpdate::NotConfirmed:   return "not-confirmed";
     case KeyUpdate::Unacknowledged: return "unacknowledged";
     case KeyUpdate::OldKeysKept:    return "old-keys-kept";
+    case KeyUpdate::TooSoon:        return "too-soon";
     case KeyUpdate::Failed:         return "provider-failed";
     }
     return "unknown";
@@ -349,6 +380,7 @@ bool Connection::roll_write() noexcept {
         util::vesta_memcpy_noinline(one_rtt_.write_secret, secret, len);
         one_rtt_.write_phase = !one_rtt_.write_phase;
         one_rtt_.first_sent_pn = kNever;
+        one_rtt_.phase_acked_at = kNever;
         one_rtt_.sealed = 0;
     }
     util::vesta_memset_noinline(secret, 0, sizeof secret);
@@ -356,7 +388,6 @@ bool Connection::roll_write() noexcept {
 }
 
 KeyUpdate Connection::update_keys(uint64_t now_us) noexcept {
-    (void)now_us;
     if (!keys_[idx(Space::Application)].have) return KeyUpdate::NoKeys;
     if (!confirmed_) return KeyUpdate::NotConfirmed;
 
@@ -377,6 +408,23 @@ KeyUpdate Connection::update_keys(uint64_t now_us) noexcept {
         acked == kNever || acked < one_rtt_.first_sent_pn)
         return KeyUpdate::Unacknowledged;
     if (one_rtt_.read_prev.aead_state != nullptr) return KeyUpdate::OldKeysKept;
+
+    /* \~english
+     * 6.5: "Endpoints SHOULD wait three times the PTO before initiating a key
+     * update after receiving an acknowledgment that confirms that the previous
+     * key update was received" -- the peer may still hold its old keys, and
+     * could not open the packets that start the new one.  Only after an
+     * update: the first one has no previous to wait for.
+     * \~spanish
+     * 6.5: los extremos DEBERIAN esperar tres PTO antes de empezar una
+     * actualizacion tras recibir el ACK que confirma que llego la anterior -- el
+     * otro puede tener aun sus claves viejas, y no podria abrir los paquetes que
+     * empiezan la nueva.  Solo tras una actualizacion: la primera no tiene
+     * anterior a la que esperar.
+     * \~ */
+    if (key_counts_.initiated + key_counts_.answered != 0 &&
+        (one_rtt_.phase_acked_at == kNever || now_us < one_rtt_.phase_acked_at + 3 * pto_duration()))
+        return KeyUpdate::TooSoon;
 
     if (!roll_write()) return KeyUpdate::Failed;
     ++key_counts_.initiated;
@@ -458,6 +506,280 @@ Connection::Opened Connection::open_one_rtt(uint8_t *p, const PacketHeader &h, U
     if (r == Unprotect::Forged) return Opened::Forged;
     if (r == Unprotect::ReservedBitsSet) return Opened::ReservedBits;
     return Opened::Failed;
+}
+
+bool Connection::owns_cid(const uint8_t *cid, size_t len) const noexcept {
+    if (len != cfg_.local_cid_len) return false;
+    for (const LocalCid &l : local_cids_)
+        if (l.active && bytes_equal(l.cid, cid, len)) return true;
+    return false;
+}
+
+bool Connection::local_cid(size_t i, uint64_t &seq, const uint8_t *&cid,
+                           const uint8_t *&token) const noexcept {
+    for (const LocalCid &l : local_cids_) {
+        if (!l.active) continue;
+        if (i-- != 0) continue;
+        seq = l.seq;
+        cid = l.cid;
+        token = l.token;
+        return true;
+    }
+    return false;
+}
+
+void Connection::learn_peer_cid(const uint8_t *cid, size_t len) noexcept {
+    // \~english Only while the first ID is the one in use: later ones come by NEW_CONNECTION_ID.
+    // \~spanish Solo mientras el primer identificador es el que se usa: los siguientes llegan por NEW_CONNECTION_ID.  \~
+    if (peer_seq_in_use_ != 0 || len > kMaxConnectionId) return;
+    if (cid != cfg_.peer_cid) util::vesta_memcpy_noinline(cfg_.peer_cid, cid, len);
+    cfg_.peer_cid_len = len;
+    util::vesta_memcpy_noinline(peer_cids_[0].cid, cid, len);
+    peer_cids_[0].len = static_cast<uint8_t>(len);
+}
+
+void Connection::top_up_cids() noexcept {
+    /* \~english
+     * As many live IDs as the peer allows -- counting only those not being
+     * retired, since a Retire Prior To may briefly exceed the limit (5.1.1) --
+     * and never more than half the table, so a renewal always has room.
+     * \~spanish
+     * Tantos identificadores vivos como permita el otro -- contando solo los que
+     * no se estan retirando, porque un Retire Prior To puede pasarse del limite
+     * un momento (5.1.1) -- y nunca mas de media tabla, para que una renovacion
+     * tenga siempre sitio.
+     * \~ */
+    if (cfg_.local_cid_len == 0) return;
+    size_t target = cfg_.peer_active_cid_limit;
+    if (target > kMaxCids / 2) target = kMaxCids / 2;
+    size_t live = 0;
+    for (const LocalCid &l : local_cids_)
+        if (l.active && l.seq >= local_retire_prior_to_) ++live;
+
+    for (LocalCid &slot : local_cids_) {
+        if (live >= target) break;
+        if (slot.active) continue;
+        LocalCid fresh;
+        do {
+            if (!crypto_.random(fresh.cid, cfg_.local_cid_len)) return;
+        } while (owns_cid(fresh.cid, cfg_.local_cid_len));
+        if (!reset_token(crypto_, cfg_.reset_key, fresh.cid, cfg_.local_cid_len, fresh.token)) return;
+        fresh.seq = next_local_seq_++;
+        fresh.active = true;
+        fresh.owed = true;
+        slot = fresh;
+        ++live;
+        ++cid_counts_.issued;
+    }
+}
+
+bool Connection::renew_connection_ids() noexcept {
+    // \~english Not before the peer retired all the previous Retire Prior To asked for (5.1.2).
+    // \~spanish No antes de que el otro retire todo lo que pidio el Retire Prior To anterior (5.1.2).  \~
+    for (const LocalCid &l : local_cids_)
+        if (l.active && l.seq < local_retire_prior_to_) return false;
+    local_retire_prior_to_ = next_local_seq_;
+    top_up_cids();
+    return true;
+}
+
+Connection::PeerCid *Connection::peer_cid_by_seq(uint64_t seq) noexcept {
+    for (PeerCid &c : peer_cids_)
+        if (c.active && c.seq == seq) return &c;
+    return nullptr;
+}
+
+bool Connection::owe_retire(uint64_t seq) noexcept {
+    for (size_t i = 0; i < retire_owed_count_; ++i)
+        if (retire_owed_[i] == seq) return true;
+    /* \~english
+     * An ID MUST NOT be forgotten without retiring it (5.1.2): a peer that
+     * makes this end owe more retirements than there is room for is closed
+     * with CONNECTION_ID_LIMIT_ERROR, which that section allows -- never
+     * dropped quietly.
+     * \~spanish
+     * Un identificador NO DEBE olvidarse sin retirarlo (5.1.2): a un otro extremo
+     * que hace que este deba mas retiradas de las que caben se le cierra con
+     * CONNECTION_ID_LIMIT_ERROR, que esa seccion permite -- nunca se tira en
+     * silencio.
+     * \~ */
+    if (retire_outstanding_ >= sizeof retire_owed_ / sizeof retire_owed_[0]) return false;
+    ++retire_outstanding_;
+    retire_owed_[retire_owed_count_++] = seq;
+    return true;
+}
+
+void Connection::requeue_retire(uint64_t seq) noexcept {
+    // \~english Lost in flight: it still counts as outstanding, so it always fits.
+    // \~spanish Perdido en vuelo: sigue contando como pendiente, asi que siempre cabe.  \~
+    for (size_t i = 0; i < retire_owed_count_; ++i)
+        if (retire_owed_[i] == seq) return;
+    if (retire_owed_count_ < sizeof retire_owed_ / sizeof retire_owed_[0])
+        retire_owed_[retire_owed_count_++] = seq;
+}
+
+bool Connection::use_peer_cid(PeerCid &c) noexcept {
+    util::vesta_memcpy_noinline(cfg_.peer_cid, c.cid, c.len);
+    cfg_.peer_cid_len = c.len;
+    peer_seq_in_use_ = c.seq;
+    c.used = true;
+    ++cid_counts_.switched;
+    return true;
+}
+
+bool Connection::on_new_connection_id(const Frame &f, const uint8_t *payload, uint64_t now_us) noexcept {
+    // \~english A peer using a zero-length ID has nowhere to be sent a new one (19.15).
+    // \~spanish Un otro extremo con identificador de longitud cero no tiene a donde recibir uno nuevo (19.15).  \~
+    if (cfg_.peer_cid_len == 0) {
+        fail(TransportError::ProtocolViolation, f.wire_type, now_us);
+        return false;
+    }
+    const uint8_t *cid = payload + f.data.off;
+    const uint8_t *token = payload + f.reset_token.off;
+
+    /* \~english
+     * The same sequence number again: harmless if it is the same frame
+     * retransmitted, a violation if anything differs; and an ID already known
+     * under another number is a violation too (19.15).
+     * \~spanish
+     * El mismo numero de secuencia otra vez: inofensivo si es la misma trama
+     * retransmitida, una violacion si algo cambia; y un identificador ya conocido
+     * con otro numero tambien es una violacion (19.15).
+     * \~ */
+    for (const PeerCid &c : peer_cids_) {
+        if (!c.active) continue;
+        const bool same_cid = c.len == f.data.len && bytes_equal(c.cid, cid, c.len);
+        const bool same_token = c.has_token && bytes_equal(c.token, token, kResetTokenSize);
+        if (c.seq == f.sequence) {
+            if (same_cid && (!c.has_token || same_token)) return true;
+            fail(TransportError::ProtocolViolation, f.wire_type, now_us);
+            return false;
+        }
+        // \~english One token for two IDs: 10.3.2 says it MUST NOT happen and MAY be a violation.
+        // \~spanish Un testigo para dos identificadores: 10.3.2 dice que NO DEBE pasar y PUEDE ser una violacion.  \~
+        if (same_cid || same_token) {
+            fail(TransportError::ProtocolViolation, f.wire_type, now_us);
+            return false;
+        }
+    }
+
+    if (f.sequence < peer_retire_prior_to_) {
+        // \~english Already retired by an earlier Retire Prior To: retire it at once (19.15).
+        // \~spanish Ya retirado por un Retire Prior To anterior: se retira en el acto (19.15).  \~
+        if (!owe_retire(f.sequence)) {
+            fail(TransportError::ConnectionIdLimitError, f.wire_type, now_us);
+            return false;
+        }
+        return true;
+    }
+
+    /* \~english
+     * An increased Retire Prior To: the IDs below it stop being used and are
+     * retired BEFORE the new one is added (5.1.2) -- which is what lets the
+     * peer replace every ID without ever exceeding the limit.
+     * \~spanish
+     * Un Retire Prior To mayor: los identificadores por debajo dejan de usarse y
+     * se retiran ANTES de anadir el nuevo (5.1.2) -- que es lo que deja al otro
+     * reemplazarlos todos sin pasarse nunca del limite.
+     * \~ */
+    bool lost_current = false;
+    if (f.retire_prior_to > peer_retire_prior_to_) {
+        peer_retire_prior_to_ = f.retire_prior_to;
+        for (PeerCid &c : peer_cids_) {
+            if (!c.active || c.seq >= peer_retire_prior_to_) continue;
+            if (c.seq == peer_seq_in_use_) lost_current = true;
+            c.active = false;
+            ++cid_counts_.retired;
+            if (!owe_retire(c.seq)) {
+                fail(TransportError::ConnectionIdLimitError, f.wire_type, now_us);
+                return false;
+            }
+        }
+    }
+
+    PeerCid *slot = nullptr;
+    for (PeerCid &c : peer_cids_)
+        if (!c.active) {
+            slot = &c;
+            break;
+        }
+    if (slot == nullptr) {
+        fail(TransportError::ConnectionIdLimitError, f.wire_type, now_us);
+        return false;
+    }
+    slot->seq = f.sequence;
+    slot->len = static_cast<uint8_t>(f.data.len);
+    util::vesta_memcpy_noinline(slot->cid, cid, f.data.len);
+    util::vesta_memcpy_noinline(slot->token, token, kResetTokenSize);
+    slot->has_token = true;
+    slot->used = false;
+    slot->active = true;
+    ++cid_counts_.received;
+
+    // \~english The one in use was retired: move to the lowest that is left.
+    // \~spanish Se retiro el que estaba en uso: se pasa al mas bajo que quede.  \~
+    if (lost_current) {
+        PeerCid *next = nullptr;
+        for (PeerCid &c : peer_cids_)
+            if (c.active && (next == nullptr || c.seq < next->seq)) next = &c;
+        if (next != nullptr) use_peer_cid(*next);
+    }
+
+    // \~english After adding and retiring, the peer may not have handed out more than allowed (5.1.1).
+    // \~spanish Tras anadir y retirar, el otro no puede haber repartido mas de lo permitido (5.1.1).  \~
+    size_t active = 0;
+    for (const PeerCid &c : peer_cids_)
+        if (c.active) ++active;
+    if (active > cfg_.active_cid_limit) {
+        fail(TransportError::ConnectionIdLimitError, f.wire_type, now_us);
+        return false;
+    }
+    return true;
+}
+
+bool Connection::on_retire_connection_id(const Frame &f, uint64_t now_us) noexcept {
+    /* \~english
+     * 19.16: an end that gave a zero-length ID MUST take any RETIRE as a
+     * violation; so is a number above any sent to the peer -- SENT, not just
+     * issued: one still waiting to go out cannot be retired yet -- and the ID
+     * this very packet came to.
+     * \~spanish
+     * 19.16: un extremo que dio un identificador de longitud cero DEBE tomar
+     * cualquier RETIRE como violacion; tambien un numero por encima de todos los
+     * mandados al otro -- MANDADOS, no solo emitidos: uno que aun espera salir no
+     * se puede retirar todavia -- y el identificador al que llego este mismo
+     * paquete.
+     * \~ */
+    if (cfg_.local_cid_len == 0 || f.sequence > max_sent_local_seq_) {
+        fail(TransportError::ProtocolViolation, f.wire_type, now_us);
+        return false;
+    }
+    for (LocalCid &l : local_cids_) {
+        if (!l.active || l.seq != f.sequence) continue;
+        if (packet_dcid_ != nullptr && packet_dcid_len_ == cfg_.local_cid_len &&
+            bytes_equal(l.cid, packet_dcid_, packet_dcid_len_)) {
+            fail(TransportError::ProtocolViolation, f.wire_type, now_us);
+            return false;
+        }
+        l.active = false;
+        l.owed = false;
+        ++cid_counts_.retired_by_peer;
+        top_up_cids();
+        return true;
+    }
+    // \~english Already retired: a retransmission.  \~spanish Ya retirado: una retransmision.  \~
+    return true;
+}
+
+bool Connection::check_stateless_reset(const uint8_t *tail) const noexcept {
+    // \~english Only the tokens of IDs packets were sent to, and not retired (10.3.1).
+    // \~spanish Solo los testigos de identificadores a los que se mandaron paquetes, y sin retirar (10.3.1).  \~
+    // \~english Every candidate compared in full, in constant time: no early exit to time.
+    // \~spanish Cada candidato comparado entero, en tiempo constante: sin salida temprana que medir.  \~
+    bool hit = false;
+    for (const PeerCid &c : peer_cids_)
+        if (c.active && c.used && c.has_token) hit = bytes_equal(c.token, tail, kResetTokenSize) || hit;
+    return hit;
 }
 
 void Connection::discard_keys(Space s, uint64_t now_us) noexcept {
@@ -626,6 +948,11 @@ void Connection::on_acked(Space space, const SentPacket &p) noexcept {
         case kRecResetStream:
             if (st != nullptr && st->send != nullptr) st->send->on_reset_acked();
             break;
+        case kRecRetireCid:
+            // \~english The peer has the retirement: it no longer counts against the room (5.1.2).
+            // \~spanish El otro tiene la retirada: ya no cuenta contra el sitio (5.1.2).  \~
+            if (retire_outstanding_ != 0) --retire_outstanding_;
+            break;
         default:
             break;
         }
@@ -673,6 +1000,15 @@ void Connection::on_lost(Space space, const SentPacket &p) noexcept {
         case kRecHandshakeDone:
             handshake_done_owed_ = true;
             break;
+        case kRecNewCid:
+            // \~english Sent again only if the ID is still live: one retired meanwhile needs nothing.
+            // \~spanish Se manda otra vez solo si el identificador sigue vivo: uno retirado entretanto no necesita nada.  \~
+            for (LocalCid &l : local_cids_)
+                if (l.active && l.seq == f.id) l.owed = true;
+            break;
+        case kRecRetireCid:
+            requeue_retire(f.id);
+            break;
         default:
             break;
         }
@@ -694,6 +1030,24 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
     HeaderContext ctx;
     ctx.short_dcid_len = cfg_.local_cid_len;
 
+    /* \~english
+     * A stateless reset looks like a packet that fails.  Its tail is kept
+     * before processing -- unprotecting works in place -- and compared when
+     * the packet could not be associated or decrypted, which is when 10.3.1
+     * says it MUST be; whatever the header form, since any datagram ending in
+     * a valid token is a reset (10.3).
+     * \~spanish
+     * Un reinicio sin estado parece un paquete que falla.  Su cola se guarda
+     * antes de procesar -- desproteger trabaja en su sitio -- y se compara cuando
+     * el paquete no se pudo asociar ni descifrar, que es cuando 10.3.1 dice que
+     * DEBE hacerse; sea cual sea la forma de la cabecera, porque todo datagrama
+     * que acaba en un testigo valido es un reinicio (10.3).
+     * \~ */
+    const bool maybe_reset = n >= kMinStatelessReset;
+    uint8_t tail[kResetTokenSize];
+    if (maybe_reset) util::vesta_memcpy(tail, data + n - kResetTokenSize, kResetTokenSize);
+    const uint64_t failed_before = drops_.bad_header + drops_.wrong_cid + drops_.forged;
+
     size_t pos = 0;
     while (pos < n && state_ != ConnState::Closed && state_ != ConnState::Draining) {
         PacketHeader h;
@@ -705,6 +1059,16 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
         }
         process_packet(data + pos, h, ecn, now_us);
         pos += h.size;
+    }
+
+    // \~english The peer has no such connection: drain, and send nothing more (10.3.1).
+    // \~spanish El otro no tiene esta conexion: drenar, y no mandar nada mas (10.3.1).  \~
+    if (maybe_reset && drops_.bad_header + drops_.wrong_cid + drops_.forged != failed_before &&
+        check_stateless_reset(tail)) {
+        closed_by_reset_ = true;
+        state_ = ConnState::Draining;
+        close_deadline_ = now_us + 3 * pto_duration();
+        return;
     }
 
     if (!validated_) recovery_.set_amplification_blocked(amplification_budget() == 0, now_us);
@@ -734,8 +1098,7 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     // \~english Addressed to this connection: our ID, or the original one on a client's Initial.
     // \~spanish Dirigido a esta conexion: nuestro identificador, o el original en un Initial del cliente.  \~
     const uint8_t *dcid = p + h.dcid.off;
-    const bool ours = h.dcid.len == cfg_.local_cid_len &&
-                      bytes_equal(dcid, cfg_.local_cid, h.dcid.len);
+    const bool ours = owns_cid(dcid, h.dcid.len);
     const bool original = cfg_.is_server && s == Space::Initial && h.dcid.len == odcid_len_ &&
                           bytes_equal(dcid, odcid_, odcid_len_);
     if (!ours && !original) {
@@ -813,10 +1176,14 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     // \~english The peer's real ID comes with its first long header.
     // \~spanish El identificador de verdad del otro extremo llega con su primera cabecera larga.  \~
     if (!peer_cid_known_ && s != Space::Application && h.scid.len <= kMaxConnectionId) {
-        util::vesta_memcpy(cfg_.peer_cid, p + h.scid.off, h.scid.len);
-        cfg_.peer_cid_len = h.scid.len;
+        learn_peer_cid(p + h.scid.off, h.scid.len);
         peer_cid_known_ = true;
     }
+
+    // \~english RETIRE_CONNECTION_ID may not name the ID this packet came to (19.16).
+    // \~spanish RETIRE_CONNECTION_ID no puede nombrar el identificador al que llego este paquete (19.16).  \~
+    packet_dcid_ = dcid;
+    packet_dcid_len_ = h.dcid.len;
 
     bool eliciting = false;
     if (!process_frames(s, p + u.payload.off, u.payload.len, h.type, eliciting, now_us))
@@ -960,8 +1327,7 @@ void Connection::process_retry(const uint8_t *p, const PacketHeader &h, uint64_t
     // \~spanish Fuera de linea: como mucho una vez por conexion, y como mucho veinte bytes.  \~
     util::vesta_memcpy_noinline(retry_scid_, p + h.scid.off, h.scid.len);
     retry_scid_len_ = h.scid.len;
-    util::vesta_memcpy_noinline(cfg_.peer_cid, p + h.scid.off, h.scid.len);
-    cfg_.peer_cid_len = h.scid.len;
+    learn_peer_cid(p + h.scid.off, h.scid.len);
     if (!derive_initial_keys(retry_scid_, retry_scid_len_)) {
         fail(TransportError::InternalError, 0, now_us);
         return;
@@ -996,8 +1362,11 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
         case FrameType::DataBlocked:
         case FrameType::StreamsBlocked:
         case FrameType::NewToken:
-        case FrameType::NewConnectionId:
         case FrameType::PathResponse:
+            break;
+
+        case FrameType::NewConnectionId:
+            if (!on_new_connection_id(f, payload, now_us)) return false;
             break;
 
         case FrameType::Ack:
@@ -1008,6 +1377,13 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
             // \~english A client's address is proven once a Handshake packet is acknowledged.
             // \~spanish La direccion de un cliente queda probada al confirmarse un paquete Handshake.  \~
             if (!cfg_.is_server && s == Space::Handshake) recovery_.set_peer_address_validated(now_us);
+            // \~english The first ACK of a packet of this write phase: the clock of 6.5 starts here.
+            // \~spanish El primer ACK de un paquete de esta fase de escritura: aqui empieza el reloj de 6.5.  \~
+            if (s == Space::Application && one_rtt_.phase_acked_at == kNever &&
+                one_rtt_.first_sent_pn != kNever &&
+                recovery_.largest_acked(Space::Application) != kNever &&
+                recovery_.largest_acked(Space::Application) >= one_rtt_.first_sent_pn)
+                one_rtt_.phase_acked_at = now_us;
             break;
 
         case FrameType::Crypto: {
@@ -1076,12 +1452,7 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
             break;
 
         case FrameType::RetireConnectionId:
-            // \~english Only sequence 0 was ever issued here: retiring more is a violation (19.16).
-            // \~spanish Aqui solo se emitio la secuencia 0: retirar mas es una violacion (19.16).  \~
-            if (f.sequence > 0) {
-                fail(TransportError::ProtocolViolation, f.wire_type, now_us);
-                return false;
-            }
+            if (!on_retire_connection_id(f, now_us)) return false;
             break;
 
         case FrameType::PathChallenge:
@@ -1165,6 +1536,30 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
             handshake_done_owed_ = false;
             ++sent_.handshake_done;
             add_record(rec, kRecHandshakeDone, 0, 0, 0, false);
+        }
+        // \~english Connection IDs owed to the peer, and retirements owed to it (19.15, 19.16).
+        // \~spanish Identificadores que se le deben al otro, y retiradas que se le deben (19.15, 19.16).  \~
+        for (LocalCid &l : local_cids_) {
+            if (!l.active || !l.owed || full(rec)) continue;
+            n = write_new_connection_id(p + used, room - used, l.seq, local_retire_prior_to_, l.cid,
+                                        cfg_.local_cid_len, l.token);
+            if (n == 0) break;
+            used += n;
+            eliciting = true;
+            l.owed = false;
+            if (l.seq > max_sent_local_seq_) max_sent_local_seq_ = l.seq;
+            ++sent_.new_connection_id;
+            add_record(rec, kRecNewCid, l.seq, 0, 0, false);
+        }
+        while (retire_owed_count_ != 0 && !full(rec)) {
+            const uint64_t seq = retire_owed_[retire_owed_count_ - 1];
+            n = write_retire_connection_id(p + used, room - used, seq);
+            if (n == 0) break;
+            used += n;
+            eliciting = true;
+            --retire_owed_count_;
+            ++sent_.retire_connection_id;
+            add_record(rec, kRecRetireCid, seq, 0, 0, false);
         }
         if (path_response_owed_ && (n = write_path_response(p + used, room - used, path_response_)) != 0) {
             // \~english Never retransmitted: a new challenge brings a new response (8.2.2).
@@ -1336,6 +1731,20 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
             close_app_ = false;
             return 0;
         }
+        /* \~english
+         * One packet left under this key, and no update possible: 6.6
+         * RECOMMENDS closing with AEAD_LIMIT_REACHED before reaching the
+         * state where no update can be made -- so this last packet carries
+         * the CONNECTION_CLOSE, and the peer learns why instead of timing out.
+         * \~spanish
+         * Queda un paquete con esta clave, y no se puede actualizar: 6.6
+         * RECOMIENDA cerrar con AEAD_LIMIT_REACHED antes de llegar al estado en
+         * que no cabe ninguna actualizacion -- asi que este ultimo paquete lleva el
+         * CONNECTION_CLOSE, y el otro sabe por que en vez de caducar.
+         * \~ */
+        if (state_ == ConnState::Active && one_rtt_.sealed + 1 >= confidentiality_limit() &&
+            update_keys(now_us) != KeyUpdate::Started)
+            close(static_cast<uint64_t>(TransportError::AeadLimitReached), false, 0, now_us);
         // \~english The fixed bit, and the key phase this end seals with (17.3.1).
         // \~spanish El bit fijo, y la fase de clave con la que sella este extremo (17.3.1).  \~
         out[h++] = static_cast<uint8_t>(0x40 | (one_rtt_.write_phase ? 0x04 : 0x00));
@@ -1375,6 +1784,25 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     if (pn_len + len < 4) {
         util::vesta_memset(payload + len, 0, 4 - pn_len - len);
         len = 4 - pn_len;
+    }
+
+    /* \~english
+     * 10.3: every short packet at least 22 bytes longer than the ID the peer
+     * puts in its packets to us.  A peer's stateless reset is always smaller
+     * than what triggered it; this keeps it from being told apart from a
+     * valid packet by its size.
+     * \~spanish
+     * 10.3: cada paquete corto al menos 22 bytes mas largo que el identificador
+     * que el otro pone en sus paquetes hacia nosotros.  Un reinicio sin estado del
+     * otro siempre es mas pequeno que lo que lo provoco; esto evita que se le
+     * distinga de un paquete valido por su tamano.
+     * \~ */
+    if (!is_long && overhead + len < cfg_.local_cid_len + 22) {
+        const size_t extra = cfg_.local_cid_len + 22 - overhead - len;
+        if (extra <= payload_room - len) {
+            util::vesta_memset(payload + len, 0, extra);
+            len += extra;
+        }
     }
 
     if (is_long) encode_varint_width(out + length_at, 2, pn_len + len + kTagSize);

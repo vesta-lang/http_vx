@@ -71,6 +71,7 @@ const char *admit_reason_name(AdmitReason r) noexcept {
     case AdmitReason::SentVersionNegotiation:     return "sent-version-negotiation";
     case AdmitReason::SentRetry:                  return "sent-retry";
     case AdmitReason::SentInvalidToken:           return "sent-invalid-token";
+    case AdmitReason::SentStatelessReset:         return "sent-stateless-reset";
     case AdmitReason::BadHeader:                  return "bad-header";
     case AdmitReason::UnknownConnection:          return "unknown-connection";
     case AdmitReason::NotInitial:                 return "not-initial";
@@ -146,9 +147,33 @@ Admission Acceptor::on_datagram(const uint8_t *data, size_t n, const uint8_t *ad
         a.reason = AdmitReason::VersionNegotiationReceived;
         return finish(a);
 
-    case PacketType::OneRtt:
-        a.reason = AdmitReason::UnknownConnection;
+    case PacketType::OneRtt: {
+        /* \~english
+         * A short header for a connection this server does not have: it may
+         * have had it and lost it.  The token for the ID it names is computed
+         * again from the key, and the peer learns to stop (10.3).  Not when the
+         * reply could not be smaller than the packet: that is the loop guard.
+         * \~spanish
+         * Una cabecera corta de una conexion que este servidor no tiene: puede
+         * que la tuviera y la perdiera.  El testigo del identificador que nombra
+         * se calcula otra vez desde la clave, y el otro extremo sabe que tiene que
+         * parar (10.3).  No cuando la respuesta no podria ser menor que el paquete:
+         * esa es la guarda contra los bucles.
+         * \~ */
+        uint8_t token[kResetTokenSize];
+        if (!cfg_.send_stateless_reset || n <= kMinStatelessReset) {
+            a.reason = AdmitReason::UnknownConnection;
+            return finish(a);
+        }
+        if (!reset_token(crypto_, cfg_.reset_key, data + h.dcid.off, h.dcid.len, token)) {
+            a.reason = AdmitReason::ProviderFailed;
+            return finish(a);
+        }
+        a.reply_len = write_stateless_reset(crypto_, token, n, reply, reply_room);
+        a.verdict = a.reply_len != 0 ? Admit::Reply : Admit::Drop;
+        a.reason = a.reply_len != 0 ? AdmitReason::SentStatelessReset : AdmitReason::ProviderFailed;
         return finish(a);
+    }
 
     case PacketType::UnsupportedVersion:
         /* \~english

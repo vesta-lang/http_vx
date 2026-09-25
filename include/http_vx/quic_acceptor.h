@@ -60,6 +60,7 @@
 
 #include "http_vx/quic_crypto.h"
 #include "http_vx/quic_packet.h"
+#include "http_vx/quic_reset.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -93,6 +94,23 @@ struct AcceptorConfig {
     /// \~english The length of the connection IDs this server hands out.
     /// \~spanish La longitud de los identificadores de conexion que reparte este servidor.  \~
     size_t cid_len = 8;
+
+    /**
+     * \~english
+     * The key stateless reset tokens come from -- the SAME the server's
+     * connections are given, so that a token handed out by a connection is
+     * the one the acceptor answers with once that connection is gone.
+     * \~spanish
+     * La clave de la que salen los testigos de reinicio sin estado -- la MISMA
+     * que reciben las conexiones del servidor, para que el testigo que entrego
+     * una conexion sea con el que contesta el acceptor cuando ya no exista.
+     * \~
+     */
+    uint8_t reset_key[kResetKeySize] = {};
+
+    /// \~english Answer a short header nobody owns with a stateless reset (10.3).
+    /// \~spanish Contestar con un reinicio sin estado a una cabecera corta que no es de nadie (10.3).  \~
+    bool send_stateless_reset = true;
 };
 
 /**
@@ -122,10 +140,13 @@ enum class AdmitReason : uint8_t {
     SentVersionNegotiation,
     SentRetry,
     SentInvalidToken,
+    /// \~english A short header for no known connection, answered with a stateless reset.
+    /// \~spanish Una cabecera corta de ninguna conexion conocida, contestada con un reinicio sin estado.  \~
+    SentStatelessReset,
     /// \~english Not parseable as QUIC.  \~spanish No se puede leer como QUIC.  \~
     BadHeader,
-    /// \~english A short header for no known connection (stateless reset, later).
-    /// \~spanish Una cabecera corta de ninguna conexion conocida (reinicio sin estado, mas adelante).  \~
+    /// \~english A short header for no known connection, too small to answer smaller (10.3.3).
+    /// \~spanish Una cabecera corta de ninguna conexion conocida, demasiado pequena para contestar con algo menor (10.3.3).  \~
     UnknownConnection,
     /// \~english A known version, but not an Initial: nothing to start from (5.2.2).
     /// \~spanish Una version conocida, pero no un Initial: nada desde lo que empezar (5.2.2).  \~

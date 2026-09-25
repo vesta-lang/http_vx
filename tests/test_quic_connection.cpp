@@ -129,6 +129,8 @@ struct NetShape {
     uint64_t key_update_packets;
     /// \~english The suite the handshake settles on.  \~spanish El algoritmo en el que queda el saludo.  \~
     Aead aead;
+    /// \~english Both ends renew their connection IDs mid-transfer.  \~spanish Los dos extremos renuevan sus identificadores a mitad de transferencia.  \~
+    bool renew_cids;
 };
 
 const uint8_t kClientAddr[6] = {198, 51, 100, 7, 0x1f, 0x90};
@@ -353,10 +355,28 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     std::vector<uint64_t> ids;
     std::map<uint64_t, size_t> written;
     bool closing = false;
+    // \~english Datagrams the client sent after closing that the network let through.
+    // \~spanish Datagramas que mando el cliente despues de cerrar y que la red dejo pasar.  \~
+    unsigned closes_through = 0;
+    bool server_renewed = false;
+    bool client_renewed = false;
 
     for (int step = 0; step < 400000; ++step) {
         drive_handshake(cr, ce, now);
         if (srv) drive_handshake(cr, se, now);
+
+        // \~english Renewals mid-transfer: the server 50 ms after confirming, the client 100 ms after.
+        // \~spanish Renovaciones a mitad de transferencia: el servidor 50 ms despues de confirmar, el cliente 100 ms despues.  \~
+        if (net.renew_cids && confirmed_at != kNever) {
+            if (!server_renewed && now >= confirmed_at + 50000) {
+                srv->renew_connection_ids();
+                server_renewed = true;
+            }
+            if (!client_renewed && now >= confirmed_at + 100000) {
+                client.renew_connection_ids();
+                client_renewed = true;
+            }
+        }
 
         // \~english Once confirmed, the client opens its streams and writes what fits.
         // \~spanish Una vez confirmado, el cliente abre sus flujos y escribe lo que cabe.  \~
@@ -433,6 +453,7 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                     ++lost_count;
                     continue;
                 }
+                if (who == 0 && closing) ++closes_through;
                 Datagram d{now + net.latency_us + (net.jitter_us ? rng() % net.jitter_us : 0),
                            who == 0, std::vector<uint8_t>(buf, buf + n)};
                 if (rng() % 100 < net.dup_pct) air.push_back(d);
@@ -539,6 +560,30 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
      * claves muchas veces -- empezando unas y contestando otras -- mientras cada
      * byte volvia entero y nada fallaba la autenticacion.
      * \~ */
+    /* \~english
+     * Connection IDs: in every run each end hands the other one more than
+     * the first and keeps what it gets.  With renewals, each end must have
+     * had both old IDs retired by the other, and be sending to a new one.
+     * \~spanish
+     * Identificadores de conexion: en cada corrida cada extremo le da al otro uno
+     * mas que el primero y guarda lo que recibe.  Con renovaciones, a cada extremo
+     * el otro le tiene que haber retirado los dos viejos, y tiene que estar
+     * mandando a uno nuevo.
+     * \~ */
+    check(client.cids().issued >= 1 && server.cids().issued >= 1 && client.cids().received >= 1 &&
+              server.cids().received >= 1,
+          "the ends did not hand each other connection IDs");
+    if (net.renew_cids) {
+        check(server_renewed && client_renewed, "the renewals did not happen");
+        check(client.cids().retired_by_peer >= 2 && server.cids().retired_by_peer >= 2,
+              "renewed IDs were not retired by the peer");
+        check(client.peer_cid_sequence() >= 2 && server.peer_cid_sequence() >= 2,
+              "an end did not move to one of the renewed IDs");
+    } else {
+        check(client.peer_cid_sequence() == 0 && server.peer_cid_sequence() == 0,
+              "an end changed destination ID without being asked to");
+    }
+
     if (net.key_update_packets != 0) {
         const KeyUpdateCounts &kc = client.key_updates();
         const KeyUpdateCounts &ks = server.key_updates();
@@ -573,11 +618,29 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     }
     check(client.state() == ConnState::Closed && server.state() == ConnState::Closed,
           "the connections did not end closed");
-    if (!(server.closed_by_peer() && server.close_code() == 0 && server.close_is_application())) {
+
+    /* \~english
+     * A CONNECTION_CLOSE is not delivered reliably (10.2): a closing end
+     * repeats it only in answer to what arrives, and one that never arrives
+     * leaves the peer to its idle timeout.  So the test does not ask for
+     * luck: if any datagram after the close got through, the server MUST have
+     * seen it; if the network took them all, it must have timed out, silently.
+     * \~spanish
+     * Un CONNECTION_CLOSE no se entrega de forma fiable (10.2): un extremo que
+     * cierra lo repite solo en respuesta a lo que llega, y uno que no llega nunca
+     * deja al otro a su plazo de inactividad.  Asi que la prueba no pide suerte:
+     * si paso algun datagrama despues del cierre, el servidor TIENE que haberlo
+     * visto; si la red se los llevo todos, tiene que haber caducado, en silencio.
+     * \~ */
+    if (closes_through == 0) {
+        check(!server.closed_by_peer() && server.close_code() == 0,
+              "a server that got no close ended as if it had");
+    } else if (!(server.closed_by_peer() && server.close_code() == 0 && server.close_is_application())) {
         std::fprintf(stderr,
                      "FAIL [%s]: the server did not see the client's application close with code 0 "
                      "(client: code 0x%llx by %s; server: code 0x%llx by %s; key update refusals: "
-                     "old-after-new %llu+%llu, updated-twice %llu+%llu)\n",
+                     "old-after-new %llu+%llu, updated-twice %llu+%llu; reset %d+%d; wrong ID %llu+%llu; "
+                     "forged %llu+%llu; closes sent by the client %llu)\n",
                      current, static_cast<unsigned long long>(client.close_code()),
                      client.closed_by_peer() ? "peer" : "itself",
                      static_cast<unsigned long long>(server.close_code()),
@@ -585,7 +648,13 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                      static_cast<unsigned long long>(client.key_updates().old_after_new),
                      static_cast<unsigned long long>(server.key_updates().old_after_new),
                      static_cast<unsigned long long>(client.key_updates().updated_twice),
-                     static_cast<unsigned long long>(server.key_updates().updated_twice));
+                     static_cast<unsigned long long>(server.key_updates().updated_twice),
+                     static_cast<int>(client.closed_by_reset()), static_cast<int>(server.closed_by_reset()),
+                     static_cast<unsigned long long>(client.drops().wrong_cid),
+                     static_cast<unsigned long long>(server.drops().wrong_cid),
+                     static_cast<unsigned long long>(client.drops().forged),
+                     static_cast<unsigned long long>(server.drops().forged),
+                     static_cast<unsigned long long>(client.sent().connection_close));
         ++failures;
     }
     check(client.drops().forged == 0 && server.drops().forged == 0,
@@ -623,7 +692,8 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                     "confirmed at %5.1f ms: %u+%u datagrams, "
                     "%u lost, %llu+%llu PTOs, %llu+%llu packets lost, %llu duplicates dropped, "
                     "%llu kept for keys, cwnd %llu/%llu, persistent %llu+%llu, "
-                    "key updates %llu+%llu (%llu late opened with old keys)\n",
+                    "key updates %llu+%llu (%llu late opened with old keys), "
+                    "IDs issued %llu+%llu retired %llu+%llu, destination seq %llu/%llu\n",
                     net.name, streams, size, static_cast<double>(now) / 1e6,
                     static_cast<double>(admitted_at) / 1e3, static_cast<double>(confirmed_at) / 1e3,
                     sent_each[0],
@@ -641,7 +711,13 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                     static_cast<unsigned long long>(client.key_updates().initiated),
                     static_cast<unsigned long long>(server.key_updates().initiated),
                     static_cast<unsigned long long>(client.key_updates().opened_with_old +
-                                                    server.key_updates().opened_with_old));
+                                                    server.key_updates().opened_with_old),
+                    static_cast<unsigned long long>(client.cids().issued),
+                    static_cast<unsigned long long>(server.cids().issued),
+                    static_cast<unsigned long long>(client.cids().retired_by_peer),
+                    static_cast<unsigned long long>(server.cids().retired_by_peer),
+                    static_cast<unsigned long long>(client.peer_cid_sequence()),
+                    static_cast<unsigned long long>(server.peer_cid_sequence()));
 }
 
 /**
@@ -1234,7 +1310,8 @@ std::string heard(KeyPair &k) {
  * \~
  */
 size_t craft_one_rtt(Crypto &cr, Aead a, uint8_t tag, int gen, bool phase, uint64_t pn, uint8_t *out,
-                     bool to_client = false) {
+                     bool to_client = false, const uint8_t *frames = nullptr, size_t frames_len = 0,
+                     size_t dcid_len = 8) {
     const size_t len = secret_len(a);
     uint8_t s0[kMaxSecret], s[kMaxSecret];
     secret(s0, tag, len);
@@ -1254,11 +1331,17 @@ size_t craft_one_rtt(Crypto &cr, Aead a, uint8_t tag, int gen, bool phase, uint6
 
     size_t p = 0;
     out[p++] = static_cast<uint8_t>(0x40 | (phase ? 0x04 : 0x00));
-    for (int i = 0; i < 8; ++i) out[p++] = static_cast<uint8_t>((to_client ? 0xc0 : 0x50) + i);
+    for (size_t i = 0; i < dcid_len; ++i) out[p++] = static_cast<uint8_t>((to_client ? 0xc0 : 0x50) + i);
     const size_t pn_offset = p;
-    const size_t body = 31;
-    out[pn_offset + 4] = 0x01;  // \~english PING  \~spanish PING  \~
-    std::memset(out + pn_offset + 5, 0, body - 1);
+    // \~english The frames given, or a PING; then PADDING up to 31 bytes, enough to sample.
+    // \~spanish Las tramas dadas, o un PING; despues PADDING hasta 31 bytes, lo bastante para muestrear.  \~
+    size_t body = frames_len > 31 ? frames_len : 31;
+    std::memset(out + pn_offset + 4, 0, body);
+    if (frames != nullptr) {
+        std::memcpy(out + pn_offset + 4, frames, frames_len);
+    } else {
+        out[pn_offset + 4] = 0x01;  // \~english PING  \~spanish PING  \~
+    }
     check(protect_packet(cr, k, out, pn_offset, 4, pn, body) == Protect::Ok, "a packet could not be sealed");
     forget_keys(cr, k);
     return pn_offset + 4 + body + kTagSize;
@@ -1485,6 +1568,400 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         check(sent == 6 && v.client.state() == ConnState::Closed &&
                   v.client.close_code() == static_cast<uint64_t>(TransportError::AeadLimitReached),
               "the confidentiality limit did not stop the connection at exactly its value");
+        // \~english The last packet the key allowed carried the reason (6.6: close before, RECOMMENDED).
+        // \~spanish El ultimo paquete que permitia la clave llevo el motivo (6.6: cerrar antes, RECOMENDADO).  \~
+        check(v.client.sent().connection_close == 1,
+              "the last packet under the key did not carry AEAD_LIMIT_REACHED");
+    }
+
+    // \~english Three PTO after the ACK that confirmed the previous update, not before (6.5).
+    // \~spanish Tres PTO despues del ACK que confirmo la actualizacion anterior, no antes (6.5).  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        // \~english The client starts an update; the server answers it...
+        // \~spanish El cliente empieza una actualizacion; el servidor la contesta...  \~
+        size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        check(v.server.key_updates().answered == 1, "the server did not answer the update");
+        expect_update(v.server.update_keys(v.now), KeyUpdate::Unacknowledged,
+                      "an update before the answer was acknowledged was not refused");
+        uint8_t out[1500];
+        check(v.server.build_datagram(out, sizeof out, v.now) != 0, "the server sent no answer");
+        // \~english ...its old keys go, and only then does the ACK of its answer come.
+        // \~spanish ...sus claves viejas se van, y solo entonces llega el ACK de su respuesta.  \~
+        const uint64_t late = v.now + 20000000;
+        v.server.on_timer(late);
+        check(v.server.key_updates().old_discarded == 1, "the old keys were not dropped");
+        const uint8_t ack[] = {0x02, 0x00, 0x00, 0x00, 0x00};  // \~english ACK of packet 0  \~spanish ACK del paquete 0  \~
+        n = craft_one_rtt(cr, a, 3, 1, true, 11, pkt, false, ack, sizeof ack);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, late);
+        expect_update(v.server.update_keys(late), KeyUpdate::TooSoon,
+                      "an update right after the confirming ACK was not refused");
+        expect_update(v.server.update_keys(late + 600000000), KeyUpdate::Started,
+                      "an update long after the confirming ACK was refused");
+    }
+}
+
+/* \~english
+ * Connection IDs and stateless reset, rule by rule (RFC 9000, 5.1, 10.3, 19.15,
+ * 19.16).  Frames are sealed by hand into 1-RTT packets from the client.
+ * \~spanish
+ * Identificadores de conexion y reinicio sin estado, regla a regla (RFC 9000,
+ * 5.1, 10.3, 19.15, 19.16).  Las tramas se sellan a mano en paquetes 1-RTT del
+ * cliente.
+ * \~ */
+
+/// \~english A NEW_CONNECTION_ID for the server; the ID is eight bytes of @p fill.
+/// \~spanish Un NEW_CONNECTION_ID para el servidor; el identificador son ocho bytes de @p fill.  \~
+size_t new_cid_frame(uint8_t *out, uint64_t seq, uint64_t rpt, uint8_t fill) {
+    uint8_t cid[8], token[kResetTokenSize];
+    std::memset(cid, fill, sizeof cid);
+    std::memset(token, fill ^ 0x5a, sizeof token);
+    return write_new_connection_id(out, 64, seq, rpt, cid, sizeof cid, token);
+}
+
+/// \~english Delivers @p frames to the server in a client 1-RTT packet numbered @p pn.
+/// \~spanish Entrega @p frames al servidor en un paquete 1-RTT del cliente numerado @p pn.  \~
+void to_server(Crypto &cr, KeyPair &k, uint64_t pn, const uint8_t *frames, size_t n) {
+    uint8_t pkt[1500];
+    const size_t len = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, pn, pkt, false, frames, n);
+    k.server.on_datagram(pkt, len, Ecn::NotEct, k.now);
+}
+
+/// \~english Checks the server is still active; when not, says how it ended.
+/// \~spanish Comprueba que el servidor sigue activo; si no, dice como acabo.  \~
+void check_server_active(KeyPair &k, const char *what) {
+    if (k.server.state() == ConnState::Active) return;
+    std::fprintf(stderr, "FAIL [%s]: %s (server state %d, code 0x%llx, frame 0x%llx)\n", current, what,
+                 static_cast<int>(k.server.state()), static_cast<unsigned long long>(k.server.close_code()),
+                 static_cast<unsigned long long>(k.server.close_frame()));
+    ++failures;
+}
+
+/// \~english Whether the server closed with @p e.  \~spanish Si el servidor cerro con @p e.  \~
+bool server_closed_with(KeyPair &k, TransportError e) {
+    return k.server.state() == ConnState::Closing && !k.server.closed_by_peer() &&
+           k.server.close_code() == static_cast<uint64_t>(e);
+}
+
+void test_cid_rules(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/connection-ids", cr.name());
+    const ConnectionConfig cc = key_client();
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    uint8_t f[256];
+    size_t n;
+
+    // \~english Kept once, and the very same frame again is harmless (a retransmission).
+    // \~spanish Se guarda una vez, y la misma trama otra vez es inofensiva (una retransmision).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        n = new_cid_frame(f, 1, 0, 0x11);
+        to_server(cr, k, 1, f, n);
+        to_server(cr, k, 2, f, n);
+        check(k.server.state() == ConnState::Active && k.server.cids().received == 1,
+              "a NEW_CONNECTION_ID was not kept exactly once");
+    }
+    // \~english The same number with another ID, or the same ID with another number: PROTOCOL_VIOLATION.
+    // \~spanish El mismo numero con otro identificador, o el mismo identificador con otro numero: PROTOCOL_VIOLATION.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        n = new_cid_frame(f, 1, 0, 0x11);
+        to_server(cr, k, 1, f, n);
+        n = new_cid_frame(f, 1, 0, 0x22);
+        to_server(cr, k, 2, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "one sequence number with two IDs was not a PROTOCOL_VIOLATION");
+    }
+    {
+        // \~english The same ID, with a different token, so that only this rule can catch it.
+        // \~spanish El mismo identificador, con otro testigo, para que solo esta regla pueda cazarlo.  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        uint8_t cid[8], t1[kResetTokenSize], t2[kResetTokenSize];
+        std::memset(cid, 0x11, sizeof cid);
+        std::memset(t1, 0x01, sizeof t1);
+        std::memset(t2, 0x02, sizeof t2);
+        n = write_new_connection_id(f, sizeof f, 1, 0, cid, 8, t1);
+        to_server(cr, k, 1, f, n);
+        n = write_new_connection_id(f, sizeof f, 2, 0, cid, 8, t2);
+        to_server(cr, k, 2, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "one ID under two sequence numbers was not a PROTOCOL_VIOLATION");
+    }
+    // \~english More than active_connection_id_limit (4): CONNECTION_ID_LIMIT_ERROR.
+    // \~spanish Mas que active_connection_id_limit (4): CONNECTION_ID_LIMIT_ERROR.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        for (uint64_t s = 1; s <= 3; ++s) {
+            n = new_cid_frame(f, s, 0, static_cast<uint8_t>(0x10 + s));
+            to_server(cr, k, s, f, n);
+        }
+        check(k.server.state() == ConnState::Active, "IDs up to the limit were refused");
+        n = new_cid_frame(f, 4, 0, 0x14);
+        to_server(cr, k, 4, f, n);
+        check(server_closed_with(k, TransportError::ConnectionIdLimitError),
+              "an ID over the limit was not a CONNECTION_ID_LIMIT_ERROR");
+    }
+    // \~english ...unless its Retire Prior To makes the room: retired first, the limit checked after.
+    // \~spanish ...salvo que su Retire Prior To haga el sitio: primero se retira, despues se mira el limite.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        for (uint64_t s = 1; s <= 3; ++s) {
+            n = new_cid_frame(f, s, 0, static_cast<uint8_t>(0x10 + s));
+            to_server(cr, k, s, f, n);
+        }
+        n = new_cid_frame(f, 4, 2, 0x14);
+        to_server(cr, k, 4, f, n);
+        check(k.server.state() == ConnState::Active && k.server.cids().retired == 2,
+              "a Retire Prior To did not make room before the limit");
+        check(k.server.peer_cid_sequence() == 2, "retiring the ID in use did not move to the lowest left");
+        uint8_t out[1500];
+        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        check(k.server.sent().retire_connection_id == 2, "the two retirements owed were not sent");
+        // \~english A number under Retire Prior To arriving late is retired at once, never kept.
+        // \~spanish Un numero por debajo de Retire Prior To que llega tarde se retira en el acto, no se guarda.  \~
+        n = new_cid_frame(f, 1, 0, 0x31);
+        const uint64_t received = k.server.cids().received;
+        to_server(cr, k, 5, f, n);
+        check(k.server.cids().received == received, "an ID under Retire Prior To was kept");
+        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        check(k.server.sent().retire_connection_id == 3, "a late ID under Retire Prior To was not retired");
+    }
+    // \~english A peer with a zero-length ID cannot be given new ones (19.15).
+    // \~spanish A un otro extremo con identificador de longitud cero no se le pueden dar nuevos (19.15).  \~
+    {
+        ConnectionConfig zero = sc;
+        zero.peer_cid_len = 0;
+        KeyPair k(cr, Aead::Aes128Gcm, cc, zero);
+        n = new_cid_frame(f, 1, 0, 0x11);
+        to_server(cr, k, 1, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "NEW_CONNECTION_ID to a zero-length peer was not a PROTOCOL_VIOLATION");
+    }
+
+    // \~english RETIRE_CONNECTION_ID: a number never issued, or the ID the packet came to, is a violation.
+    // \~spanish RETIRE_CONNECTION_ID: un numero nunca emitido, o el identificador al que llego el paquete, es una violacion.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        n = write_retire_connection_id(f, sizeof f, 5);
+        to_server(cr, k, 1, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "retiring a number never issued was not a PROTOCOL_VIOLATION");
+    }
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        n = write_retire_connection_id(f, sizeof f, 0);
+        to_server(cr, k, 1, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "retiring the ID the packet came to was not a PROTOCOL_VIOLATION");
+    }
+    // \~english Issued but not yet sent: "greater than any previously sent" (19.16).
+    // \~spanish Emitido pero aun sin mandar: "mayor que cualquiera mandado" (19.16).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        check(k.server.cids().issued == 1, "the server did not hand out one more ID");
+        n = write_retire_connection_id(f, sizeof f, 1);
+        to_server(cr, k, 1, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "retiring an ID not yet sent was not a PROTOCOL_VIOLATION");
+    }
+    {
+        // \~english The client speaks first: until then the server may send nothing at all (8.1).
+        // \~spanish El cliente habla primero: hasta entonces el servidor no puede mandar nada (8.1).  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 5);
+        check(k.server.sent().new_connection_id == 1, "the server did not send its extra ID");
+        n = write_retire_connection_id(f, sizeof f, 1);
+        to_server(cr, k, 1001, f, n);
+        to_server(cr, k, 1002, f, n);
+        check_server_active(k, "a valid RETIRE closed the server");
+        check(k.server.cids().retired_by_peer == 1 && k.server.cids().issued == 2,
+              "a retired ID was not replaced exactly once");
+    }
+    // \~english An end that gave a zero-length ID takes any RETIRE as a violation (19.16).
+    // \~spanish Un extremo que dio un identificador de longitud cero toma cualquier RETIRE como violacion (19.16).  \~
+    {
+        ConnectionConfig zero = sc;
+        zero.local_cid_len = 0;
+        KeyPair k(cr, Aead::Aes128Gcm, cc, zero);
+        check(k.server.ready(), "a server with a zero-length ID is not ready");
+        n = write_retire_connection_id(f, sizeof f, 0);
+        uint8_t pkt[1500];
+        // \~english Addressed with a zero-length ID: no destination bytes at all.
+        // \~spanish Dirigido con identificador de longitud cero: ningun byte de destino.  \~
+        const size_t len = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, 1, pkt, false, f, n, 0);
+        k.server.on_datagram(pkt, len, Ecn::NotEct, k.now);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "a RETIRE to an end with a zero-length ID was not a PROTOCOL_VIOLATION");
+    }
+    // \~english One token for two IDs is a violation (10.3.2).
+    // \~spanish Un testigo para dos identificadores es una violacion (10.3.2).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        uint8_t cid1[8], cid2[8], token[kResetTokenSize];
+        std::memset(cid1, 0x41, 8);
+        std::memset(cid2, 0x42, 8);
+        std::memset(token, 0x77, sizeof token);
+        n = write_new_connection_id(f, sizeof f, 1, 0, cid1, 8, token);
+        to_server(cr, k, 1, f, n);
+        n = write_new_connection_id(f, sizeof f, 2, 0, cid2, 8, token);
+        to_server(cr, k, 2, f, n);
+        check(server_closed_with(k, TransportError::ProtocolViolation),
+              "one token for two IDs was not a PROTOCOL_VIOLATION");
+    }
+    // \~english No ID forgotten without retiring it: past the room for retirements, the connection closes (5.1.2).
+    // \~spanish Ningun identificador olvidado sin retirarlo: pasado el sitio para retiradas, la conexion se cierra (5.1.2).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        for (uint64_t s = 1; s <= 16; ++s) {
+            n = new_cid_frame(f, s, s, static_cast<uint8_t>(0x20 + s));
+            to_server(cr, k, s, f, n);
+        }
+        check(k.server.state() == ConnState::Active, "sixteen retirements owed were refused");
+        n = new_cid_frame(f, 17, 17, 0x60);
+        to_server(cr, k, 17, f, n);
+        check(server_closed_with(k, TransportError::ConnectionIdLimitError),
+              "a seventeenth retirement owed did not close with CONNECTION_ID_LIMIT_ERROR");
+    }
+    // \~english ...while retirements the peer acknowledged free their room: thirty renewals by the real
+    // \~english client make the server retire sixty IDs, far past the sixteen that fit at once.
+    // \~spanish ...mientras que las retiradas que confirmo el otro liberan su sitio: treinta renovaciones
+    // \~spanish del cliente de verdad hacen que el servidor retire sesenta identificadores, muy por encima de
+    // \~spanish los dieciseis que caben a la vez.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 5);
+        bool all = true;
+        for (int r = 0; r < 30; ++r) {
+            all = k.client.renew_connection_ids() && all;
+            pump(k, 5);
+        }
+        check(all, "a renewal was refused although the previous one was fully retired");
+        check_server_active(k, "acknowledged retirements did not free their room");
+        check(k.server.cids().retired == 60 && k.client.cids().retired_by_peer == 60,
+              "not every renewed ID was retired");
+    }
+    // \~english A renewal is refused while the peer has not retired what the last one asked for (5.1.2).
+    // \~spanish Una renovacion se niega mientras el otro no haya retirado lo que pidio la anterior (5.1.2).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 5);
+        check(k.client.renew_connection_ids(), "the first renewal was refused");
+        check(!k.client.renew_connection_ids(), "a renewal was allowed before the last one was retired");
+        pump(k, 5);
+        check(k.client.renew_connection_ids(), "a renewal was refused after the last one was retired");
+    }
+
+    // \~english Every short packet is at least 22 bytes longer than this end's ID (10.3).
+    // \~spanish Cada paquete corto mide al menos 22 bytes mas que el identificador de este extremo (10.3).  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        uint8_t out[1500];
+        pump(k, 10);
+        size_t smallest = 1500;
+        to_server(cr, k, 1000, nullptr, 0);
+        for (int i = 0; i < 20; ++i) {
+            k.now += 30000;
+            size_t m;
+            while ((m = k.server.build_datagram(out, sizeof out, k.now)) != 0)
+                if (m < smallest) smallest = m;
+        }
+        check(smallest != 1500 && smallest >= sc.local_cid_len + 22,
+              "a short packet was smaller than the ID plus 22 bytes");
+
+        // \~english The smallest there is: a probe carrying only a PING (1 + 8 + 1 + 3 + 16 = 29 unpadded).
+        // \~spanish El mas pequeno que hay: un sondeo que solo lleva un PING (1 + 8 + 1 + 3 + 16 = 29 sin relleno).  \~
+        say(k, "x");
+        check(k.client.build_datagram(out, sizeof out, k.now) != 0, "the client sent nothing");
+        const uint64_t t = k.client.timer();
+        k.client.on_timer(t);
+        const size_t probe = k.client.build_datagram(out, sizeof out, t);
+        check(probe == cc.local_cid_len + 22, "a PING-only probe was not padded to the ID plus 22 bytes");
+    }
+
+    // \~english Renewing: the peer retires both old IDs, moves to a new one, and data still flows.
+    // \~spanish Renovar: el otro retira los dos identificadores viejos, pasa a uno nuevo, y los datos siguen.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        say(k, "before ");
+        pump(k, 10);
+        k.server.renew_connection_ids();
+        pump(k, 10);
+        say(k, "after");
+        pump(k, 10);
+        check(k.server.cids().retired_by_peer == 2 && k.client.cids().retired == 2 &&
+                  k.client.peer_cid_sequence() == 2,
+              "a renewal did not end with the old IDs retired and a new one in use");
+        check(heard(k) == "before after", "the stream did not survive a renewal");
+    }
+
+    // \~english Stateless reset: a used ID's token ends the connection; no other does (10.3.1).
+    // \~spanish Reinicio sin estado: el testigo de un identificador usado acaba la conexion; ningun otro (10.3.1).  \~
+    {
+        for (size_t i = 0; i < kResetKeySize; ++i) sc.reset_key[i] = static_cast<uint8_t>(0xa0 + i);
+        ConnectionConfig ccr = cc;
+        check(reset_token(cr, sc.reset_key, sc.local_cid, 8, ccr.peer_reset_token), "token");
+        ccr.peer_reset_token_known = true;
+        KeyPair k(cr, Aead::Aes128Gcm, ccr, sc);
+
+        uint8_t wrong[kResetTokenSize];
+        std::memcpy(wrong, ccr.peer_reset_token, kResetTokenSize);
+        wrong[0] ^= 1;
+        uint8_t pkt[64];
+        size_t m = write_stateless_reset(cr, wrong, 60, pkt, sizeof pkt);
+        k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+        check(k.client.state() == ConnState::Active && !k.client.closed_by_reset(),
+              "a reset with the wrong token ended the connection");
+
+        // \~english The acceptor, holding the same key, answers for a server that is gone.
+        // \~spanish El acceptor, con la misma clave, contesta por un servidor que ya no esta.  \~
+        AcceptorConfig ac = acceptor_config(false);
+        std::memcpy(ac.reset_key, sc.reset_key, kResetKeySize);
+        Acceptor gone(cr, ac);
+        say(k, "anyone there?");
+        uint8_t out[1500], reply[1500];
+        m = k.client.build_datagram(out, sizeof out, k.now);
+        const Admission ad = gone.on_datagram(out, m, kClientAddr, sizeof kClientAddr, k.now, reply,
+                                              sizeof reply);
+        check(ad.reason == AdmitReason::SentStatelessReset, "the acceptor did not answer with a reset");
+        k.client.on_datagram(reply, ad.reply_len, Ecn::NotEct, k.now);
+        check(k.client.closed_by_reset() && k.client.state() == ConnState::Draining,
+              "the client did not recognise the reset for its server");
+        check(k.client.build_datagram(out, sizeof out, k.now) == 0, "a reset connection still sends");
+    }
+    // \~english The token of an ID the client holds but never sent to does not count (10.3.1)...
+    // \~spanish El testigo de un identificador que el cliente tiene pero al que nunca mando no cuenta (10.3.1)...  \~
+    {
+        for (size_t i = 0; i < kResetKeySize; ++i) sc.reset_key[i] = static_cast<uint8_t>(0xa0 + i);
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 10);
+        check(k.client.cids().received == 1, "the client did not get the server's extra ID");
+        uint64_t seq = 0;
+        const uint8_t *cid = nullptr;
+        const uint8_t *token = nullptr;
+        check(k.server.local_cid(1, seq, cid, token) && seq == 1, "the server's second ID is not listed");
+        uint8_t pkt[64];
+        size_t m = write_stateless_reset(cr, token, 60, pkt, sizeof pkt);
+        k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+        check(k.client.state() == ConnState::Active, "the token of an ID never sent to ended the connection");
+
+        // \~english Once the client moves to that ID, its token does count -- in any header form (10.3).
+        // \~spanish Cuando el cliente pasa a ese identificador, su testigo si cuenta.  \~
+        k.server.renew_connection_ids();
+        pump(k, 10);
+        uint64_t in_use = k.client.peer_cid_sequence();
+        const uint8_t *used_token = nullptr;
+        for (size_t i = 0; k.server.local_cid(i, seq, cid, token); ++i)
+            if (seq == in_use) used_token = token;
+        check(used_token != nullptr, "the ID in use is not one the server lists");
+        if (used_token != nullptr) {
+            m = write_stateless_reset(cr, used_token, 60, pkt, sizeof pkt);
+            pkt[0] |= 0x80;
+            k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+            check(k.client.closed_by_reset(), "the token of the ID in use did not end the connection");
+        }
     }
 }
 
@@ -1500,18 +1977,23 @@ void run_all(Crypto &cr) {
      * cliente no confirmaria nunca, ni abriria un flujo.
      * \~ */
     const NetShape shapes[] = {
-        {"clean", 0, 0, 20000, 0, 0, 0, false, 0, Aead::Aes128Gcm},
-        {"lossy", 5, 2, 20000, 10000, 0, 0, false, 0, Aead::Aes128Gcm},
-        {"hostile", 20, 5, 30000, 40000, 0, 0, false, 0, Aead::Aes128Gcm},
-        {"handshake-lost", 3, 0, 20000, 5000, 2, 0, false, 0, Aead::Aes128Gcm},
-        {"handshake-done-lost", 0, 0, 20000, 0, 0, 150000, false, 0, Aead::Aes128Gcm},
-        {"retry-clean", 0, 0, 20000, 0, 0, 0, true, 0, Aead::Aes128Gcm},
-        {"retry-lossy", 5, 2, 20000, 10000, 0, 0, true, 0, Aead::Aes128Gcm},
+        {"clean", 0, 0, 20000, 0, 0, 0, false, 0, Aead::Aes128Gcm, false},
+        {"lossy", 5, 2, 20000, 10000, 0, 0, false, 0, Aead::Aes128Gcm, false},
+        {"hostile", 20, 5, 30000, 40000, 0, 0, false, 0, Aead::Aes128Gcm, false},
+        {"handshake-lost", 3, 0, 20000, 5000, 2, 0, false, 0, Aead::Aes128Gcm, false},
+        {"handshake-done-lost", 0, 0, 20000, 0, 0, 150000, false, 0, Aead::Aes128Gcm, false},
+        {"retry-clean", 0, 0, 20000, 0, 0, 0, true, 0, Aead::Aes128Gcm, false},
+        {"retry-lossy", 5, 2, 20000, 10000, 0, 0, true, 0, Aead::Aes128Gcm, false},
         // \~english Keys updated every 40 packets, one suite each: a clean network must not notice.
         // \~spanish Claves actualizadas cada 40 paquetes, un algoritmo en cada una: una red limpia no debe notarlo.  \~
-        {"keys-clean", 0, 0, 20000, 0, 0, 0, false, 40, Aead::Aes128Gcm},
-        {"keys-lossy", 5, 2, 20000, 10000, 0, 0, false, 40, Aead::Aes256Gcm},
-        {"keys-hostile", 20, 5, 30000, 40000, 0, 0, false, 40, Aead::ChaCha20Poly1305},
+        {"keys-clean", 0, 0, 20000, 0, 0, 0, false, 40, Aead::Aes128Gcm, false},
+        {"keys-lossy", 5, 2, 20000, 10000, 0, 0, false, 40, Aead::Aes256Gcm, false},
+        {"keys-hostile", 20, 5, 30000, 40000, 0, 0, false, 40, Aead::ChaCha20Poly1305, false},
+        // \~english Both ends renew their connection IDs mid-transfer; the peer must retire and move on.
+        // \~spanish Los dos extremos renuevan sus identificadores a mitad de transferencia; el otro tiene que retirar y cambiar.  \~
+        {"cids-clean", 0, 0, 20000, 0, 0, 0, false, 0, Aead::Aes128Gcm, true},
+        {"cids-lossy", 5, 2, 20000, 10000, 0, 0, false, 0, Aead::Aes128Gcm, true},
+        {"cids-hostile", 20, 5, 30000, 40000, 0, 0, false, 40, Aead::Aes128Gcm, true},
     };
     for (const NetShape &net : shapes)
         for (uint64_t seed = 1; seed <= 3; ++seed) run(cr, net, seed, 4, 100000);
@@ -1524,6 +2006,7 @@ void run_all(Crypto &cr) {
     test_key_update_rules(cr, Aead::Aes128Gcm);
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
+    test_cid_rules(cr);
 }
 
 } // namespace
