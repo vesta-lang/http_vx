@@ -4,7 +4,8 @@
     Estado:     BORRADOR
     Fecha:      2026-09-23
     Sustituye:  --
-    Ver tambien: HVX-2 (seguridad), HVX-3 (el contrato publico)
+    Ver tambien: HVX-2 (seguridad), HVX-3 (el contrato publico),
+                 HVX-4 (servir HTTP sin red)
 
 ## Resumen
 

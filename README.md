@@ -87,3 +87,4 @@ cuanto dependiera, dejaria de servir para lo demas.
 | | |
 | --- | --- |
 | [`doc/architecture.md`](doc/architecture.md) | donde se corta y por que: el modelo de E/S, los fragmentos, la memoria, y lo que NO se hace |
+| [`doc/sin-red.md`](doc/sin-red.md) | servir HTTP sobre una tuberia, un socket de dominio o dos descriptores: donde estan las costuras, que reglas no se pueden romper, y como se sirve un recurso |
