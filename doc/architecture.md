@@ -315,13 +315,21 @@ arena de la peticion y muere con ella.
 
 > **R22. `http_vx` NO DEBE enlazar ninguna biblioteca de TLS.**
 
-No trae criptografia propia -- seria una mala idea -- ni ajena.  Define la
-interfaz y el proveedor lo pone quien construye.  Es el mismo modelo de ganchos
-que usa el lenguaje de este ecosistema para el asignador o el panico: **lo
-provee el programador, una biblioteca o el SISTEMA OPERATIVO**.
+La razon es la LICENCIA: la biblioteca de TLS de referencia, OpenSSL, tiene una
+que no encaja con la de este proyecto, y enlazarla la arrastraria a todo el que
+use `http_vx`.  Asi que no se enlaza ninguna: se define la interfaz y el
+proveedor lo pone quien construye.  Es el mismo modelo de ganchos que usa el
+lenguaje de este ecosistema para el asignador o el panico: **lo provee el
+programador, una biblioteca o el SISTEMA OPERATIVO**.
 
 Con eso `http_vx` queda sin una sola dependencia con licencia, y el sistema
 operativo es un proveedor valido -- en Windows, el natural.
+
+Lo que la regla deja fuera es una BIBLIOTECA, no escribir un algoritmo: uno
+basico, pequeno y especificado hasta el ultimo bit se puede escribir aqui, bajo
+la licencia de este proyecto, cuando un proveedor lo necesita y su sistema no lo
+tiene (ver 9.2).  Lo que no se escribe aqui es lo que es grande y facil de hacer
+mal -- un handshake de TLS, una pila de certificados.
 
 ### 9.1 Los proveedores tienen TRES formas
 
@@ -355,7 +363,8 @@ etiquetas, las sales de cada version, el nonce, que bits del primer byte se
 enmascaran, de donde sale la muestra, en que orden se desprotege -- vive en
 `quic/` (`quic_protection.h`).
 
-Mas abajo seria escribir criptografia aqui, que esta R22 prohibe.  Mas arriba --
+Mas abajo seria meter las primitivas en el nucleo, atado a una sola forma de
+obtenerlas y sin que quien construye pueda elegir.  Mas arriba --
 un proveedor que "protege un paquete QUIC" -- seria que cada proveedor
 reimplementara el RFC 9001 con su propia ocasion de equivocarse, y los vectores
 del RFC probarian al proveedor y no a este proyecto.  Con la linea aqui, la
@@ -368,13 +377,21 @@ una clave AES la expande en una agenda, y hacerlo en cada paquete costaria mas
 que el paquete.
 
 **No todos los proveedores tienen todos los algoritmos, y eso se PREGUNTA**
-(`supports`).  Hay dos en `providers/`: uno sobre la libcrypto de OpenSSL, con
-los tres, y el del propio sistema en Windows, sobre CNG, que no tiene ChaCha20
-porque CNG no da el flujo ChaCha20 en bruto que pide su proteccion de cabecera.
-El handshake ofrecera solo lo que el proveedor diga que sabe hacer, de modo que
-el otro extremo no pueda elegir un algoritmo que falle en el primer paquete.  Los
-dos pasan los MISMOS casos -- una sola prueba, que corre contra cada proveedor
-que haya --, igual que los backends de E/S con la R8.
+(`supports`).  El handshake ofrecera solo lo que el proveedor diga que sabe
+hacer, de modo que el otro extremo no pueda elegir un algoritmo que falle en el
+primer paquete.
+
+Hay dos en `providers/`: uno sobre la libcrypto de OpenSSL y el del propio
+sistema en Windows, sobre CNG.  La CNG de Windows 10 no tiene ChaCha20-Poly1305
+-- ni el AEAD ni el flujo ChaCha20 en bruto que pide su proteccion de cabecera --,
+asi que esos dos algoritmos estan escritos aqui (`providers/common/`, a partir
+del RFC 8439, en tiempo constante) y el proveedor de Windows los usa; con eso los
+dos proveedores ofrecen los tres algoritmos.  Esa implementacion se prueba en
+todas las plataformas contra los vectores del RFC 8439, incluidos los casos
+limite de la aritmetica de Poly1305.
+
+Los dos proveedores pasan los MISMOS casos -- una sola prueba, que corre contra
+cada proveedor que haya --, igual que los backends de E/S con la R8.
 
 ### 9.3 Sin proveedor no se degrada
 
@@ -407,7 +424,10 @@ ensamblador, asignador y perfilador propios.  Y las bibliotecas serias traen
 mucho mas de lo que aqui se necesita, con su superficie de ataque y su ciclo de
 publicacion.
 
-**Criptografia propia.**  Ni propia ni ajena: seccion 9.
+**Enlazar una biblioteca de criptografia.**  La licencia de la de referencia no
+encaja con la de este proyecto: seccion 9.  Lo grande -- un handshake de TLS,
+certificados -- lo pone un proveedor; un algoritmo basico que al proveedor le
+falte si se escribe aqui.
 
 **HTTP/0.9 y HTTP/1.0.**  Se reconocen lo justo para responder un error claro.
 Aceptarlos es superficie de ataque a cambio de nada.

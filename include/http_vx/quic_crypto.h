@@ -13,16 +13,17 @@
  * \~
  *
  * \~english
- * R22 says http_vx links no TLS library and carries no cryptography of its
- * own.  This is where that rule meets QUIC, and the cut is drawn at the
+ * R22 says http_vx links no TLS library -- the reference one's license does
+ * not fit this project's.  This is where that rule meets QUIC, and the cut is
+ * drawn at the
  * PRIMITIVES: a provider knows how to run HKDF, an AEAD and a block cipher, and
  * nothing about QUIC.  Everything QUIC-specific -- the labels, the initial
  * salts, how the nonce is made from the packet number, which bits of the first
  * byte are masked, the order in which a packet is unprotected -- lives in
  * `quic_protection.h`, on this side of the line.
  *
- * Drawing the line lower than that would mean writing cryptography here, which
- * R22 forbids and which would be a bad idea anyway.  Drawing it higher -- a
+ * Drawing the line lower than that would tie the core to one way of getting
+ * the primitives, leaving whoever builds no choice.  Drawing it higher -- a
  * provider that "protects a QUIC packet" -- would mean every provider
  * re-implementing the same RFC 9001 logic, each with its own chance of getting
  * the mask bits wrong, and the RFC's test vectors would be testing the
@@ -36,16 +37,16 @@
  * and where its memory comes from, is the provider's business.
  *
  * \~spanish
- * La R22 dice que http_vx no enlaza ninguna biblioteca de TLS ni trae
- * criptografia propia.  Aqui es donde esa regla se encuentra con QUIC, y el
- * corte va en las PRIMITIVAS: un proveedor sabe hacer HKDF, un AEAD y un cifrado
+ * La R22 dice que http_vx no enlaza ninguna biblioteca de TLS -- la de
+ * referencia tiene una licencia que no encaja con la de este proyecto --.  Aqui
+ * es donde esa regla se encuentra con QUIC, y el corte va en las PRIMITIVAS: un proveedor sabe hacer HKDF, un AEAD y un cifrado
  * de bloque, y nada de QUIC.  Todo lo que es de QUIC -- las etiquetas, las sales
  * iniciales, como sale el nonce del numero de paquete, que bits del primer byte
  * se enmascaran, en que orden se desprotege un paquete -- vive en
  * `quic_protection.h`, a este lado de la linea.
  *
- * Poner la linea mas abajo seria escribir criptografia aqui, que la R22 prohibe
- * y que ademas seria mala idea.  Ponerla mas arriba -- un proveedor que
+ * Poner la linea mas abajo ataria el nucleo a una sola forma de obtener las
+ * primitivas, sin que quien construye pudiera elegir.  Ponerla mas arriba -- un proveedor que
  * "protege un paquete QUIC" -- seria que cada proveedor reimplementara la misma
  * logica del RFC 9001, cada uno con su propia ocasion de equivocarse en los bits
  * de la mascara, y los vectores del RFC probarian al proveedor en vez de a este
@@ -197,15 +198,15 @@ public:
      * \~
      *
      * \~english
-     * Not every provider has every suite: the Windows one has no raw ChaCha20,
-     * which ChaCha20's header protection needs.  R23 says the server ASKS
+     * Not every provider has to have every suite -- a system library may lack
+     * one, as Windows 10's CNG lacks ChaCha20.  R23 says the server ASKS
      * rather than assumes, and this is where: the handshake offers only what
      * this answers yes to, so a peer can never pick a suite that would fail on
      * the first packet.
      * \~spanish
-     * No todos los proveedores tienen todos los algoritmos: el de Windows no
-     * tiene ChaCha20 en bruto, que es lo que necesita la proteccion de cabecera
-     * de ChaCha20.  La R23 dice que el servidor PREGUNTA en vez de suponer, y es
+     * No todos los proveedores tienen por que tener todos los algoritmos -- a una
+     * biblioteca del sistema le puede faltar uno, como a la CNG de Windows 10 le
+     * falta ChaCha20.  La R23 dice que el servidor PREGUNTA en vez de suponer, y es
      * aqui: el handshake ofrece solo aquello a lo que esto dice que si, asi que
      * el otro extremo nunca puede elegir un algoritmo que fallaria en el primer
      * paquete.

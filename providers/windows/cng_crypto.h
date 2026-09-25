@@ -19,11 +19,11 @@
  * one it lives in its own library and is linked only by whoever chooses it,
  * and no Windows header leaks through this one.
  *
- * **It offers AES-GCM and not ChaCha20.**  CNG has no raw ChaCha20 stream,
- * and ChaCha20's header protection is exactly that -- the keystream at a
- * counter taken from the sample.  So `supports` says no, and a server using
- * this provider never offers the suite, rather than offering it and failing
- * on the first packet.
+ * **AES comes from the system; ChaCha20-Poly1305 does not.**  Windows 10's
+ * CNG has neither the AEAD nor the raw ChaCha20 stream that ChaCha20's header
+ * protection needs, so both come from `providers/common/chacha20_poly1305`,
+ * written here from RFC 8439.  With that, this provider offers all three
+ * suites, the same as the OpenSSL one.
  *
  * HKDF is split the way the RFC splits it.  Extract IS one HMAC (RFC 5869,
  * section 2.2), computed by the system's HMAC; expand is the system's own
@@ -35,11 +35,11 @@
  * vive en su propia biblioteca y solo lo enlaza quien lo elige, y ninguna
  * cabecera de Windows se cuela por esta.
  *
- * **Ofrece AES-GCM y no ChaCha20.**  CNG no tiene el flujo ChaCha20 en bruto, y
- * la proteccion de cabecera de ChaCha20 es exactamente eso -- el flujo de clave
- * en un contador sacado de la muestra.  Asi que `supports` dice que no, y un
- * servidor con este proveedor nunca ofrece ese algoritmo, en vez de ofrecerlo y
- * fallar en el primer paquete.
+ * **AES sale del sistema; ChaCha20-Poly1305 no.**  La CNG de Windows 10 no
+ * tiene ni el AEAD ni el flujo ChaCha20 en bruto que pide la proteccion de
+ * cabecera de ChaCha20, asi que los dos salen de
+ * `providers/common/chacha20_poly1305`, escrito aqui a partir del RFC 8439.  Con
+ * eso, este proveedor ofrece los tres algoritmos, igual que el de OpenSSL.
  *
  * HKDF se parte como lo parte el RFC.  Extract ES un HMAC (RFC 5869, seccion
  * 2.2), calculado con el HMAC del sistema; expand es el HKDF del propio sistema,

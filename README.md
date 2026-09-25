@@ -50,12 +50,14 @@ entregue bytes. Mezclarlos daria un servidor mas corto y una pieza inseparable.
 naciera para HTTP/3 no lo hace parte de HTTP, y meterlo ahi impediria usarlo
 para otra cosa -- que es lo contrario de para lo que existe este proyecto.
 
-**`providers/` no lo enlaza nadie por defecto.** `http_vx` no trae
-criptografia, ni propia ni ajena: define lo que necesita y el proveedor lo pone
-quien construye el servidor. Lo que hay en `providers/` son adaptadores --
+**`providers/` no lo enlaza nadie por defecto.** `http_vx` no enlaza ninguna
+biblioteca de criptografia -- la de referencia tiene una licencia que no encaja
+con la de este proyecto --: define lo que necesita y el proveedor lo pone quien
+construye el servidor. Lo que hay en `providers/` son adaptadores --
 cada uno en su propia biblioteca, que se enlaza o no --, no una dependencia:
 uno sobre OpenSSL y otro sobre la CNG del propio Windows, que es el proveedor
-natural ahi porque no hay nada que distribuir ni que parchear.
+natural ahi porque no hay nada que distribuir ni que parchear. Lo que la CNG no
+tiene -- ChaCha20 y Poly1305 -- esta escrito en `providers/common/`.
 
 **Una version del protocolo es un codec, no un servidor.** La semantica -- que
 significa una peticion: metodo, cabeceras, estado, cuerpo -- es la misma en las

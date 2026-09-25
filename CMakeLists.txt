@@ -226,10 +226,24 @@ endif ()
 # Windows: no depende de nada que pueda faltar.  Enlazarlo sigue siendo decision
 # de quien construye el servidor.
 #
-# Ofrece AES-GCM y NO ChaCha20: CNG no tiene el flujo ChaCha20 en bruto que pide
-# su proteccion de cabecera, y el proveedor lo dice por `supports` en vez de
-# fallar en el primer paquete.
+# AES sale del sistema; ChaCha20-Poly1305, de `http_vx_chacha`, porque la CNG
+# de Windows 10 no tiene ni el AEAD ni el flujo en bruto que pide su proteccion
+# de cabecera.
 # ---------------------------------------------------------------------------
+# ChaCha20 y Poly1305 (RFC 8439), escritos aqui: la CNG de Windows 10 no tiene
+# ninguno de los dos.  Sin ninguna cabecera del sistema, asi que se construye y
+# se prueba en TODAS las plataformas, lo use ahi un proveedor o no.  Escribir un
+# algoritmo basico no va contra la R22: lo que deja fuera es una BIBLIOTECA con
+# una licencia que no encaja con la de este proyecto.
+add_library(http_vx_chacha STATIC
+        providers/common/chacha20_poly1305.cpp
+)
+target_include_directories(http_vx_chacha
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/common
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_chacha PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_chacha PUBLIC vesta_alloc)
+
 if (WIN32)
     add_library(http_vx_crypto_cng STATIC
             providers/windows/cng_crypto.cpp
@@ -239,7 +253,7 @@ if (WIN32)
     target_compile_options(http_vx_crypto_cng PRIVATE -Wall -Wextra -pedantic-errors)
     target_link_libraries(http_vx_crypto_cng
             PUBLIC http_vx_quic
-            PRIVATE bcrypt)
+            PRIVATE http_vx_chacha bcrypt)
     message(STATUS "[http_vx] QUIC provider: cng (the system's own)")
 endif ()
 
@@ -377,6 +391,8 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_quic_packet tests/test_quic_packet.cpp)
     http_vx_add_test(test_quic_protection tests/test_quic_protection.cpp)
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
+    http_vx_add_test(test_chacha20_poly1305 tests/test_chacha20_poly1305.cpp)
+    target_link_libraries(test_chacha20_poly1305 PRIVATE http_vx_chacha)
 
     # Contra los paquetes enteros de los RFC: solo si hay un proveedor con el
     # que sellarlos.  Si no lo hay ya se dijo arriba, al buscarlo.  Con varios,

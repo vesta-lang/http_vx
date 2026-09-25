@@ -35,9 +35,12 @@
 
 #include "cng_crypto.h"
 
+#include "chacha20_poly1305.h"
+
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
 #include "util/mem/vesta_memcpy.h"
+#include "util/mem/vesta_memset.h"
 
 #include <climits>
 
@@ -71,19 +74,43 @@ bool ok(NTSTATUS s) noexcept {
 
 /**
  * @brief
- * \~english What a prepared key is: the system's key handle and what it is for.
- * \~spanish Lo que es una clave preparada: el manejador de clave del sistema y para que es.
+ * \~english What a prepared key is, and what it is for.
+ * \~spanish Lo que es una clave preparada, y para que es.
+ * \~
+ *
+ * \~english
+ * For AES, the system's key handle.  For ChaCha20, the key bytes themselves:
+ * ChaCha20 has no key schedule to precompute -- the key goes into the state
+ * word for word on every block -- so keeping the bytes IS preparing it.
+ * \~spanish
+ * Para AES, el manejador de clave del sistema.  Para ChaCha20, los propios
+ * bytes de la clave: ChaCha20 no tiene agenda que precalcular -- la clave entra
+ * en el estado palabra a palabra en cada bloque --, asi que guardar los bytes ES
+ * prepararla.
  * \~
  */
 struct State {
-    enum Kind : uint8_t { Aead, HpAes };
+    enum Kind : uint8_t { Aead, HpAes, AeadChaCha, HpChaCha };
 
     Kind kind;
     BCRYPT_KEY_HANDLE key;
+    uint8_t chacha_key[chacha::kKeySize];
 };
 
-/// \~english A key for @p alg from @p key, wrapped in a State from our allocator.
-/// \~spanish Una clave para @p alg a partir de @p key, envuelta en un State de nuestro asignador.  \~
+/// \~english A State from our allocator, with no key yet.
+/// \~spanish Un State de nuestro asignador, todavia sin clave.  \~
+State *alloc_state(State::Kind kind) noexcept {
+    const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
+                                 util::AllocFill::All);
+    State *s = static_cast<State *>(util::host_alloc(sizeof(State)));
+    if (s == nullptr) return nullptr;
+    s->kind = kind;
+    s->key = nullptr;
+    return s;
+}
+
+/// \~english A key for @p alg from @p key, wrapped in a State.
+/// \~spanish Una clave para @p alg a partir de @p key, envuelta en un State.  \~
 State *new_state(State::Kind kind, void *alg, const uint8_t *key,
                  size_t key_len) noexcept {
     BCRYPT_KEY_HANDLE k = nullptr;
@@ -95,16 +122,31 @@ State *new_state(State::Kind kind, void *alg, const uint8_t *key,
                                        static_cast<ULONG>(key_len), 0)))
         return nullptr;
 
-    const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
-                                 util::AllocFill::All);
-    State *s = static_cast<State *>(util::host_alloc(sizeof(State)));
+    State *s = alloc_state(kind);
     if (s == nullptr) {
         BCryptDestroyKey(k);
         return nullptr;
     }
-    s->kind = kind;
     s->key = k;
     return s;
+}
+
+/// \~english A ChaCha20 State holding a copy of @p key.
+/// \~spanish Un State de ChaCha20 con una copia de @p key.  \~
+State *new_chacha_state(State::Kind kind, const uint8_t *key) noexcept {
+    State *s = alloc_state(kind);
+    if (s == nullptr) return nullptr;
+    util::vesta_memcpy(s->chacha_key, key, chacha::kKeySize);
+    return s;
+}
+
+/// \~english Overwrites key bytes so that the optimizer cannot drop it.
+/// \~spanish Sobrescribe bytes de clave de forma que el optimizador no lo pueda quitar.  \~
+void wipe(void *p, size_t n) noexcept {
+    util::vesta_memset_noinline(p, 0, n);
+#if defined(__GNUC__)
+    __asm__ __volatile__("" : : "r"(p) : "memory");
+#endif
 }
 
 /// \~english Opens @p id, optionally with a chaining mode; null if the system refuses.
@@ -167,7 +209,10 @@ const char *CngCrypto::name() const noexcept {
 }
 
 bool CngCrypto::supports(quic::Aead a) const noexcept {
-    return ready() && a != quic::Aead::ChaCha20Poly1305;
+    // \~english ChaCha20 comes from `providers/common`, not from the system.
+    // \~spanish ChaCha20 sale de `providers/common`, no del sistema.  \~
+    (void)a;
+    return ready();
 }
 
 bool CngCrypto::extract(quic::Hash h, const uint8_t *salt, size_t salt_len,
@@ -247,19 +292,23 @@ bool CngCrypto::expand(quic::Hash h, const uint8_t *prk, size_t prk_len,
 
 void *CngCrypto::prepare_aead(quic::Aead a, const uint8_t *key) noexcept {
     if (!supports(a)) return nullptr;
+    if (a == quic::Aead::ChaCha20Poly1305) return new_chacha_state(State::AeadChaCha, key);
     return new_state(State::Aead, gcm_, key, quic::key_size(a));
 }
 
 void *CngCrypto::prepare_hp(quic::Aead a, const uint8_t *key) noexcept {
     if (!supports(a)) return nullptr;
+    if (a == quic::Aead::ChaCha20Poly1305) return new_chacha_state(State::HpChaCha, key);
     return new_state(State::HpAes, ecb_, key, quic::key_size(a));
 }
 
 void CngCrypto::forget(void *state) noexcept {
     State *s = static_cast<State *>(state);
     if (s == nullptr) return;
-    // \~english Destroying the key also wipes it.  \~spanish Destruir la clave tambien la borra.  \~
-    BCryptDestroyKey(s->key);
+    // \~english Destroying a system key also wipes it; our own bytes we wipe.
+    // \~spanish Destruir una clave del sistema tambien la borra; los bytes propios los borramos.  \~
+    if (s->key != nullptr) BCryptDestroyKey(s->key);
+    wipe(s->chacha_key, sizeof s->chacha_key);
     util::host_free(s);
 }
 
@@ -267,7 +316,12 @@ bool CngCrypto::seal(void *aead, const uint8_t *nonce, const uint8_t *ad,
                      size_t ad_len, const uint8_t *in, size_t n,
                      uint8_t *out) noexcept {
     State *s = static_cast<State *>(aead);
-    if (s == nullptr || s->kind != State::Aead) return false;
+    if (s == nullptr) return false;
+    if (s->kind == State::AeadChaCha) {
+        chacha::seal(s->chacha_key, nonce, ad, ad_len, in, n, out);
+        return true;
+    }
+    if (s->kind != State::Aead) return false;
     if (n > ULONG_MAX || ad_len > ULONG_MAX) return false;
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
@@ -293,7 +347,12 @@ quic::OpenResult CngCrypto::open(void *aead, const uint8_t *nonce,
                                  const uint8_t *in, size_t n,
                                  uint8_t *out) noexcept {
     State *s = static_cast<State *>(aead);
-    if (s == nullptr || s->kind != State::Aead) return quic::OpenResult::Failed;
+    if (s == nullptr) return quic::OpenResult::Failed;
+    if (s->kind == State::AeadChaCha)
+        return chacha::open(s->chacha_key, nonce, ad, ad_len, in, n, out)
+                   ? quic::OpenResult::Ok
+                   : quic::OpenResult::Forged;
+    if (s->kind != State::Aead) return quic::OpenResult::Failed;
     if (n > ULONG_MAX || ad_len > ULONG_MAX) return quic::OpenResult::Failed;
     if (n < quic::kTagSize) return quic::OpenResult::Forged;
 
@@ -327,7 +386,29 @@ quic::OpenResult CngCrypto::open(void *aead, const uint8_t *nonce,
 
 bool CngCrypto::mask(void *hp, const uint8_t *sample, uint8_t *out) noexcept {
     State *s = static_cast<State *>(hp);
-    if (s == nullptr || s->kind != State::HpAes) return false;
+    if (s == nullptr) return false;
+
+    if (s->kind == State::HpChaCha) {
+        /* \~english
+         * RFC 9001, 5.4.4: counter = the sample's first four bytes read
+         * little-endian, nonce = its other twelve; the mask is the first five
+         * bytes of that block's keystream.
+         * \~spanish
+         * RFC 9001, 5.4.4: contador = los cuatro primeros bytes de la muestra
+         * leidos en orden inverso, nonce = los otros doce; la mascara son los
+         * cinco primeros bytes del flujo de ese bloque.
+         * \~ */
+        const uint32_t counter = static_cast<uint32_t>(sample[0]) |
+                                 (static_cast<uint32_t>(sample[1]) << 8) |
+                                 (static_cast<uint32_t>(sample[2]) << 16) |
+                                 (static_cast<uint32_t>(sample[3]) << 24);
+        uint8_t ks[chacha::kBlockSize];
+        chacha::block(s->chacha_key, counter, sample + 4, ks);
+        util::vesta_memcpy(out, ks, quic::kMaskSize);
+        wipe(ks, sizeof ks);
+        return true;
+    }
+    if (s->kind != State::HpAes) return false;
 
     // \~english One AES block, ECB, no padding: the first five bytes are the mask.
     // \~spanish Un bloque AES, ECB, sin relleno: los cinco primeros bytes son la mascara.  \~
