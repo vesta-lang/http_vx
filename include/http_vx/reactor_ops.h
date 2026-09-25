@@ -180,6 +180,53 @@ struct Op {
      */
     uint32_t offset = 0;
     uint32_t length = 0;
+
+    /**
+     * \~english
+     * Which socket.
+     *
+     * The operation names it, rather than the backend working it out from
+     * @c conn, and that is what keeps a backend from needing a connection
+     * table.  A backend that had one would be a second place where a slot's
+     * life is tracked, and the two would disagree exactly once -- on the
+     * completion that arrives after its connection has gone, which is the case
+     * the whole handle design exists for.
+     *
+     * Two operations have no connection to be worked out from anyway, which is
+     * the same answer arriving from the other side:
+     *
+     *  - an @c Accept has no connection yet -- producing one is the point of it
+     *    -- so this is where the socket it produced comes back;
+     *  - a @c Close of a socket that was never adopted.  A shard that accepts
+     *    while its table is full has a socket in its hand and nowhere to put
+     *    it, and the only wrong answer is to drop it: an unclosed socket is a
+     *    descriptor leaked on every accept a busy server refuses, which ends
+     *    with a server that cannot accept anything and no memory missing.
+     *
+     * \~spanish
+     * Que socket.
+     *
+     * Lo nombra la operacion, en vez de que el backend lo saque de @c conn, y eso
+     * es lo que evita que un backend necesite una tabla de conexiones.  Uno que
+     * la tuviera seria un segundo sitio donde se lleva la vida de una casilla, y
+     * los dos discreparian exactamente una vez -- en la finalizacion que llega
+     * despues de que su conexion se haya ido, que es el caso para el que existe
+     * todo el diseno de las referencias.
+     *
+     * Dos operaciones no tienen ademas ninguna conexion de la que sacarlo, que es
+     * la misma respuesta llegando por el otro lado:
+     *
+     *  - un @c Accept no tiene conexion todavia -- producir una es para lo que
+     *    esta -- asi que aqui es donde vuelve el socket que produjo;
+     *  - un @c Close de un socket que no llego a adoptarse.  Un fragmento que
+     *    acepta con la tabla llena tiene un socket en la mano y ningun sitio
+     *    donde ponerlo, y la unica respuesta equivocada es soltarlo: un socket
+     *    sin cerrar es un descriptor perdido en cada aceptacion que rechaza un
+     *    servidor con trabajo, y eso acaba en un servidor que no puede aceptar
+     *    nada sin que falte memoria.
+     * \~
+     */
+    int32_t fd = -1;
 };
 
 /**
@@ -229,6 +276,28 @@ struct Completion {
      * \~
      */
     int32_t result = 0;
+
+    /**
+     * \~english
+     * The socket an @c Accept produced, and @c -1 on anything else.
+     *
+     * A separate field from @c result rather than the socket returned as the
+     * "count", because they are different things and a reader cannot tell them
+     * apart afterwards: a count is a number of bytes and a socket is a name,
+     * and code that treated one as the other would work perfectly until the
+     * day a descriptor came back as zero.
+     *
+     * \~spanish
+     * El socket que produjo un @c Accept, y @c -1 en cualquier otra cosa.
+     *
+     * Un campo aparte de @c result y no el socket devuelto como si fuera la
+     * "cuenta", porque son cosas distintas y despues no se distinguen: una
+     * cuenta es un numero de bytes y un socket es un nombre, y un codigo que
+     * tratara uno por el otro funcionaria perfectamente hasta el dia en que
+     * volviera un descriptor que fuera cero.
+     * \~
+     */
+    int32_t fd = -1;
 
     /// \~english Whether it worked.  \~spanish Si funciono.  \~
     bool ok() const noexcept { return result >= 0; }

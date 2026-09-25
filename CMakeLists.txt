@@ -170,6 +170,31 @@ target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
 
 # ---------------------------------------------------------------------------
+# El primer backend con un sistema operativo dentro.  Va en su propia libreria
+# y no en `http_vx_core` por la R6: lo que hay en `core/` y en `proto/` no
+# incluye ni una cabecera del sistema, y eso es lo que permite darles bytes
+# torcidos desde una prueba corriente sin abrir ningun puerto.  Este SI abre
+# uno, asi que vive aparte y lo enlaza quien lo quiera.
+#
+# Y va por plataforma, no por opcion: un objetivo de IOCP en Linux no es una
+# caracteristica apagada, es un fichero que no compila.  Cuando llegue io_uring
+# entrara aqui al lado con la condicion contraria.
+# ---------------------------------------------------------------------------
+if (WIN32)
+    add_library(http_vx_windows STATIC windows/iocp_backend.cpp)
+    target_include_directories(http_vx_windows
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+    target_compile_options(http_vx_windows PRIVATE -Wall -Wextra -pedantic-errors)
+
+    # `ws2_32` es Winsock y `mswsock` es donde vive de verdad `AcceptEx`.  Se
+    # enlazan PUBLIC porque quien use este backend acaba llamando a los dos sin
+    # nombrarlos.
+    target_link_libraries(http_vx_windows
+            PUBLIC http_vx_core vesta_alloc ws2_32 mswsock)
+endif ()
+
+# ---------------------------------------------------------------------------
 # Las medidas.  El README dice que no son opcionales y tiene razon por dos
 # lados: un servidor que promete un millon de conexiones tiene que poder ensenar
 # cuanto ocupa cada una, y uno que promete velocidad tiene que poder ensenar
@@ -230,6 +255,16 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_status tests/test_status.cpp)
     http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
     http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
+
+    # La unica prueba que abre un puerto, y por eso enlaza lo que las demas no.
+    # Lo que comprueba son las cosas en las que un backend sin sistema operativo
+    # dentro NO PUEDE equivocarse -- perder un socket, no atarse, devolver una
+    # referencia de otro puerto de finalizacion --, asi que no sustituye a
+    # ninguna: se anade a ellas.
+    if (WIN32)
+        http_vx_add_test(test_iocp_backend tests/test_iocp_backend.cpp)
+        target_link_libraries(test_iocp_backend PRIVATE http_vx_windows)
+    endif ()
 endif ()
 
 # ---------------------------------------------------------------------------

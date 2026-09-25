@@ -66,5 +66,6 @@ vez la hay tendra que salir de correr al rival con este mismo fichero.
   lectura nombra el buffer.  A 16 KB y un millon son 16 GB, que es justo lo que
   la R1 existe para evitar.  Lo arregla la lectura de longitud cero -- la
   recepcion de cero bytes de IOCP, los buffers provistos de io_uring --, que
-  acaba cuando hay algo y solo entonces coge buffer.  Ninguno de los dos
-  backends esta escrito, asi que el numero sale como esta.
+  acaba cuando hay algo y solo entonces coge buffer.  El backend de IOCP ya
+  esta escrito y la lectura de longitud cero NO, asi que el numero sale como
+  esta.

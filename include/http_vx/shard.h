@@ -289,6 +289,44 @@ struct ShardConfig {
     /// \~english How many completions to take at once.
     /// \~spanish Cuantas finalizaciones coger de una vez.  \~
     size_t batch = 64;
+
+    /**
+     * \~english
+     * How many accepts this shard keeps outstanding, and zero means it does
+     * not accept at all.
+     *
+     * More than one because accepting is a completion like any other: with a
+     * single one posted, every connection that arrives while the previous
+     * accept is being dealt with waits in the kernel's backlog for a round of
+     * the loop.  Several posted means several arrive at once, which is what
+     * happens when a server is under load and is the only time it matters.
+     *
+     * **Zero is the default and it is not a disabled feature.**  R5 says
+     * accepting is spread across shards, and how it is spread is the platform's
+     * answer rather than this one's: one listening socket per shard where the
+     * system distributes them, or one shard accepting and handing sockets to
+     * the others where it does not.  A shard that accepted by default would
+     * make the first arrangement the only one anybody ever wrote.
+     *
+     * \~spanish
+     * Cuantas aceptaciones mantiene pendientes este fragmento, y cero quiere
+     * decir que no acepta nada.
+     *
+     * Mas de una porque aceptar es una finalizacion como cualquier otra: con una
+     * sola puesta, cada conexion que llegue mientras se atiende la anterior
+     * espera una vuelta del bucle en la cola del nucleo.  Varias puestas quiere
+     * decir que llegan varias a la vez, que es lo que pasa cuando un servidor
+     * tiene trabajo y es la unica vez que importa.
+     *
+     * **Cero es el valor por defecto y no es una funcion apagada.**  La R5 dice
+     * que aceptar se reparte entre fragmentos, y COMO se reparte es la respuesta
+     * de la plataforma y no de esto: un socket de escucha por fragmento donde el
+     * sistema los reparte, o un fragmento aceptando y pasandoles los sockets a
+     * los demas donde no.  Un fragmento que aceptara por defecto haria que el
+     * primer arreglo fuera el unico que escribiera nadie.
+     * \~
+     */
+    uint32_t accepts = 0;
 };
 
 /**
@@ -435,6 +473,37 @@ class Shard {
 
     void on_read(const Completion &done) noexcept;
     void on_write(const Completion &done) noexcept;
+
+    /**
+     * @brief
+     * \~english Takes a connection the operating system handed over.
+     * \~spanish Coge una conexion que entrego el sistema operativo.
+     * \~
+     *
+     * \~english
+     * And asks for another accept, always -- whether this one worked, whether
+     * the table had room, whether the socket had to be closed again.  An accept
+     * that is not replaced is a listening socket that has quietly stopped
+     * listening, and the server goes on looking perfectly healthy: the
+     * connections it already had carry on being served while nothing new ever
+     * arrives.
+     *
+     * \~spanish
+     * Y pide otra aceptacion, siempre -- funcionara o no, hubiera sitio en la
+     * tabla o no, hubiera que volver a cerrar el socket o no --.  Una aceptacion
+     * que no se repone es un socket de escucha que ha dejado de escuchar por lo
+     * bajo, y el servidor sigue pareciendo perfectamente sano: las conexiones que
+     * ya tenia se siguen sirviendo mientras no llega ninguna nueva.
+     * \~
+     *
+     * @param done \~english what came back  \~spanish lo que volvio  \~
+     * @param now  \~english what tick it is  \~spanish en que tic se esta  \~
+     */
+    void on_accept(const Completion &done, uint64_t now) noexcept;
+
+    /// \~english Asks for one more connection.
+    /// \~spanish Pide una conexion mas.  \~
+    void want_accept() noexcept;
 
     ConnTable conns_;
     BufferPool pool_;

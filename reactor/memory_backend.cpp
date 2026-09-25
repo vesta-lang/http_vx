@@ -21,6 +21,14 @@ namespace http_vx {
 
 Backend::~Backend() = default;
 
+bool MemoryBackend::arrive(int32_t fd) noexcept {
+    if (arrivals_count_ == 16) return false;
+
+    arrivals_[(arrivals_head_ + arrivals_count_) % 16] = fd;
+    ++arrivals_count_;
+    return true;
+}
+
 bool MemoryBackend::feed(const uint8_t *p, size_t n) noexcept {
     /* \~english
      * What has been read is forgotten before more is added.  Without this the
@@ -82,7 +90,32 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
 
     switch (op.kind) {
     case OpKind::Accept:
+        /* \~english
+         * The socket that arrived, taken in the order they arrived in.  The
+         * count is not checked here because @c wait already decided this
+         * operation was ready, and it decided it by looking at exactly this.
+         * \~spanish
+         * El socket que llego, cogido en el orden en que llegaron.  Aqui no se
+         * comprueba la cuenta porque @c wait ya decidio que esta operacion estaba
+         * lista, y lo decidio mirando justo esto.
+         * \~ */
+        c.fd = arrivals_[arrivals_head_];
+        arrivals_head_ = (arrivals_head_ + 1) % 16;
+        --arrivals_count_;
+        c.result = 0;
+        return c;
+
     case OpKind::Close:
+        /* \~english
+         * Counted rather than done, because there is no socket to close: what
+         * a test needs to be able to see is that the shard ASKED, which is the
+         * difference between a refused connection and a leaked descriptor.
+         * \~spanish
+         * Se cuenta en vez de hacerse, porque no hay ningun socket que cerrar: lo
+         * que una prueba tiene que poder ver es que el fragmento lo PIDIO, que es
+         * la diferencia entre una conexion rechazada y un descriptor perdido.
+         * \~ */
+        ++closed_;
         c.result = 0;
         return c;
 
@@ -247,8 +280,24 @@ size_t MemoryBackend::wait(Completion *out, size_t cap,
 
         const bool is_read =
             op.kind == OpKind::Recv || op.kind == OpKind::RecvFrom;
-        const bool ready =
-            !is_read || in_read_ < in_len_ || ended_ || failures_ != 0;
+
+        /* \~english
+         * An accept waits for a connection the way a read waits for bytes, and
+         * for the same reason: neither is something this end can make happen.
+         * Finishing one that nobody arrived for would be a backend inventing a
+         * client, and the loop above it would spin accepting nothing.
+         * \~spanish
+         * Una aceptacion espera una conexion igual que una lectura espera bytes, y
+         * por lo mismo: ninguna de las dos es algo que pueda provocar este
+         * extremo.  Acabar una a la que no llego nadie seria un backend
+         * inventandose un cliente, y el bucle de encima daria vueltas aceptando
+         * nada.
+         * \~ */
+        const bool waiting = is_read ? in_read_ >= in_len_ && !ended_
+                                     : op.kind == OpKind::Accept &&
+                                           arrivals_count_ == 0;
+
+        const bool ready = !waiting || failures_ != 0;
 
         if (made < cap && ready) {
             out[made] = finish(op);

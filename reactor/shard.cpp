@@ -66,7 +66,77 @@ bool Shard::reset(const ShardConfig &cfg, Backend &io, Service &service,
      * \~ */
     if (cfg.idle_ticks == 0 || cfg.idle_ticks > wheel_.horizon()) return false;
 
+    /* \~english
+     * And the accepts are posted, which is what makes a shard start listening.
+     * They go LAST, after everything a connection will need exists: an accept
+     * posted before the connection table is made could be completed by the
+     * operating system before this function returns, and the answer to a
+     * connection arriving is not allowed to be "in a moment".
+     * \~spanish
+     * Y se ponen las aceptaciones, que es lo que hace que un fragmento empiece a
+     * escuchar.  Van AL FINAL, cuando ya existe todo lo que va a necesitar una
+     * conexion: una aceptacion puesta antes de hacer la tabla de conexiones
+     * podria acabarla el sistema operativo antes de que volviera esta funcion, y
+     * la respuesta a una conexion que llega no puede ser "un momento".
+     * \~ */
+    for (uint32_t i = 0; i < cfg_.accepts; ++i) want_accept();
+
     return true;
+}
+
+void Shard::want_accept() noexcept {
+    if (io_ == nullptr) return;
+
+    Op op;
+    op.kind = OpKind::Accept;
+    op.buffer = kNoBuffer;
+
+    /* \~english
+     * A submission that is refused is the queue being full, and the accept is
+     * NOT retried here.  It will be posted again by the next accept that
+     * completes, and if there is no such accept then this shard never accepted
+     * anything -- which is a configuration that could not work and shows up as
+     * a port nobody answers on, rather than as a loop spinning on a full queue.
+     * \~spanish
+     * Una entrega rechazada es la cola llena, y la aceptacion NO se reintenta
+     * aqui.  La volvera a poner la aceptacion siguiente que acabe, y si no hay
+     * ninguna es que este fragmento no acepto nada nunca -- que es una
+     * configuracion que no podia funcionar y se ve como un puerto en el que no
+     * contesta nadie, en vez de como un bucle dando vueltas sobre una cola llena.
+     * \~ */
+    io_->submit(op);
+}
+
+void Shard::on_accept(const Completion &done, uint64_t now) noexcept {
+    want_accept();
+
+    if (!done.ok() || done.fd < 0) return;
+
+    /* \~english
+     * A socket that does not fit is closed, and closing it is the whole point
+     * of doing this here.  The shard is full -- which is what R1 and the pools
+     * are sized for, and is a state a server is meant to survive -- but a
+     * socket that was accepted and then dropped is a descriptor leaked on every
+     * refused connection.  A server under load would run out of descriptors and
+     * stop accepting for good, with no memory missing and nothing to point at.
+     *
+     * \~spanish
+     * Un socket que no cabe se cierra, y cerrarlo es para lo que esta esto aqui.
+     * El fragmento esta lleno -- que es para lo que estan dimensionados la R1 y
+     * los pozos, y es un estado al que un servidor tiene que sobrevivir -- pero
+     * un socket aceptado y luego soltado es un descriptor perdido en cada
+     * conexion rechazada.  Un servidor con trabajo se quedaria sin descriptores y
+     * dejaria de aceptar para siempre, sin que falte memoria y sin nada a lo que
+     * senalar.
+     * \~ */
+    const ConnHandle c = adopt(done.fd, now);
+    if (c.valid()) return;
+
+    Op shut;
+    shut.kind = OpKind::Close;
+    shut.buffer = kNoBuffer;
+    shut.fd = done.fd;
+    io_->submit(shut);
 }
 
 void Shard::release() noexcept {
@@ -110,6 +180,44 @@ void Shard::let_go(ConnHandle c, ConnHot &h) noexcept {
     drop_queue(h);
     wheel_.cancel(c.slot);
     service_->on_close(c);
+
+    /* \~english
+     * And the socket is shut.  It is asked for as an operation and not done
+     * here, because on a completion interface closing has to be ORDERED with
+     * the rest: a socket closed while a read is still in the kernel is asking
+     * about memory the kernel is about to write to.  What makes it safe at this
+     * point is that @c leave_if_done let it get here, and that check is
+     * precisely "nothing outstanding".
+     *
+     * It goes before the slot is given back, because the slot is where the
+     * socket's number lives -- and a table that had already forgotten it would
+     * leave nothing to close.  That is how this was missing: with a backend
+     * that has no operating system in it there is no socket to leak, so a shard
+     * that never closed one passed every test there was.
+     *
+     * \~spanish
+     * Y el socket se cierra.  Se pide como operacion y no se hace aqui porque en
+     * una interfaz por finalizacion cerrar tiene que ORDENARSE con lo demas: un
+     * socket cerrado con una lectura todavia en el nucleo es preguntar por una
+     * memoria en la que el nucleo esta a punto de escribir.  Lo que lo hace seguro
+     * en este punto es que @c leave_if_done dejo llegar hasta aqui, y esa
+     * comprobacion es justamente "no queda nada pendiente".
+     *
+     * Va antes de devolver la casilla, porque la casilla es donde vive el numero
+     * del socket -- y una tabla que ya lo hubiera olvidado no dejaria nada que
+     * cerrar --.  Asi es como faltaba esto: con un backend sin ningun sistema
+     * operativo dentro no hay ningun socket que perder, asi que un fragmento que
+     * no cerrara ninguno pasaba todas las pruebas que habia.
+     * \~ */
+    if (io_ != nullptr && h.fd >= 0) {
+        Op shut;
+        shut.conn = c;
+        shut.kind = OpKind::Close;
+        shut.buffer = kNoBuffer;
+        shut.fd = h.fd;
+        io_->submit(shut);
+    }
+
     conns_.close(c);
 }
 
@@ -216,6 +324,7 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     op.buffer = b;
     op.offset = 0;
     op.length = cfg_.read_size;
+    op.fd = h.fd;
 
     if (!io_->submit(op)) {
         /* \~english
@@ -259,6 +368,7 @@ bool Shard::want_write(ConnHandle c, ConnHot &h, uint32_t buf) noexcept {
         op.buffer = buf;
         op.offset = 0;
         op.length = static_cast<uint32_t>(out->size());
+        op.fd = h.fd;
 
         if (!io_->submit(op)) return false;
 
@@ -300,6 +410,7 @@ void Shard::send_next(ConnHandle c, ConnHot &h) noexcept {
     op.buffer = buf;
     op.offset = 0;
     op.length = static_cast<uint32_t>(out->size());
+    op.fd = h.fd;
 
     if (!io_->submit(op)) {
         pool_.release(buf);
@@ -618,6 +729,7 @@ void Shard::on_write(const Completion &done) noexcept {
         op.buffer = done.buffer;
         op.offset = 0;
         op.length = static_cast<uint32_t>(out->size());
+        op.fd = h->fd;
 
         if (!io_->submit(op)) {
             pool_.release(done.buffer);
@@ -656,7 +768,6 @@ void Shard::on_write(const Completion &done) noexcept {
 }
 
 size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
-    (void)now;
     if (io_ == nullptr) return 0;
 
     Completion done[64];
@@ -678,6 +789,9 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
 
         case OpKind::Accept:
+            on_accept(done[i], now);
+            break;
+
         case OpKind::Close:
             break;
         }

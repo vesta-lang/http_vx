@@ -161,15 +161,140 @@ struct Rig {
 
     Rig() : io(shard.buffers()) {}
 
-    bool start(uint32_t buffers, uint32_t idle) {
+    bool start(uint32_t buffers, uint32_t idle, uint32_t accepts = 0,
+               uint32_t connections = 8) {
         ShardConfig cfg;
-        cfg.connections = 8;
+        cfg.connections = connections;
         cfg.buffers = buffers;
         cfg.idle_ticks = idle;
         cfg.wheel_slots = 64;
+        cfg.accepts = accepts;
         return shard.reset(cfg, io, service, 0);
     }
 };
+
+/**
+ * @brief
+ * \~english A connection that arrives is taken and served.
+ * \~spanish Una conexion que llega se coge y se sirve.
+ * \~
+ *
+ * \~english
+ * Accepting is a completion like any other, which is the whole point: the loop
+ * does not call `accept` and wait, it asks for the next connection and is told
+ * when there is one.  What this checks is that the socket the operating system
+ * handed over ends up in the table with nobody outside having been asked.
+ *
+ * \~spanish
+ * Aceptar es una finalizacion como cualquier otra, que es de lo que se trata: el
+ * bucle no llama a `accept` y espera, pide la conexion siguiente y le avisan
+ * cuando hay una.  Lo que se comprueba aqui es que el socket que entrego el
+ * sistema operativo acaba en la tabla sin haberle preguntado a nadie de fuera.
+ * \~
+ */
+void test_a_connection_that_arrives_is_taken() {
+    Rig r;
+    check(r.start(4, 10, 1), "the shard would not start");
+
+    check(r.shard.conns().count() == 0, "there was a connection before any came");
+
+    check(r.io.arrive(11), "the arrival would not fit");
+    r.shard.poll(1, 0);
+
+    check(r.shard.conns().count() == 1, "the connection that arrived was not taken");
+
+    /* \~english
+     * And it is a connection like any other from here on: bytes for it are
+     * read and answered without anybody adopting anything by hand.
+     * \~spanish
+     * Y a partir de aqui es una conexion como cualquier otra: sus bytes se leen y
+     * se contestan sin que nadie adopte nada a mano.
+     * \~ */
+    r.io.feed(reinterpret_cast<const uint8_t *>("hello"), 5);
+    for (int i = 0; i < 8; ++i) r.shard.poll(2, 0);
+
+    check(r.service.seen == 5, "the connection that arrived was never read");
+    check(r.io.written_size() == 5, "it was never answered");
+}
+
+/**
+ * @brief
+ * \~english Taking one connection asks for the next.
+ * \~spanish Coger una conexion pide la siguiente.
+ * \~
+ *
+ * \~english
+ * An accept that is not replaced is a listening socket that has quietly
+ * stopped listening, and it is the worst shape of failure there is: the
+ * connections the server already had go on being served perfectly, so
+ * everything looks healthy, while nothing new ever arrives again.
+ *
+ * \~spanish
+ * Una aceptacion que no se repone es un socket de escucha que ha dejado de
+ * escuchar por lo bajo, y es el peor modo de fallo que hay: las conexiones que
+ * el servidor ya tenia se siguen sirviendo perfectamente, asi que todo parece
+ * sano, mientras no vuelve a llegar ninguna nueva.
+ * \~
+ */
+void test_accepting_asks_for_another() {
+    Rig r;
+    check(r.start(4, 10, 1), "the shard would not start");
+
+    for (int32_t fd = 11; fd < 16; ++fd) {
+        check(r.io.arrive(fd), "the arrival would not fit");
+        r.shard.poll(1, 0);
+    }
+
+    check(r.shard.conns().count() == 5,
+          "the shard stopped accepting after the first");
+}
+
+/**
+ * @brief
+ * \~english A connection that does not fit is closed, not dropped.
+ * \~spanish Una conexion que no cabe se cierra, no se suelta.
+ * \~
+ *
+ * \~english
+ * A shard at its limit is a state a server is meant to survive -- the pools are
+ * sized for it on purpose -- but a socket accepted and then forgotten is a
+ * descriptor leaked on every refused connection.  Under load the server runs
+ * out of descriptors and stops accepting for good, with no memory missing and
+ * nothing to point at.
+ *
+ * \~spanish
+ * Un fragmento en su limite es un estado al que un servidor tiene que sobrevivir
+ * -- los pozos estan dimensionados para eso a proposito -- pero un socket
+ * aceptado y luego olvidado es un descriptor perdido en cada conexion rechazada.
+ * Con trabajo, el servidor se queda sin descriptores y deja de aceptar para
+ * siempre, sin que falte memoria y sin nada a lo que senalar.
+ * \~
+ */
+void test_a_connection_that_does_not_fit_is_closed() {
+    Rig r;
+    check(r.start(4, 10, 1, 2), "the shard would not start");
+
+    for (int32_t fd = 11; fd < 15; ++fd) {
+        check(r.io.arrive(fd), "the arrival would not fit");
+        r.shard.poll(1, 0);
+    }
+
+    /* \~english
+     * One more turn, because closing is an operation and not a call: the shard
+     * ASKS for the socket to be shut and is told later, exactly like a read.
+     * The last refusal's close is still on its way when the arrivals stop.
+     * \~spanish
+     * Una vuelta mas, porque cerrar es una operacion y no una llamada: el
+     * fragmento PIDE que se cierre el socket y se lo dicen despues, igual que una
+     * lectura.  El cierre del ultimo rechazo sigue de camino cuando se acaban las
+     * llegadas.
+     * \~ */
+    r.shard.poll(1, 0);
+
+    check(r.shard.conns().count() == 2, "the table took more than it holds");
+    check(r.io.closed() == 2,
+          "the sockets that did not fit were dropped instead of closed");
+}
 
 /**
  * @brief
@@ -758,6 +883,9 @@ void test_half_a_message_waits_for_the_rest() {
 } // namespace
 
 int main() {
+    test_a_connection_that_arrives_is_taken();
+    test_accepting_asks_for_another();
+    test_a_connection_that_does_not_fit_is_closed();
     test_half_a_message_waits_for_the_rest();
     test_both_directions_at_once();
     test_an_idle_connection_holds_no_buffer();

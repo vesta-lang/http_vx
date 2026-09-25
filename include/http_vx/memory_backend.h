@@ -139,6 +139,45 @@ class MemoryBackend final : public Backend {
 
     /**
      * @brief
+     * \~english Says a connection has arrived, and that it is @p fd.
+     * \~spanish Dice que ha llegado una conexion, y que es @p fd.
+     * \~
+     *
+     * \~english
+     * What a listening socket does, in other words.  Until one arrives an
+     * accept stays outstanding, which is the state a listening server is in
+     * almost all of the time and the one a test would otherwise have no way to
+     * be in: an accept that completed the moment it was asked for would make
+     * every loop spin, and make the case that matters -- nobody is connecting
+     * -- the case nothing ever runs.
+     *
+     * The number is the test's to choose, because a socket is a name and this
+     * backend does not have an operating system to get one from.
+     *
+     * \~spanish
+     * Lo que hace un socket de escucha, dicho de otra forma.  Hasta que llega una,
+     * una aceptacion sigue pendiente, que es el estado en el que esta un servidor
+     * a la escucha casi todo el tiempo y en el que una prueba no podria ponerse de
+     * otra forma: una aceptacion que acabara en cuanto se pide haria dar vueltas a
+     * cualquier bucle, y haria que el caso que importa -- que no se conecte nadie
+     * -- fuera el caso que no corre nunca.
+     *
+     * El numero lo elige la prueba, porque un socket es un nombre y este backend
+     * no tiene ningun sistema operativo del que sacar uno.
+     *
+     * \~
+     * @param fd \~english the socket  \~spanish el socket  \~
+     * @return   \~english false if there was no room to remember it
+     *           \~spanish false si no habia sitio para recordarla  \~
+     */
+    bool arrive(int32_t fd) noexcept;
+
+    /// \~english How many sockets this backend was told to close.
+    /// \~spanish Cuantos sockets se le dijo a este backend que cerrara.  \~
+    size_t closed() const noexcept { return closed_; }
+
+    /**
+     * @brief
      * \~english Says the peer has closed its end.
      * \~spanish Dice que el otro extremo ha cerrado su lado.
      * \~
@@ -255,6 +294,25 @@ class MemoryBackend final : public Backend {
 
     uint8_t out_[65536];
     size_t out_len_ = 0;
+
+    /**
+     * \~english
+     * The connections waiting to be accepted.  A handful, because this is for
+     * arranging cases: what it has to be able to hold is several arriving
+     * before the loop looks, which is what tells a shard with more than one
+     * accept posted apart from one with a single one.
+     * \~spanish
+     * Las conexiones esperando a que las acepten.  Unas pocas, porque esto es
+     * para preparar casos: lo que tiene que poder guardar son varias llegando
+     * antes de que mire el bucle, que es lo que distingue un fragmento con varias
+     * aceptaciones puestas de uno con una sola.
+     * \~
+     */
+    int32_t arrivals_[16] = {};
+    size_t arrivals_head_ = 0;
+    size_t arrivals_count_ = 0;
+
+    size_t closed_ = 0;
 
     uint32_t failures_ = 0;
     int32_t failure_ = -1;
