@@ -322,9 +322,18 @@ struct DropCounts {
     /// \~english A Retry that came too late, repeated, empty, or naming the ID it answers (17.2.5.2).
     /// \~spanish Un Retry que llego tarde, repetido, vacio, o con el identificador al que contesta (17.2.5.2).  \~
     uint64_t retry = 0;
-    /// \~english A long header whose source ID is not the one the server first gave (7.2).
-    /// \~spanish Una cabecera larga cuyo identificador de origen no es el que dio primero el servidor (7.2).  \~
+    /// \~english A long header whose source ID is not the one the peer first gave (7.2).
+    /// \~spanish Una cabecera larga cuyo identificador de origen no es el que dio primero el otro (7.2).  \~
     uint64_t changed_source = 0;
+    /// \~english A long header of another version than the one this connection uses (5.2.1).
+    /// \~spanish Una cabecera larga de otra version que la que usa esta conexion (5.2.1).  \~
+    uint64_t wrong_version = 0;
+    /// \~english A server's Initial in a datagram under 1200 bytes (14.1).
+    /// \~spanish Un Initial en un datagrama de menos de 1200 bytes, en el servidor (14.1).  \~
+    uint64_t small_initial = 0;
+    /// \~english An Initial from a server carrying a token (17.2.2).
+    /// \~spanish Un Initial de un servidor que lleva testigo (17.2.2).  \~
+    uint64_t initial_with_token = 0;
 };
 
 /**
@@ -801,6 +810,9 @@ private:
     /// \~spanish El identificador de destino del paquete que se procesa: RETIRE_CONNECTION_ID no puede nombrarlo.  \~
     const uint8_t *packet_dcid_ = nullptr;
     size_t packet_dcid_len_ = 0;
+    /// \~english The size of the datagram being processed: an Initial in a small one is dropped (14.1).
+    /// \~spanish El tamano del datagrama que se procesa: un Initial en uno pequeno se tira (14.1).  \~
+    size_t datagram_len_ = 0;
     bool closed_by_reset_ = false;
     CidCounts cid_counts_;
 

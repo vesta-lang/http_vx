@@ -64,6 +64,7 @@
 #include "http_vx/quic_connection.h"
 #include "http_vx/quic_frame.h"
 #include "http_vx/quic_protection.h"
+#include "http_vx/quic_varint.h"
 
 #include "fake_crypto.h"
 
@@ -1191,6 +1192,112 @@ void test_retry_rules(Crypto &cr) {
     }
 }
 
+/**
+ * @brief
+ * \~english An Initial sealed by hand: PING and PADDING up to @p total bytes.
+ * \~spanish Un Initial sellado a mano: PING y PADDING hasta @p total bytes.
+ * \~
+ *
+ * \~english Keys from @p key_dcid, as the one who sends it (@p from_server) would derive them.
+ * \~spanish Claves de @p key_dcid, como las derivaria quien lo manda (@p from_server).  \~
+ */
+size_t craft_initial(Crypto &cr, bool from_server, const uint8_t *key_dcid, const uint8_t *dcid,
+                     const uint8_t *scid, const uint8_t *token, size_t token_len, uint64_t pn,
+                     size_t total, uint8_t *out) {
+    PacketKeys rk, wk;
+    check(make_initial_keys(cr, kVersion1, key_dcid, 8, from_server, rk, wk), "Initial keys");
+    size_t p = 0;
+    out[p++] = 0xc0;
+    p += put_u32(out + p, kVersion1);
+    out[p++] = 8;
+    std::memcpy(out + p, dcid, 8);
+    p += 8;
+    out[p++] = 8;
+    std::memcpy(out + p, scid, 8);
+    p += 8;
+    p += encode_varint(out + p, 8, token_len);
+    if (token_len) std::memcpy(out + p, token, token_len);
+    p += token_len;
+    const size_t length_at = p;
+    p += 2;
+    const size_t pn_offset = p;
+    const size_t body = total - pn_offset - 1 - kTagSize;
+    std::memset(out + pn_offset + 1, 0, body);
+    out[pn_offset + 1] = 0x01;  // \~english PING  \~spanish PING  \~
+    encode_varint_width(out + length_at, 2, 1 + body + kTagSize);
+    check(protect_packet(cr, wk, out, pn_offset, 1, pn, body) == Protect::Ok, "an Initial could not be sealed");
+    forget_keys(cr, rk);
+    forget_keys(cr, wk);
+    return total;
+}
+
+/**
+ * @brief
+ * \~english What the RFC says of Initials around Version Negotiation and Retry, checked against its text.
+ * \~spanish Lo que dice el RFC de los Initial en torno a Version Negotiation y Retry, contrastado con su texto.
+ * \~
+ */
+void test_initial_rules(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/initial-rules", cr.name());
+    const ConnectionConfig cc = small_client(kVersion1);
+    uint8_t first[1500], pkt[1500];
+    const uint8_t server_cid[8] = {0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57};
+
+    Connection client(cr, cc);
+    const size_t n = start_client(client, cc, first);
+    Acceptor a(cr, acceptor_config(false));
+    std::unique_ptr<Connection> server = admit(cr, a, first, n, 1000);
+    check(server != nullptr, "the acceptor did not admit the client");
+    if (server == nullptr) return;
+
+    // \~english 14.1: a server MUST discard an Initial in a datagram under 1200 bytes -- only then.
+    // \~spanish 14.1: un servidor DEBE descartar un Initial en un datagrama de menos de 1200 bytes -- solo entonces.  \~
+    size_t m = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 5, 1199, pkt);
+    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    check(server->drops().small_initial == 1, "an Initial in a 1199-byte datagram was not dropped");
+    m = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 6, 1200, pkt);
+    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    check(server->drops().small_initial == 1 && server->drops().forged == 0 &&
+              server->state() == ConnState::Active,
+          "an Initial in a 1200-byte datagram was not taken");
+
+    // \~english 7.2: later Initials with another source ID MUST be discarded by the server too.
+    // \~spanish 7.2: los Initial posteriores con otro identificador de origen DEBE descartarlos tambien el servidor.  \~
+    uint8_t other[8];
+    std::memcpy(other, cc.local_cid, 8);
+    other[2] ^= 0x10;
+    m = craft_initial(cr, false, cc.peer_cid, server_cid, other, nullptr, 0, 7, 1200, pkt);
+    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    check(server->drops().changed_source == 1, "a server took an Initial from another source ID");
+
+    // \~english 17.2.2: a server's Initial carries no token; a client MUST discard one that does.
+    // \~spanish 17.2.2: el Initial de un servidor no lleva testigo; un cliente DEBE descartar uno que lo lleve.  \~
+    drive_handshake_server_first(cr, *server);
+    uint8_t reply[1500];
+    const size_t r = server->build_datagram(reply, sizeof reply, 3000);
+    uint8_t copy[1500];
+    std::memcpy(copy, reply, r);
+    client.on_datagram(reply, r, Ecn::NotEct, 4000);
+    const uint8_t token[] = {'t'};
+    m = craft_initial(cr, true, cc.peer_cid, cc.local_cid, server_cid, token, 1, 40, 1200, pkt);
+    client.on_datagram(pkt, m, Ecn::NotEct, 5000);
+    check(client.drops().initial_with_token == 1, "a client took a server Initial carrying a token");
+
+    // \~english 5.2.1: a client MUST discard a packet of another version than it selected.
+    // \~spanish 5.2.1: un cliente DEBE descartar un paquete de otra version que la que eligio.  \~
+    put_u32(copy + 1, kVersion2);
+    client.on_datagram(copy, r, Ecn::NotEct, 5000);
+    check(client.drops().wrong_version >= 1, "a client took a packet of another version");
+
+    // \~english 8.1 / 14.1: a client's datagram with an Initial is 1200 bytes, even when it only closes.
+    // \~spanish 8.1 / 14.1: un datagrama de cliente con un Initial mide 1200 bytes, aunque solo cierre.  \~
+    Connection early(cr, cc);
+    start_client(early, cc, first);
+    early.close(0x0100, true, 0, 1000);
+    m = early.build_datagram(pkt, sizeof pkt, 1000);
+    check(m >= kMinInitialDatagram, "a client's closing Initial was not padded to 1200 bytes");
+}
+
 /// \~english Once the server gave its ID, a long header with another is dropped (7.2).
 /// \~spanish Una vez que el servidor dio su identificador, una cabecera larga con otro se tira (7.2).  \~
 void test_changed_source(Crypto &cr) {
@@ -2003,6 +2110,7 @@ void run_all(Crypto &cr) {
     test_version_negotiation(cr);
     test_retry_rules(cr);
     test_changed_source(cr);
+    test_initial_rules(cr);
     test_key_update_rules(cr, Aead::Aes128Gcm);
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);

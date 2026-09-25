@@ -321,9 +321,14 @@ size_t Acceptor::write_retry(const uint8_t *data, const PacketHeader &h, const u
 
     // \~english A new ID of this server's choosing: the one the client will aim at next.
     // \~spanish Un identificador nuevo elegido por este servidor: al que apuntara el cliente despues.  \~
+    // \~english 17.2.5.1: it "MUST NOT be equal to the Destination Connection ID" the client sent.
+    // \~spanish 17.2.5.1: "NO DEBE ser igual al Destination Connection ID" que mando el cliente.  \~
     uint8_t rscid[kMaxConnectionId];
     uint8_t r[1];
-    if (!crypto_.random(rscid, cfg_.cid_len) || !crypto_.random(r, 1)) return 0;
+    do {
+        if (!crypto_.random(rscid, cfg_.cid_len)) return 0;
+    } while (cfg_.cid_len == h.dcid.len && same(rscid, data + h.dcid.off, h.dcid.len));
+    if (!crypto_.random(r, 1)) return 0;
 
     uint8_t plain[kTokenPlainMax];
     size_t pl = 0;

@@ -869,6 +869,9 @@ void Connection::replay(Space s, uint64_t now_us) noexcept {
 
     HeaderContext ctx;
     ctx.short_dcid_len = cfg_.local_cid_len;
+    // \~english Kept packets passed the size check when they arrived; their datagram is gone.
+    // \~spanish Los paquetes guardados pasaron la comprobacion de tamano al llegar; su datagrama ya no esta.  \~
+    datagram_len_ = static_cast<size_t>(-1);
     for (size_t i = 0; i < kPendingPackets; ++i) {
         Pending &q = pending_[i];
         if (!q.used || q.space != static_cast<uint8_t>(s)) continue;
@@ -1044,6 +1047,7 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
      * que acaba en un testigo valido es un reinicio (10.3).
      * \~ */
     const bool maybe_reset = n >= kMinStatelessReset;
+    datagram_len_ = n;
     uint8_t tail[kResetTokenSize];
     if (maybe_reset) util::vesta_memcpy(tail, data + n - kResetTokenSize, kResetTokenSize);
     const uint64_t failed_before = drops_.bad_header + drops_.wrong_cid + drops_.forged;
@@ -1077,6 +1081,23 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
 
 bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
                                 uint64_t now_us) noexcept {
+    /* \~english
+     * 5.2.1: a client MUST discard a packet of another version than it
+     * selected; a server committed to the client's version when it accepted
+     * the Initial (5.2.2).  Before looking at the type: the type bits mean
+     * different things in different versions (RFC 9369 renumbers them).
+     * \~spanish
+     * 5.2.1: un cliente DEBE descartar un paquete de otra version que la que
+     * eligio; un servidor se comprometio con la version del cliente al aceptar el
+     * Initial (5.2.2).  Antes de mirar el tipo: los bits de tipo significan cosas
+     * distintas en versiones distintas (el RFC 9369 los renumera).
+     * \~ */
+    if (h.type != PacketType::OneRtt && h.type != PacketType::VersionNegotiation &&
+        h.type != PacketType::UnsupportedVersion && h.version != cfg_.version) {
+        ++drops_.wrong_version;
+        return false;
+    }
+
     Space s;
     switch (h.type) {
     case PacketType::Initial:   s = Space::Initial; break;
@@ -1106,12 +1127,35 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
         return false;
     }
 
-    // \~english Once the server gave its ID, a long header naming another is not from it (7.2).
-    // \~spanish Una vez que el servidor dio su identificador, una cabecera larga con otro no es suya (7.2).  \~
-    if (!cfg_.is_server && peer_cid_known_ && s != Space::Application &&
-        (h.scid.len != cfg_.peer_cid_len ||
-         !bytes_equal(p + h.scid.off, cfg_.peer_cid, cfg_.peer_cid_len))) {
+    /* \~english
+     * 7.2: once the ID is set from the first long header, one naming another
+     * source is dropped -- by a client for any packet ("any subsequent packet
+     * ... with a different Source Connection ID"), by a server for Initials
+     * ("if subsequent Initial packets include a different Source Connection
+     * ID, they MUST be discarded").
+     * \~spanish
+     * 7.2: una vez fijado el identificador por la primera cabecera larga, una que
+     * nombra otro origen se tira -- un cliente, cualquier paquete; un servidor,
+     * los Initial ("si Initial posteriores incluyen un Source Connection ID
+     * distinto, DEBEN descartarse").
+     * \~ */
+    if (peer_cid_known_ && s != Space::Application && (!cfg_.is_server || s == Space::Initial) &&
+        (h.scid.len != peer_cids_[0].len ||
+         !bytes_equal(p + h.scid.off, peer_cids_[0].cid, peer_cids_[0].len))) {
         ++drops_.changed_source;
+        return false;
+    }
+
+    // \~english 14.1: a server MUST discard an Initial in a datagram under 1200 bytes.
+    // \~spanish 14.1: un servidor DEBE descartar un Initial en un datagrama de menos de 1200 bytes.  \~
+    if (cfg_.is_server && s == Space::Initial && datagram_len_ < kMinInitial) {
+        ++drops_.small_initial;
+        return false;
+    }
+    // \~english 17.2.2: a server's Initial carries no token; a client MUST discard one that does.
+    // \~spanish 17.2.2: el Initial de un servidor no lleva testigo; un cliente DEBE descartar uno que lo lleve.  \~
+    if (!cfg_.is_server && s == Space::Initial && h.token.len != 0) {
+        ++drops_.initial_with_token;
         return false;
     }
 
@@ -1882,7 +1926,10 @@ size_t Connection::build_datagram(uint8_t *out, size_t room, uint64_t now_us) no
         for (int s = 2; s >= 0; --s) {
             if (!keys_[s].have) continue;
             close_owed_ = false;
-            return build_packet(static_cast<Space>(s), out, room, Pad::Never, padded, now_us);
+            // \~english A client's datagram with an Initial is 1200 bytes, a close included (8.1, 14.1).
+            // \~spanish Un datagrama de cliente con un Initial mide 1200 bytes, tambien con un cierre (8.1, 14.1).  \~
+            const Pad pad = !cfg_.is_server && s == 0 ? Pad::Always : Pad::Never;
+            return build_packet(static_cast<Space>(s), out, room, pad, padded, now_us);
         }
         return 0;
     }

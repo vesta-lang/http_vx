@@ -515,6 +515,71 @@ void test_stateless_reset(Crypto &c) {
           "a reset was sent with resets switched off");
 }
 
+/**
+ * @brief
+ * \~english A provider whose random bytes start with a script: to force what chance almost never gives.
+ * \~spanish Un proveedor cuyos bytes aleatorios empiezan por un guion: para forzar lo que el azar casi nunca da.
+ * \~
+ */
+class ScriptedRandom final : public Crypto {
+public:
+    ScriptedRandom(const uint8_t *script, size_t n) : script_(script), left_(n) {}
+    test_support::FakeCrypto inner;
+    size_t left() const { return left_; }
+
+    const char *name() const noexcept override { return "scripted"; }
+    bool supports(Aead a) const noexcept override { return inner.supports(a); }
+    bool random(uint8_t *out, size_t n) noexcept override {
+        size_t i = 0;
+        for (; i < n && left_ != 0; ++i, --left_) out[i] = *script_++;
+        return i == n || inner.random(out + i, n - i);
+    }
+    bool extract(Hash h, const uint8_t *s, size_t sl, const uint8_t *k, size_t kl,
+                 uint8_t *prk) noexcept override {
+        return inner.extract(h, s, sl, k, kl, prk);
+    }
+    bool expand(Hash h, const uint8_t *prk, size_t pl, const uint8_t *info, size_t il, uint8_t *out,
+                size_t ol) noexcept override {
+        return inner.expand(h, prk, pl, info, il, out, ol);
+    }
+    void *prepare_aead(Aead a, const uint8_t *k) noexcept override { return inner.prepare_aead(a, k); }
+    void *prepare_hp(Aead a, const uint8_t *k) noexcept override { return inner.prepare_hp(a, k); }
+    void forget(void *s) noexcept override { inner.forget(s); }
+    bool seal(void *s, const uint8_t *nonce, const uint8_t *ad, size_t al, const uint8_t *in, size_t n,
+              uint8_t *out) noexcept override {
+        return inner.seal(s, nonce, ad, al, in, n, out);
+    }
+    OpenResult open(void *s, const uint8_t *nonce, const uint8_t *ad, size_t al, const uint8_t *in, size_t n,
+                    uint8_t *out) noexcept override {
+        return inner.open(s, nonce, ad, al, in, n, out);
+    }
+    bool mask(void *s, const uint8_t *sample, uint8_t *out) noexcept override {
+        return inner.mask(s, sample, out);
+    }
+
+private:
+    const uint8_t *script_;
+    size_t left_;
+};
+
+/// \~english 17.2.5.1: the Retry's source ID "MUST NOT be equal to the Destination Connection ID" the client sent.
+/// \~spanish 17.2.5.1: el identificador de origen del Retry "NO DEBE ser igual al Destination Connection ID" del cliente.  \~
+void test_retry_id_differs() {
+    provider = "scripted";
+    ScriptedRandom c(kDcid, sizeof kDcid);
+    Rig r(c);
+    r.cfg.require_retry = true;
+    Acceptor a(c, r.cfg);
+    client_initial(r.in, 1200, kVersion1, kDcid, 8, nullptr, 0);
+    const Admission ad = a.on_datagram(r.in, 1200, kAddrA, 6, 0, r.reply, sizeof r.reply);
+    HeaderContext hc;
+    PacketHeader h;
+    check(ad.reason == AdmitReason::SentRetry && parse_packet(r.reply, ad.reply_len, hc, h) == HeaderError::None,
+          "no Retry to look at");
+    check(c.left() == 0, "the scripted ID was never drawn");
+    check(!span_is(r.reply, h.scid, kDcid, 8), "the Retry's source ID equals the client's destination ID");
+}
+
 void test_broken_provider() {
     test_support::FakeCrypto c;
     Rig r(c);
@@ -571,6 +636,7 @@ int main() {
     test_support::FakeCrypto fake;
     run_all(fake);
     test_broken_provider();
+    test_retry_id_differs();
 
 #if defined(HTTP_VX_HAVE_OPENSSL)
     http_vx::OpensslCrypto ossl;
