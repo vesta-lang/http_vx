@@ -194,6 +194,15 @@ if (WIN32)
             PUBLIC http_vx_core vesta_alloc ws2_32 mswsock)
 endif ()
 
+if (UNIX)
+    add_library(http_vx_linux STATIC linux/epoll_backend.cpp)
+    target_include_directories(http_vx_linux
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+    target_compile_options(http_vx_linux PRIVATE -Wall -Wextra -pedantic-errors)
+    target_link_libraries(http_vx_linux PUBLIC http_vx_core vesta_alloc)
+endif ()
+
 # ---------------------------------------------------------------------------
 # Las medidas.  El README dice que no son opcionales y tiene razon por dos
 # lados: un servidor que promete un millon de conexiones tiene que poder ensenar
@@ -258,12 +267,19 @@ if (HTTP_VX_BUILD_TESTS)
 
     # La unica prueba que abre un puerto, y por eso enlaza lo que las demas no.
     # Lo que comprueba son las cosas en las que un backend sin sistema operativo
-    # dentro NO PUEDE equivocarse -- perder un socket, no atarse, devolver una
-    # referencia de otro puerto de finalizacion --, asi que no sustituye a
-    # ninguna: se anade a ellas.
+    # dentro NO PUEDE equivocarse -- perder un socket, no atarse, devolver un
+    # descriptor de otro --, asi que no sustituye a ninguna: se anade a ellas.
+    #
+    # Es UN fichero para los dos sistemas, y eso es la R8: que epoll no sea un
+    # camino que no prueba nadie no se consigue escribiendole una segunda
+    # prueba, se consigue haciendo que los MISMOS casos corran contra el backend
+    # que haya.  Dos ficheros serian dos juegos de casos, y el que se quedara
+    # atras seria el de la maquina en la que no construye nadie.
+    http_vx_add_test(test_socket_backend tests/test_socket_backend.cpp)
     if (WIN32)
-        http_vx_add_test(test_iocp_backend tests/test_iocp_backend.cpp)
-        target_link_libraries(test_iocp_backend PRIVATE http_vx_windows)
+        target_link_libraries(test_socket_backend PRIVATE http_vx_windows)
+    else ()
+        target_link_libraries(test_socket_backend PRIVATE http_vx_linux)
     endif ()
 endif ()
 
