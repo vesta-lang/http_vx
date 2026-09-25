@@ -35,6 +35,7 @@ void Http1Service::release() noexcept {
     }
     capacity_ = 0;
     said_.release();
+    writer_.release();
 }
 
 bool Http1Service::reset(uint32_t connections, Handler &handler,
@@ -114,7 +115,7 @@ bool Http1Service::render(const ResponseBuilder &res, const Request &req,
                           bool keep_alive, Buffer &out) noexcept {
     if (res.failed()) return refuse(500, out);
 
-    h1::ResponseWriter w;
+    h1::ResponseWriter &w = writer_;
     w.begin(req.version, res.status(), req.method, keep_alive);
 
     const uint8_t *bytes = res.bytes();
@@ -159,9 +160,16 @@ bool Http1Service::render(const ResponseBuilder &res, const Request &req,
 
     if (b.len != 0) w.body(bytes + b.off, b.len);
 
-    const bool wrote = flush(w, out);
-    w.release();
-    return wrote;
+    /* \~english
+     * And the writer is NOT released.  Its memory is what answering the next
+     * request would ask for again, and @c begin empties it -- so keeping it is
+     * the whole of the saving and costs one buffer per service.
+     * \~spanish
+     * Y el escritor NO se libera.  Su memoria es la que volveria a pedir
+     * contestar la peticion siguiente, y @c begin lo vacia -- asi que guardarlo es
+     * todo el ahorro y cuesta un buffer por servicio.
+     * \~ */
+    return flush(w, out);
 }
 
 bool Http1Service::refuse(StatusCode status, Buffer &out) noexcept {
@@ -178,11 +186,10 @@ bool Http1Service::refuse(StatusCode status, Buffer &out) noexcept {
      * reintenta -- y una peticion que se rechaza siempre se convierte en una
      * peticion que se manda siempre.
      * \~ */
-    h1::ResponseWriter w;
+    h1::ResponseWriter &w = writer_;
     w.begin(Version::Http11, status, MethodId::Get, false);
     w.finish(h1::ResponseBody::Length, 0);
     flush(w, out);
-    w.release();
     return false;
 }
 

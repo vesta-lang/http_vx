@@ -336,6 +336,39 @@ class Http1Service final : public Service {
      */
     Buffer said_;
 
+    /**
+     * \~english
+     * The writer, kept.  It was made and thrown away on every request, and a
+     * writer owns a buffer -- so answering cost an allocation and a free of
+     * four kilobytes per response, on the one path every request takes.
+     *
+     * Nothing was wrong with the code that did it: @c begin already empties the
+     * writer and resets its state, so a fresh one and a reused one produce the
+     * same bytes.  What made the difference invisible is that a buffer
+     * allocates lazily and frees quietly, and neither shows up as anything but
+     * time.
+     *
+     * One per service and reused, for the same reason @c said_ is: a shard is
+     * one thread, and a response is finished with before the next one starts.
+     *
+     * \~spanish
+     * El escritor, guardado.  Se hacia y se tiraba en cada peticion, y un
+     * escritor es dueno de un buffer -- asi que contestar costaba una reserva y
+     * una liberacion de cuatro kilobytes por respuesta, en el unico camino por el
+     * que pasan todas las peticiones.
+     *
+     * El codigo que lo hacia no tenia nada malo: @c begin ya vacia el escritor y
+     * reinicia su estado, asi que uno nuevo y uno reutilizado producen los mismos
+     * bytes.  Lo que hacia invisible la diferencia es que un buffer reserva tarde
+     * y libera callado, y ninguna de las dos cosas se ve como otra cosa que
+     * tiempo.
+     *
+     * Uno por servicio y reutilizado, por lo mismo que @c said_: un fragmento es
+     * un hilo, y con una respuesta se acaba antes de que empiece la siguiente.
+     * \~
+     */
+    h1::ResponseWriter writer_;
+
     State *state_ = nullptr;
     uint32_t capacity_ = 0;
 
