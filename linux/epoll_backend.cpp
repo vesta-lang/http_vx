@@ -17,12 +17,12 @@
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
+#include "util/mem/vesta_memset.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -189,7 +189,7 @@ bool EpollBackend::listen(const char *host, uint16_t port, int backlog) noexcept
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
 
     sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
+    util::vesta_memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
 
@@ -248,32 +248,55 @@ bool EpollBackend::arm(int32_t fd) noexcept {
     if (w.known && w.armed == want) return true;
 
     /* \~english
-     * Nothing waited on means the socket comes OUT of the queue, and that is
-     * not tidiness.  epoll here is level-triggered, so a socket left registered
-     * for reading with nothing to read for stays ready for ever -- and every
-     * wait would return it, immediately, with nothing to do.  An idle server
-     * would spend a core reporting that a connection has bytes nobody asked
-     * for.
+     * Nothing waited on means the socket is left DISARMED, and with
+     * `EPOLLONESHOT` that has already happened: the kernel takes a descriptor
+     * out of the ready set the moment it reports it, and puts it back only
+     * when it is told to.  So there is nothing to say here, and saying it
+     * would be a system call bought to repeat something already true.
+     *
+     * Without oneshot this had to be an `EPOLL_CTL_DEL`, because epoll is
+     * level-triggered: a socket left registered for reading with nobody
+     * waiting stays ready for ever, and every wait would hand it back with
+     * nothing to do.  So a keep-alive connection paid a DEL when its read was
+     * taken and an ADD when the next one was asked for -- two of the five
+     * system calls a request costs, spent saying twice a turn what the kernel
+     * would have done by itself.
+     *
      * \~spanish
-     * Que no se espere nada quiere decir que el socket SALE de la cola, y eso no
-     * es limpieza.  epoll aqui es por nivel, asi que un socket que se quede
-     * registrado para leer sin que nadie espere una lectura sigue listo para
-     * siempre -- y todas las esperas lo devolverian, en el acto, sin nada que
-     * hacer --.  Un servidor parado se gastaria un nucleo informando de que una
-     * conexion tiene bytes que no ha pedido nadie.
+     * Que no se espere nada quiere decir que el socket se queda DESARMADO, y con
+     * `EPOLLONESHOT` eso ya ha pasado: el nucleo saca un descriptor del conjunto
+     * de listos en cuanto lo informa, y lo vuelve a meter solo cuando se lo
+     * dicen.  Asi que aqui no hay nada que decir, y decirlo seria una llamada al
+     * sistema comprada para repetir algo que ya es cierto.
+     *
+     * Sin oneshot esto tenia que ser un `EPOLL_CTL_DEL`, porque epoll es por
+     * nivel: un socket que se quede registrado para leer sin que nadie espere
+     * sigue listo para siempre, y todas las esperas lo devolverian sin nada que
+     * hacer.  Asi que una conexion mantenida viva pagaba un DEL cuando se
+     * llevaban su lectura y un ADD cuando se pedia la siguiente -- dos de las
+     * cinco llamadas al sistema que cuesta una peticion, gastadas en decir dos
+     * veces por vuelta lo que el nucleo iba a hacer solo.
      * \~ */
     if (want == 0) {
-        if (w.known) {
-            epoll_ctl(queue_, EPOLL_CTL_DEL, fd, nullptr);
-            w.known = false;
-            w.armed = 0;
-        }
+        w.armed = 0;
         return true;
     }
 
     epoll_event ev;
-    memset(&ev, 0, sizeof ev);
-    ev.events = want;
+    util::vesta_memset(&ev, 0, sizeof ev);
+
+    /* \~english
+     * `EPOLLONESHOT` on every registration.  It means "tell me once", and the
+     * re-arming that costs is a call this loop was making anyway: a connection
+     * whose read has just been taken asks for the next one, and that ask is
+     * the `EPOLL_CTL_MOD` that puts it back.
+     * \~spanish
+     * `EPOLLONESHOT` en cada registro.  Quiere decir "avisame una vez", y el
+     * rearme que cuesta es una llamada que este bucle hacia igual: una conexion a
+     * la que le acaban de coger su lectura pide la siguiente, y esa peticion es
+     * el `EPOLL_CTL_MOD` que la vuelve a poner.
+     * \~ */
+    ev.events = want | EPOLLONESHOT;
     ev.data.fd = fd;
 
     const int how = w.known ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
@@ -570,6 +593,22 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
         if (fd < 0 || static_cast<uint32_t>(fd) >= max_fds_) continue;
 
         Waiting &w = waiting_[fd];
+
+        /* \~english
+         * The kernel disarmed it when it reported it, so what this end
+         * remembers about the registration is now stale.  Saying so here is
+         * what makes the re-arming below a `MOD` that actually happens: an
+         * @c arm that still believed the old mask was in force would decide
+         * nothing had changed and say nothing, and the descriptor would never
+         * be reported again.
+         * \~spanish
+         * El nucleo lo desarmo al informarlo, asi que lo que este extremo recuerda
+         * del registro ya no vale.  Decirlo aqui es lo que hace que el rearme de
+         * abajo sea un `MOD` que ocurre de verdad: un @c arm que siguiera creyendo
+         * que la mascara vieja esta puesta decidiria que no ha cambiado nada y no
+         * diria nada, y el descriptor no se volveria a informar nunca.
+         * \~ */
+        w.armed = 0;
 
         /* \~english
          * A socket in trouble -- an error, or the peer gone -- is reported to

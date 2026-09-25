@@ -54,6 +54,7 @@
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
+#include "util/mem/vesta_memset.h"
 
 #include <new>
 
@@ -258,7 +259,7 @@ bool IocpBackend::listen(const char *host, uint16_t port, int backlog) noexcept 
     }
 
     sockaddr_in addr;
-    ZeroMemory(&addr, sizeof addr);
+    util::vesta_memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
 
@@ -335,7 +336,7 @@ IocpBackend::Context *IocpBackend::take() noexcept {
     Context *c = &contexts_[free_head_];
     free_head_ = c->next;
 
-    ZeroMemory(&c->ov, sizeof c->ov);
+    util::vesta_memset(&c->ov, 0, sizeof c->ov);
     c->sock = INVALID_SOCKET;
     ++in_flight_;
     return c;
