@@ -215,6 +215,24 @@ public:
 
     /**
      * @brief
+     * \~english Every stream gone, and the table as it was built: numbering, limits and windows start over.
+     * \~spanish Todos los flujos fuera, y la tabla como se construyo: numeracion, limites y ventanas empiezan de nuevo.
+     * \~
+     *
+     * \~english
+     * What 0-RTT rejected asks for: "all connection characteristics that the
+     * client assumed might be incorrect ... The client therefore MUST reset
+     * the state of all streams" (RFC 9001, 4.6.2).
+     * \~spanish
+     * Lo que pide un 0-RTT rechazado: todo lo que supuso el cliente puede ser
+     * incorrecto, asi que DEBE reiniciar el estado de todos los flujos (RFC 9001,
+     * 4.6.2).
+     * \~
+     */
+    void reset() noexcept;
+
+    /**
+     * @brief
      * \~english Removes every stream whose parts have both finished, and counts it closed.
      * \~spanish Quita cada flujo cuyas partes han terminado las dos, y lo cuenta como cerrado.
      * \~
@@ -256,6 +274,8 @@ private:
     bool is_local(uint64_t id) const noexcept;
 
     StreamConfig cfg_;
+    /// \~english The configuration as given: what reset() goes back to.  \~spanish La configuracion tal como se dio: a lo que vuelve reset().  \~
+    StreamConfig base_;
 
     Stream *slots_ = nullptr;
     uint32_t *free_ = nullptr;

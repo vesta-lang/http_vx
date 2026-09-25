@@ -53,7 +53,7 @@ inline bool names_sending_part(FrameType t) noexcept {
 
 } // namespace
 
-StreamTable::StreamTable(const StreamConfig &config) noexcept : cfg_(config) {
+StreamTable::StreamTable(const StreamConfig &config) noexcept : cfg_(config), base_(config) {
     const bool srv = cfg_.is_server;
     limit_[peer_type(srv, true)] = cfg_.peer_bidi_concurrency;
     limit_[peer_type(srv, false)] = cfg_.peer_uni_concurrency;
@@ -324,6 +324,29 @@ void StreamTable::on_max_streams(bool bidirectional, uint64_t maximum) noexcept 
         limit_[t] = maximum;
         refused_[bidirectional ? 1 : 0] = false;
     }
+}
+
+void StreamTable::reset() noexcept {
+    if (slots_ == nullptr) return;
+    for (size_t i = 0; i < capacity_; ++i)
+        if (slots_[i].id != kNever) destroy(i);
+    // \~english Back to what the table was built with: numbering, limits and windows start over.
+    // \~spanish De vuelta a con lo que se construyo la tabla: numeracion, limites y ventanas empiezan de nuevo.  \~
+    for (size_t t = 0; t < 4; ++t) {
+        opened_[t] = 0;
+        closed_[t] = 0;
+    }
+    const bool srv = cfg_.is_server;
+    limit_[peer_type(srv, true)] = base_.peer_bidi_concurrency;
+    limit_[peer_type(srv, false)] = base_.peer_uni_concurrency;
+    limit_[local_type(srv, true)] = base_.peer_max_streams_bidi;
+    limit_[local_type(srv, false)] = base_.peer_max_streams_uni;
+    cfg_.peer_window_bidi_local = base_.peer_window_bidi_local;
+    cfg_.peer_window_bidi_remote = base_.peer_window_bidi_remote;
+    cfg_.peer_window_uni = base_.peer_window_uni;
+    refused_[0] = false;
+    refused_[1] = false;
+    local_open_ = 0;
 }
 
 void StreamTable::on_peer_params(uint64_t max_bidi, uint64_t max_uni, uint64_t window_bidi_local,

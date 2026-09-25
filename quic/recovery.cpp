@@ -127,7 +127,7 @@ void Recovery::pop_front(Ring &r) noexcept {
 
 bool Recovery::on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eliciting,
                               bool in_flight, bool path_probe, uint64_t tag, uint64_t ack_largest,
-                              uint64_t now_us) noexcept {
+                              uint64_t now_us, bool early) noexcept {
     // \~english A probe is never in flight: its loss is the probed path's business (RFC 9000, 9.4).
     // \~spanish Un sondeo nunca esta en vuelo: su perdida es cosa del camino sondeado (RFC 9000, 9.4).  \~
     if (path_probe) in_flight = false;
@@ -149,6 +149,7 @@ bool Recovery::on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eli
     p.in_flight = in_flight;
     p.counted = in_flight;
     p.other_path = path_probe;
+    p.early = early;
     p.state = kOutstanding;
     ++r.size;
 
@@ -561,6 +562,34 @@ void Recovery::discard_space(Space s, uint64_t now_us) noexcept {
     loss_time_[i] = 0;
     pto_count_ = 0;
     set_timer(now_us);
+}
+
+size_t Recovery::drop_early(uint64_t now_us, RecoveryListener *requeue) noexcept {
+    const size_t i = idx(Space::Application);
+    Ring &r = ring_[i];
+    size_t dropped = 0;
+    for (uint32_t k = 0; k < r.size; ++k) {
+        SentPacket &p = r.at(k);
+        if (!p.early || p.state != kOutstanding) continue;
+        if (requeue != nullptr) requeue->on_lost(Space::Application, p);
+        if (p.counted) bytes_in_flight_ -= p.bytes;
+        if (p.in_flight && p.ack_eliciting && eliciting_in_flight_[i] != 0) --eliciting_in_flight_[i];
+        // \~english Out of the flight as if lost -- but not a loss: no congestion event (6.4).
+        // \~spanish Fuera del vuelo como si se perdiera -- pero no es una perdida: sin evento de congestion (6.4).  \~
+        p.state = kLost;
+        ++dropped;
+    }
+    pop_front(r);
+    set_timer(now_us);
+    return dropped;
+}
+
+size_t Recovery::early_outstanding() const noexcept {
+    const Ring &r = ring_[idx(Space::Application)];
+    size_t n = 0;
+    for (uint32_t k = 0; k < r.size; ++k)
+        if (r.at(k).early && r.at(k).state == kOutstanding) ++n;
+    return n;
 }
 
 void Recovery::on_retry(uint64_t now_us, RecoveryListener &l) noexcept {

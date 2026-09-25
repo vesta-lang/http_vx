@@ -515,9 +515,40 @@ void test_discard_ecn() {
           "a rising ECN-CE count was not a congestion event");
 }
 
+/**
+ * @brief
+ * \~english 0-RTT packets leave the flight together: discarded when rejected, handed back after a Retry.
+ * \~spanish Los paquetes 0-RTT salen juntos del vuelo: tirados al rechazarse, devueltos tras un Retry.
+ * \~
+ */
+void test_drop_early() {
+    for (int requeue = 0; requeue < 2; ++requeue) {
+        Recovery r;
+        Log log;
+        // \~english pn 0 and 2 in 0-RTT, pn 1 not: the same space, told apart by the flag.
+        // \~spanish pn 0 y 2 en 0-RTT, pn 1 no: el mismo espacio, distinguidos por la marca.  \~
+        r.on_packet_sent(Space::Application, 0, 1000, true, true, false, 10, kNever, 0, true);
+        r.on_packet_sent(Space::Application, 1, 500, true, true, false, 11, kNever, 0, false);
+        r.on_packet_sent(Space::Application, 2, 300, true, true, false, 12, kNever, 0, true);
+        send(r, Space::Handshake, 0, 0, 200);
+        check(r.bytes_in_flight() == 2000 && r.early_outstanding() == 2, "three in flight, two of them 0-RTT");
+        const size_t n = r.drop_early(100, requeue != 0 ? &log : nullptr);
+        check(n == 2 && r.early_outstanding() == 0, "both 0-RTT packets leave");
+        check(r.bytes_in_flight() == 700, "and only their bytes: the 1-RTT and Handshake ones stay (RFC 9002, 6.4)");
+        if (requeue != 0)
+            check(log.n_lost == 2 && log.was_lost(10) && log.was_lost(12) && !log.was_lost(11),
+                  "after a Retry they come back to be sent again (RFC 9000, 17.2.3)");
+        else
+            check(log.n_lost == 0, "rejected, nothing comes back to be resent (RFC 9002, 6.4)");
+        check(r.congestion_events() == 0, "and none of it is a loss that shrinks the window");
+        check(r.drop_early(200, &log) == 0, "a second time there is nothing left");
+    }
+}
+
 } // namespace
 
 int main() {
+    test_drop_early();
     test_rtt();
     test_loss_detection();
     test_newreno();

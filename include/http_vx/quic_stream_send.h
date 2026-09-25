@@ -231,6 +231,12 @@ public:
     bool blocked() const noexcept { return used_ >= limit_; }
     uint64_t limit() const noexcept { return limit_; }
     uint64_t used() const noexcept { return used_; }
+    /// \~english Back to a limit and nothing sent: 0-RTT rejected (RFC 9001, 4.6.2).
+    /// \~spanish De vuelta a un limite y nada mandado: 0-RTT rechazado (RFC 9001, 4.6.2).  \~
+    void reset(uint64_t limit) noexcept {
+        limit_ = limit;
+        used_ = 0;
+    }
 
 private:
     uint64_t limit_;

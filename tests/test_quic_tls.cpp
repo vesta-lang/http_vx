@@ -37,6 +37,7 @@
 #include "http_vx/quic_acceptor.h"
 #include "http_vx/quic_connection.h"
 #include "http_vx/quic_transport_params.h"
+#include "http_vx/quic_varint.h"
 #include "http_vx/tls_quic.h"
 
 #include "fake_crypto.h"
@@ -113,6 +114,13 @@ struct Options {
     const http_vx::tls::Ticket *resume = nullptr;
     /// \~english When the run starts: one clock across runs, as tickets need.  \~spanish Cuando empieza la corrida: un reloj entre corridas, como necesitan los tickets.  \~
     uint64_t start_us = 0;
+    /// \~english 0-RTT: the server allows it with this guard and context; the client says hello in it.
+    /// \~spanish 0-RTT: el servidor lo permite con este guardian y contexto; el cliente dice hola en el.  \~
+    bool early_data = false;
+    http_vx::tls::ReplayGuard *guard = nullptr;
+    const uint8_t *context = nullptr;
+    /// \~english The server's MAX_DATA window; zero leaves the default.  \~spanish La ventana MAX_DATA del servidor; cero deja la de por defecto.  \~
+    uint64_t server_data_window = 0;
     uint64_t client_idle_us = 30000000;
     uint64_t server_idle_us = 20000000;
 };
@@ -133,6 +141,11 @@ struct Outcome {
     bool resumed = false;
     size_t tickets = 0;
     http_vx::tls::Ticket ticket;
+    uint64_t early_sent = 0;
+    uint64_t early_opened = 0;
+    uint64_t early_dropped = 0;
+    bool early_rejected = false;
+    bool hello_in_early = false;
 };
 
 struct Datagram {
@@ -172,6 +185,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     ConnectionConfig cc = blank(false, 0xc0, o.client_idle_us);
     ConnectionConfig sc = blank(true, 0x50, o.server_idle_us);
     sc.crypto_window = o.server_crypto_window;
+    if (o.server_data_window != 0) sc.data_window = o.server_data_window;
     Connection client(client_crypto, cc);
     check(client.ready() && client.set_initial_keys(cc.peer_cid, 8), "the client could not start");
 
@@ -180,6 +194,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     ccfg.alpn_count = 1;
     ccfg.server_name = "example.com";
     ccfg.resume = o.resume;
+    ccfg.early_data = o.early_data;
     QuicHandshake ch(client_crypto, client, ccfg);
     check(ch.start(o.start_us), "the client's handshake did not start");
 
@@ -196,6 +211,10 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     scfg.signing_key = key;
     scfg.scheme = scheme;
     scfg.tickets = o.sealer;
+    scfg.early_data = o.early_data;
+    scfg.replay = o.guard;
+    scfg.early_context = o.context;
+    scfg.early_context_len = o.context != nullptr ? 4 : 0;
 
     AcceptorConfig ac;
     ac.require_retry = o.retry;
@@ -214,6 +233,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     std::vector<uint8_t> at_server;
     size_t echoed = 0;
     bool junk_sent = false;
+    bool reopened = false;
 
     for (int step = 0; step < 20000 && !out.echoed; ++step) {
         ch.step(now);
@@ -228,9 +248,22 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
             junk_sent = took == sizeof junk;
         }
 
-        // \~english The client says hello once confirmed; the server says it back.
-        // \~spanish El cliente dice hola en cuanto confirma; el servidor lo repite.  \~
-        if (client.is_handshake_confirmed() && !opened) {
+        /* \~english
+         * The client says hello once confirmed -- or at once, in 0-RTT, when
+         * it offered it.  Turned down, its stream is gone (RFC 9001, 4.6.2):
+         * it says hello again once confirmed.  The server says it back.
+         * \~spanish
+         * El cliente dice hola en cuanto confirma -- o en el acto, en 0-RTT,
+         * cuando lo ofrecio.  Rechazado, su flujo desaparece (RFC 9001, 4.6.2):
+         * vuelve a decir hola cuando confirma.  El servidor lo repite.
+         * \~ */
+        if (opened && client.early_rejected() && !reopened) {
+            opened = false;
+            reopened = true;
+            back.clear();
+        }
+        const bool early_now = ch.session().early_offered() && !client.early_rejected() && !reopened;
+        if (!opened && (client.is_handshake_confirmed() || early_now)) {
             Stream *st = client.streams().open(true);
             if (st != nullptr) {
                 size_t took = 0;
@@ -238,6 +271,9 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
                 st->send->finish();
                 stream_id = st->id;
                 opened = true;
+                // \~english The first hello says whether it went early; the one after a rejection never does.
+                // \~spanish El primer hola dice si fue temprano; el que sigue a un rechazo nunca lo es.  \~
+                if (!reopened) out.hello_in_early = !client.is_handshake_confirmed();
             }
         }
         if (opened) {
@@ -340,6 +376,12 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     out.retried = client.retried();
     out.peer_streams = client.streams().peer_limit(true);
     out.resumed = ch.session().resumed();
+    out.early_sent = client.early_sent();
+    out.early_rejected = client.early_rejected();
+    if (srv) {
+        out.early_opened = srv->early_opened();
+        out.early_dropped = srv->drops().early;
+    }
     out.tickets = ch.session().tickets();
     ch.take_ticket(out.ticket);
     if (srv) {
@@ -391,6 +433,51 @@ void run_good(Crypto &cc, Crypto &sc, const uint8_t *cert, size_t cert_len, void
     second.start_us = 10000000;
     const Outcome b = run(cc, sc, cert, cert_len, key, scheme, second);
     check(b.echoed && b.resumed, "the second resumes, through a Retry, and says hello");
+
+    /* \~english
+     * 0-RTT: the hello goes in 0-RTT packets and comes back.  Turned down --
+     * another context -- the client's stream is reset and the hello goes
+     * again after the handshake.  Through a Retry, what went before it is
+     * sent again (RFC 9000, 17.2.3).
+     * \~spanish
+     * 0-RTT: el hola va en paquetes 0-RTT y vuelve.  Rechazado -- otro contexto
+     * --, el flujo del cliente se reinicia y el hola va otra vez tras el saludo.
+     * A traves de un Retry, lo mandado antes se manda otra vez (RFC 9000,
+     * 17.2.3).
+     * \~ */
+    const uint8_t ctx_a[4] = {'c', 't', 'x', 'a'};
+    const uint8_t ctx_b[4] = {'c', 't', 'x', 'b'};
+    for (int k = 0; k < 4; ++k) {
+        // \~english 3: the server's transport parameters changed since the ticket: 0-RTT is refused (7.4.1).
+        // \~spanish 3: los parametros de transporte del servidor cambiaron desde el ticket: se rechaza el 0-RTT (7.4.1).  \~
+        const char *what[4] = {"0-RTT accepted", "0-RTT turned down", "0-RTT through a Retry",
+                               "0-RTT with changed parameters"};
+        std::snprintf(current, sizeof current, "%s: %s", name, what[k]);
+        http_vx::tls::ReplayGuard guard(64, 10000, 0);
+        Options f;
+        f.sealer = &sealer;
+        f.early_data = true;
+        f.guard = &guard;
+        f.context = ctx_a;
+        f.start_us = 20000000;
+        const Outcome t = run(cc, sc, cert, cert_len, key, scheme, f);
+        check(t.echoed && t.ticket.early_data, "a ticket that allows 0-RTT");
+        Options g = f;
+        g.resume = &t.ticket;
+        g.start_us = 30000000;
+        g.context = k == 1 ? ctx_b : ctx_a;
+        g.retry = k == 2;
+        if (k == 3) g.server_data_window = 1u << 19;
+        const Outcome r = run(cc, sc, cert, cert_len, key, scheme, g);
+        check(r.echoed && r.resumed, "resumed, and the hello came back");
+        check(r.hello_in_early && r.early_sent != 0, "the hello went in 0-RTT packets");
+        if (k == 1 || k == 3) {
+            check(r.early_rejected && r.early_opened == 0, "turned down: nothing opened, the client started over");
+            check(r.early_dropped != 0, "and the server dropped the 0-RTT packets, counted (RFC 9001, 4.6.2)");
+        } else {
+            check(!r.early_rejected && r.early_opened != 0, "accepted: the server opened 0-RTT packets");
+        }
+    }
 }
 
 /// \~english What must fail, with the fake provider.  \~spanish Lo que debe fallar, con el proveedor falso.  \~
@@ -548,6 +635,221 @@ void test_parameters(Crypto &c) {
     }
 }
 
+/// \~english A server's parameters as a client would remember them: @p max_data of MAX_DATA, two streams.
+/// \~spanish Los parametros de un servidor como los recordaria un cliente: @p max_data de MAX_DATA, dos flujos.  \~
+size_t remembered(uint8_t *out, size_t room, uint64_t max_data) {
+    TransportParams tp;
+    tp.initial_source_connection_id.present = true;
+    tp.initial_source_connection_id.len = 8;
+    tp.original_destination_connection_id = tp.initial_source_connection_id;
+    tp.initial_max_data = max_data;
+    tp.initial_max_streams_bidi = 2;
+    tp.initial_max_stream_data_bidi_remote = 1000;
+    return encode_transport_params(tp, out, room);
+}
+
+/// \~english Whether transport parameter @p id is in @p p.  \~spanish Si el parametro de transporte @p id esta en @p p.  \~
+bool has_param(const uint8_t *p, size_t n, uint64_t id) {
+    size_t at = 0;
+    while (at < n) {
+        uint64_t k = 0;
+        uint64_t len = 0;
+        const size_t a = decode_varint(p + at, n - at, k);
+        if (a == 0) return false;
+        const size_t b = decode_varint(p + at + a, n - at - a, len);
+        if (b == 0) return false;
+        if (k == id) return true;
+        at += a + b + static_cast<size_t>(len);
+    }
+    return false;
+}
+
+/**
+ * @brief
+ * \~english The connection's side of 0-RTT, piece by piece, with the fake provider.
+ * \~spanish El lado de la conexion del 0-RTT, pieza a pieza, con el proveedor falso.
+ * \~
+ */
+void test_early_connection(Crypto &c) {
+    std::snprintf(current, sizeof current, "0-RTT in the connection");
+    uint8_t secret[32];
+    for (int i = 0; i < 32; ++i) secret[i] = static_cast<uint8_t>(0x30 + i);
+    // \~english Just the hello's worth of credit, and plenty.  \~spanish Credito justo para el hola, y de sobra.  \~
+    uint8_t params[256];
+    const size_t params_len = remembered(params, sizeof params, sizeof kHello);
+    uint8_t wide[256];
+    const size_t wide_len = remembered(wide, sizeof wide, 1000);
+
+    // \~english The client: 0-RTT packets on remembered limits, a long header of type 0x01 (17.2.3).
+    // \~spanish El cliente: paquetes 0-RTT con los limites recordados, cabecera larga de tipo 0x01 (17.2.3).  \~
+    ConnectionConfig cc = blank(false, 0xc0, 0);
+    Connection client(c, cc);
+    client.set_initial_keys(cc.peer_cid, 8);
+    check(client.remember_transport_params(wide, wide_len), "the client remembers the server's parameters");
+    check(client.send_credit() == 1000 && client.streams().peer_limit(true) == 2,
+          "and runs 0-RTT on them (RFC 9000, 7.4.1)");
+    check(client.install_early_secret(Aead::Aes128Gcm, secret, 32, 0) && client.has_early_keys(), "0-RTT keys");
+    Stream *st = client.streams().open(true);
+    size_t took = 0;
+    st->send->write(kHello, sizeof kHello, took);
+    uint8_t dgram[1500];
+    const size_t n = client.build_datagram(g_sent, dgram, sizeof dgram, 1000);
+    check(n != 0 && (dgram[0] & 0x80) != 0 && ((dgram[0] >> 4) & 3) == 1 && dgram[5] == 8 && dgram[6] == 0x0d,
+          "a 0-RTT packet: long header, type 1, to the original destination");
+    check(client.early_sent() == 1 && client.recovery().early_outstanding() == 1, "counted, and in flight");
+    uint8_t copy[1500];
+
+    // \~english Another client never opens it (RFC 9001, 5.6).  \~spanish Otro cliente nunca lo abre (RFC 9001, 5.6).  \~
+    {
+        ConnectionConfig other = blank(false, 0x0d, 0);
+        Connection b(c, other);
+        b.set_initial_keys(other.peer_cid, 8);
+        b.install_early_secret(Aead::Aes128Gcm, secret, 32, 0);
+        std::memcpy(copy, dgram, n);
+        b.on_datagram(kPath, copy, n, Ecn::NotEct, 2000);
+        check(b.drops().early == 1 && b.early_opened() == 0, "a client discards 0-RTT packets");
+    }
+
+    /* \~english
+     * A server keeps it until its keys, then opens it (RFC 9001, 4.1.4).
+     * Its own ID is the client's first destination: the client never
+     * learns another here, and its 1-RTT packets must reach it too.
+     * \~spanish
+     * Un servidor lo guarda hasta sus claves, y entonces lo abre (RFC 9001,
+     * 4.1.4).  Su propio identificador es el primer destino del cliente: aqui el
+     * cliente no aprende otro, y sus paquetes 1-RTT tambien tienen que llegarle.
+     * \~ */
+    {
+        ConnectionConfig sc = blank(true, 0x0d, 0);
+        Connection s(c, sc);
+        s.set_initial_keys(cc.peer_cid, 8);
+        std::memcpy(copy, dgram, n);
+        s.on_datagram(kPath, copy, n, Ecn::NotEct, 2000);
+        check(s.drops().early == 0 && s.early_opened() == 0, "kept while its keys are not there");
+        check(s.install_early_secret(Aead::Aes128Gcm, secret, 32, 2500) && s.early_opened() == 1,
+              "opened once they are");
+        Stream *got = s.streams().find(st->id);
+        const uint8_t *p = nullptr;
+        check(got != nullptr && got->recv->peek(p) == sizeof kHello && std::memcmp(p, kHello, sizeof kHello) == 0,
+              "and its hello is there");
+
+        // \~english Its keys go three PTO after the first 1-RTT packet (RFC 9001, 4.9.3).
+        // \~spanish Sus claves se van tres PTO despues del primer paquete 1-RTT (RFC 9001, 4.9.3).  \~
+        uint8_t r1[32], w1[32];
+        for (int i = 0; i < 32; ++i) {
+            r1[i] = static_cast<uint8_t>(i);
+            w1[i] = static_cast<uint8_t>(0x80 + i);
+        }
+        check(s.install_secrets(Space::Application, Aead::Aes128Gcm, r1, w1, 32, 3000) &&
+                  client.install_secrets(Space::Application, Aead::Aes128Gcm, w1, r1, 32, 3000),
+              "1-RTT keys on both ends");
+        check(!client.has_early_keys(), "a client drops its 0-RTT keys with the 1-RTT ones (4.9.3)");
+        s.handshake_confirmed(3000);
+        client.handshake_confirmed(3000);
+        // \~english More of the hello, now in 1-RTT: credit is left.  \~spanish Mas del hola, ahora en 1-RTT: queda credito.  \~
+        st->send->write(kHello, sizeof kHello, took);
+        const size_t m = client.build_datagram(g_sent, dgram, sizeof dgram, 4000);
+        check(m != 0 && (dgram[0] & 0x80) == 0, "a 1-RTT packet from the client");
+        s.on_datagram(kPath, dgram, m, Ecn::NotEct, 5000);
+        check(s.drops().wrong_cid == 0 && s.drops().no_keys == 0, "the server opened that 1-RTT packet");
+        check(s.has_early_keys(), "right after it the server still holds them, for reordered 0-RTT");
+        s.on_timer(5001);
+        check(s.has_early_keys(), "a moment later too");
+        check(s.timer() <= 5000 + 3 * 1100000, "their discard is on the timer");
+        s.on_timer(5000 + 10000000);
+        check(!s.has_early_keys(), "and three PTO later they are gone");
+    }
+
+    // \~english A server that turned it down: kept ones and later ones are dropped, and counted (4.6.2).
+    // \~spanish Un servidor que lo rechazo: los guardados y los que lleguen se tiran, y se cuentan (4.6.2).  \~
+    {
+        ConnectionConfig sc = blank(true, 0x50, 0);
+        Connection s(c, sc);
+        s.set_initial_keys(cc.peer_cid, 8);
+        uint8_t first[1500];
+        size_t fn = 0;
+        {
+            Connection c2(c, cc);
+            c2.set_initial_keys(cc.peer_cid, 8);
+            c2.remember_transport_params(params, params_len);
+            c2.install_early_secret(Aead::Aes128Gcm, secret, 32, 0);
+            Stream *x = c2.streams().open(true);
+            x->send->write(kHello, sizeof kHello, took);
+            fn = c2.build_datagram(g_sent, first, sizeof first, 1000);
+        }
+        std::memcpy(copy, first, fn);
+        s.on_datagram(kPath, copy, fn, Ecn::NotEct, 2000);
+        s.reject_early(2100);
+        check(s.early_rejected() && s.drops().early == 1, "the kept one is dropped at once, and counted");
+        std::memcpy(copy, first, fn);
+        s.on_datagram(kPath, copy, fn, Ecn::NotEct, 2200);
+        check(s.drops().early == 2 && s.early_opened() == 0, "a later one too, never kept");
+        check(!s.install_early_secret(Aead::Aes128Gcm, secret, 32, 2300), "and no keys can come after");
+    }
+
+    // \~english A client turned down: its 0-RTT is forgotten, and streams and flow control start over (4.6.2).
+    // \~spanish Un cliente rechazado: su 0-RTT se olvida, y flujos y control de flujo empiezan de nuevo (4.6.2).  \~
+    {
+        Connection c3(c, cc);
+        c3.set_initial_keys(cc.peer_cid, 8);
+        c3.remember_transport_params(params, params_len);
+        c3.install_early_secret(Aead::Aes128Gcm, secret, 32, 0);
+        Stream *x = c3.streams().open(true);
+        x->send->write(kHello, sizeof kHello, took);
+        check(c3.build_datagram(g_sent, dgram, sizeof dgram, 1000) != 0 && c3.send_credit() == 0 &&
+                  c3.recovery().bytes_in_flight() != 0,
+              "the hello used the whole remembered credit");
+        c3.reject_early(2000);
+        check(c3.early_rejected() && c3.recovery().early_outstanding() == 0 && c3.recovery().bytes_in_flight() == 0,
+              "its 0-RTT packets are out of the flight, never resent (RFC 9002, 6.4)");
+        check(c3.streams().count() == 0 && c3.streams().peer_limit(true) == 0 && c3.send_credit() == 0,
+              "no stream left, and the limits are the ones it started with");
+        check(!c3.has_early_keys() && c3.build_datagram(g_sent, dgram, sizeof dgram, 1500) == 0,
+              "and no 0-RTT goes out any more");
+        check(c3.remember_transport_params(params, params_len) && c3.send_credit() == sizeof kHello,
+              "the credit is whole again: nothing counts as sent");
+        Stream *y = c3.streams().open(true);
+        check(y != nullptr && y->id == 0, "stream numbering starts over");
+    }
+
+    // \~english Remembered values are replaced by the handshake's, never the other way round.
+    // \~spanish Los valores recordados los sustituye el saludo, nunca al reves.  \~
+    {
+        Connection c4(c, cc);
+        c4.set_initial_keys(cc.peer_cid, 8);
+        TransportParams tp;
+        tp.initial_source_connection_id.present = true;
+        tp.initial_source_connection_id.len = 8;
+        for (int i = 0; i < 8; ++i) tp.initial_source_connection_id.bytes[i] = static_cast<uint8_t>(0x0d + i);
+        tp.original_destination_connection_id = tp.initial_source_connection_id;
+        uint8_t real[256];
+        const size_t rn = encode_transport_params(tp, real, sizeof real);
+        check(c4.on_peer_transport_params(real, rn, 0), "the handshake's parameters");
+        check(!c4.remember_transport_params(params, params_len), "after them, remembered ones are refused");
+        Connection s5(c, blank(true, 0x50, 0));
+        check(!s5.remember_transport_params(params, params_len), "and a server remembers nothing");
+    }
+
+    // \~english A server's 0-RTT context: its limits, without IDs, token or ACK timing (7.4.1).
+    // \~spanish El contexto de 0-RTT de un servidor: sus limites, sin identificadores, testigo ni tiempo de ACK (7.4.1).  \~
+    {
+        ConnectionConfig sc = blank(true, 0x50, 0);
+        sc.ack.max_ack_delay_us = 40000;
+        Connection s(c, sc);
+        s.set_initial_keys(cc.peer_cid, 8);
+        uint8_t ctx[256];
+        const size_t cn = s.early_context(ctx, sizeof ctx);
+        uint8_t full[256];
+        const size_t fn = s.local_transport_params(full, sizeof full);
+        check(has_param(full, fn, 0x0f) && has_param(full, fn, 0x00) && has_param(full, fn, 0x02) &&
+                  has_param(full, fn, 0x0b),
+              "the full parameters carry the IDs, the token and max_ack_delay");
+        check(cn != 0 && has_param(ctx, cn, 0x04) && !has_param(ctx, cn, 0x0f) && !has_param(ctx, cn, 0x00) &&
+                  !has_param(ctx, cn, 0x02) && !has_param(ctx, cn, 0x0b) && !has_param(ctx, cn, 0x10),
+              "the context keeps the limits and none of those");
+    }
+}
+
 /// \~english A stream opened before the peer's parameters came takes their window (7.4.1).
 /// \~spanish Un flujo abierto antes de que llegaran los parametros del otro toma su ventana (7.4.1).  \~
 void test_stream_windows() {
@@ -571,6 +873,10 @@ void test_stream_windows() {
 
 int main() {
     test_stream_windows();
+    {
+        test_support::FakeCrypto fc;
+        test_early_connection(fc);
+    }
     test_support::FakeCrypto fake;
     void *fake_key = fake.signing_key(Scheme::EcdsaSecp256r1Sha256, kFakeCert, sizeof kFakeCert);
     test_parameters(fake);

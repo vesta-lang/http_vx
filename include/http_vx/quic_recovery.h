@@ -142,6 +142,8 @@ struct SentPacket {
      * \~
      */
     bool other_path;
+    /// \~english Sealed with 0-RTT keys.  \~spanish Sellado con claves 0-RTT.  \~
+    bool early;
     /// \~english Outstanding, acknowledged or lost; internal.  \~spanish Pendiente, confirmado o perdido; interno.  \~
     uint8_t state;
 };
@@ -278,7 +280,30 @@ public:
      */
     bool on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eliciting,
                         bool in_flight, bool path_probe, uint64_t tag, uint64_t ack_largest,
-                        uint64_t now_us) noexcept;
+                        uint64_t now_us, bool early = false) noexcept;
+
+    /**
+     * @brief
+     * \~english Every 0-RTT packet still outstanding leaves the flight.
+     * \~spanish Todo paquete 0-RTT aun pendiente sale del vuelo.
+     * \~
+     *
+     * \~english
+     * 0-RTT rejected: their recovery state is discarded, nothing is resent
+     * (RFC 9002, 6.4) -- @p requeue null.  After a Retry the server threw
+     * them away, and they are handed back to be sent again (RFC 9000,
+     * 17.2.3) -- @p requeue hears each as lost.
+     * \~spanish
+     * 0-RTT rechazado: su estado de recuperacion se tira, no se reenvia nada (RFC
+     * 9002, 6.4) -- @p requeue nulo.  Tras un Retry el servidor los tiro, y se
+     * devuelven para mandarlos otra vez (RFC 9000, 17.2.3) -- @p requeue se
+     * entera de cada uno como perdido.
+     * \~
+     * @return \~english how many  \~spanish cuantos  \~
+     */
+    size_t drop_early(uint64_t now_us, RecoveryListener *requeue) noexcept;
+    /// \~english 0-RTT packets still outstanding.  \~spanish Paquetes 0-RTT aun pendientes.  \~
+    size_t early_outstanding() const noexcept;
 
     /**
      * @brief

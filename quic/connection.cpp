@@ -187,6 +187,7 @@ Connection::~Connection() {
         }
     }
     forget_one_rtt();
+    forget_early();
     for (size_t s = 0; s < kSpaces; ++s) {
         drop_from_heap(crypto_recv_[s]);
         drop_from_heap(crypto_send_[s]);
@@ -298,6 +299,9 @@ bool Connection::install_secrets(Space s, Aead a, const uint8_t *read_secret,
         }
     }
     k.have = true;
+    // \~english A client's 0-RTT keys have no use once it has 1-RTT ones (RFC 9001, 4.9.3: SHOULD).
+    // \~spanish Las claves 0-RTT de un cliente no sirven para nada cuando tiene las 1-RTT (RFC 9001, 4.9.3: DEBERIA).  \~
+    if (s == Space::Application && !cfg_.is_server && early_have_) forget_early();
     // \~english With 1-RTT keys, NEW_CONNECTION_ID can travel: hand out as many IDs as the peer takes.
     // \~spanish Con claves 1-RTT, NEW_CONNECTION_ID puede viajar: repartir tantos identificadores como acepte el otro.  \~
     if (s == Space::Application) top_up_cids();
@@ -341,6 +345,34 @@ bool tp_names(const TpConnectionId &t, const uint8_t *cid, size_t len) noexcept 
 
 size_t Connection::local_transport_params(uint8_t *out, size_t room) const noexcept {
     TransportParams tp;
+    own_params(tp);
+    return encode_transport_params(tp, out, room);
+}
+
+size_t Connection::early_context(uint8_t *out, size_t room) const noexcept {
+    /* \~english
+     * What a client may remember for 0-RTT (7.4.1): this end's parameters
+     * without the IDs, the reset token or the ACK timing.  Equal to what a
+     * ticket was issued with means no limit went down (7.4.1: MUST NOT).
+     * \~spanish
+     * Lo que un cliente puede recordar para 0-RTT (7.4.1): los parametros de este
+     * extremo sin los identificadores, el testigo ni el tiempo de ACK.  Igual a
+     * aquello con lo que se emitio un ticket significa que ningun limite bajo
+     * (7.4.1: NO DEBE).
+     * \~ */
+    TransportParams tp;
+    own_params(tp);
+    const TransportParams defaults;
+    tp.original_destination_connection_id.present = false;
+    tp.initial_source_connection_id.present = false;
+    tp.retry_source_connection_id.present = false;
+    tp.has_stateless_reset_token = false;
+    tp.max_ack_delay_ms = defaults.max_ack_delay_ms;
+    tp.ack_delay_exponent = defaults.ack_delay_exponent;
+    return encode_transport_params(tp, out, room);
+}
+
+void Connection::own_params(TransportParams &tp) const noexcept {
     // \~english The source ID of this end's first Initial (7.3): the first local ID.
     // \~spanish El identificador de origen del primer Initial de este extremo (7.3): el primer identificador local.  \~
     set_tp_cid(tp.initial_source_connection_id, local_cids_[0].cid, cfg_.local_cid_len);
@@ -373,7 +405,6 @@ size_t Connection::local_transport_params(uint8_t *out, size_t room) const noexc
     tp.initial_max_streams_bidi = streams_.max_streams(true);
     tp.initial_max_streams_uni = streams_.max_streams(false);
     tp.active_connection_id_limit = cfg_.active_cid_limit;
-    return encode_transport_params(tp, out, room);
 }
 
 bool Connection::on_peer_transport_params(const uint8_t *data, size_t n, uint64_t now_us) noexcept {
@@ -446,6 +477,77 @@ bool Connection::on_peer_transport_params(const uint8_t *data, size_t n, uint64_
         cfg_.peer_disable_active_migration = tp.disable_active_migration;
     }
     return true;
+}
+
+bool Connection::remember_transport_params(const uint8_t *data, size_t n) noexcept {
+    if (cfg_.is_server || peer_params_known_) return false;
+    TransportParams tp;
+    if (decode_transport_params(data, n, true, tp) != TpError::None) return false;
+    /* \~english
+     * 7.4.1: never the ACK timing, the IDs, preferred_address or the reset
+     * token -- those are the new connection's own.  The rest is what 0-RTT
+     * runs on, and the handshake's values replace it.
+     * \~spanish
+     * 7.4.1: nunca el tiempo de ACK, los identificadores, preferred_address ni el
+     * testigo -- esos son de la conexion nueva.  El resto es con lo que funciona
+     * el 0-RTT, y los valores del saludo lo sustituyen.
+     * \~ */
+    const uint64_t idle = tp.max_idle_timeout_ms * 1000;
+    if (idle != 0 && (cfg_.idle_timeout_us == 0 || idle < cfg_.idle_timeout_us)) cfg_.idle_timeout_us = idle;
+    if (tp.max_udp_payload_size < cfg_.max_datagram) cfg_.max_datagram = static_cast<size_t>(tp.max_udp_payload_size);
+    send_flow_.on_max_data(tp.initial_max_data);
+    streams_.on_peer_params(tp.initial_max_streams_bidi, tp.initial_max_streams_uni,
+                            tp.initial_max_stream_data_bidi_local, tp.initial_max_stream_data_bidi_remote,
+                            tp.initial_max_stream_data_uni);
+    cfg_.peer_disable_active_migration = tp.disable_active_migration;
+    return true;
+}
+
+bool Connection::install_early_secret(Aead a, const uint8_t *secret, size_t len, uint64_t now_us) noexcept {
+    if (early_have_ || early_gone_ || len > kMaxSecret) return false;
+    KeyMaterial m;
+    const bool ok = derive_key_material(crypto_, cfg_.version, a, secret, len, m) && prepare_keys(crypto_, m, early_keys_);
+    util::vesta_memset_noinline(&m, 0, sizeof m);
+    if (!ok) return false;
+    early_have_ = true;
+    // \~english A server may have kept some that came first (RFC 9001, 4.1.4).
+    // \~spanish Un servidor puede haber guardado alguno que llego antes (RFC 9001, 4.1.4).  \~
+    if (cfg_.is_server) replay(Space::Application, now_us, true);
+    return true;
+}
+
+void Connection::forget_early() noexcept {
+    if (early_have_) forget_keys(crypto_, early_keys_);
+    early_have_ = false;
+    early_gone_ = true;
+    early_discard_at_ = kNever;
+}
+
+void Connection::reject_early(uint64_t now_us) noexcept {
+    if (early_rejected_) return;
+    early_rejected_ = true;
+    forget_early();
+    // \~english Kept 0-RTT packets will never be opened (4.6.2: MUST NOT process any).
+    // \~spanish Los paquetes 0-RTT guardados no se abriran nunca (4.6.2: NO DEBE procesar ninguno).  \~
+    if (pending_ != nullptr)
+        for (size_t i = 0; i < kPendingPackets; ++i)
+            if (pending_[i].used && pending_[i].early) {
+                pending_[i].used = false;
+                ++drops_.early;
+            }
+    if (cfg_.is_server) return;
+    /* \~english
+     * The client: what it sent in 0-RTT is gone for good (RFC 9002, 6.4), and
+     * everything it assumed may be wrong -- streams and flow control start
+     * over (RFC 9001, 4.6.2), on the handshake's parameters.
+     * \~spanish
+     * El cliente: lo que mando en 0-RTT se perdio para siempre (RFC 9002, 6.4), y
+     * todo lo que supuso puede estar mal -- flujos y control de flujo empiezan de
+     * nuevo (RFC 9001, 4.6.2), con los parametros del saludo.
+     * \~ */
+    recovery_.drop_early(now_us, nullptr);
+    streams_.reset();
+    send_flow_.reset(cfg_.peer_max_data);
 }
 
 const char *key_update_name(KeyUpdate k) noexcept {
@@ -1048,7 +1150,7 @@ bool Connection::can_open(Space s) const noexcept {
     return !(cfg_.is_server && s == Space::Application && !confirmed_);
 }
 
-bool Connection::keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) noexcept {
+bool Connection::keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn, bool early) noexcept {
     if (n > sizeof(Pending::bytes)) return false;
     if (pending_ == nullptr) {
         const util::AllocScope scope(util::AllocUse::Instant, util::AllocShape::Fixed,
@@ -1066,14 +1168,15 @@ bool Connection::keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) no
         q.len = static_cast<uint16_t>(n);
         q.space = static_cast<uint8_t>(s);
         q.ecn = ecn;
+        q.early = early;
         q.used = true;
         return true;
     }
     return false;
 }
 
-void Connection::replay(Space s, uint64_t now_us) noexcept {
-    if (pending_ == nullptr || !can_open(s)) return;
+void Connection::replay(Space s, uint64_t now_us, bool early) noexcept {
+    if (pending_ == nullptr || !(early ? early_have_ : can_open(s))) return;
 
     HeaderContext ctx;
     ctx.short_dcid_len = cfg_.local_cid_len;
@@ -1082,7 +1185,7 @@ void Connection::replay(Space s, uint64_t now_us) noexcept {
     datagram_len_ = static_cast<size_t>(-1);
     for (size_t i = 0; i < kPendingPackets; ++i) {
         Pending &q = pending_[i];
-        if (!q.used || q.space != static_cast<uint8_t>(s)) continue;
+        if (!q.used || q.space != static_cast<uint8_t>(s) || q.early != early) continue;
 
         // \~english Freed first: processing it may keep another one in its place.
         // \~spanish Se libera antes: procesarlo puede guardar otro en su sitio.  \~
@@ -1712,10 +1815,23 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     }
 
     Space s;
+    bool early = false;
     switch (h.type) {
     case PacketType::Initial:   s = Space::Initial; break;
     case PacketType::Handshake: s = Space::Handshake; break;
     case PacketType::OneRtt:    s = Space::Application; break;
+    case PacketType::ZeroRtt:
+        // \~english A client never opens one (RFC 9001, 5.6): it MUST discard them.
+        // \~spanish Un cliente nunca abre uno (RFC 9001, 5.6): DEBE descartarlos.  \~
+        if (!cfg_.is_server) {
+            ++drops_.early;
+            return false;
+        }
+        // \~english 0-RTT and 1-RTT share the application space's numbering (17.2.3).
+        // \~spanish 0-RTT y 1-RTT comparten la numeracion del espacio de aplicacion (17.2.3).  \~
+        s = Space::Application;
+        early = true;
+        break;
     case PacketType::VersionNegotiation:
         process_version_negotiation(p, h);
         return false;
@@ -1723,17 +1839,16 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
         process_retry(p, h, now_us);
         return false;
     default:
-        // \~english 0-RTT comes in a later step; an unknown version is the acceptor's business.
-        // \~spanish 0-RTT llega en un paso posterior; una version desconocida es cosa del acceptor.  \~
+        // \~english An unknown version is the acceptor's business.  \~spanish Una version desconocida es cosa del acceptor.  \~
         ++drops_.unsupported;
         return false;
     }
 
-    // \~english Addressed to this connection: our ID, or the original one on a client's Initial.
-    // \~spanish Dirigido a esta conexion: nuestro identificador, o el original en un Initial del cliente.  \~
+    // \~english Addressed to this connection: our ID, or the original one on a client's Initial or 0-RTT.
+    // \~spanish Dirigido a esta conexion: nuestro identificador, o el original en un Initial o 0-RTT del cliente.  \~
     const uint8_t *dcid = p + h.dcid.off;
     const bool ours = owns_cid(dcid, h.dcid.len);
-    const bool original = cfg_.is_server && s == Space::Initial && h.dcid.len == odcid_len_ &&
+    const bool original = cfg_.is_server && (s == Space::Initial || early) && h.dcid.len == odcid_len_ &&
                           bytes_equal(dcid, odcid_, odcid_len_);
     if (!ours && !original) {
         ++drops_.wrong_cid;
@@ -1795,7 +1910,13 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     }
 
     Keys &k = keys_[idx(s)];
-    if (!can_open(s)) {
+    if (early && !early_have_) {
+        // \~english 0-RTT keys still to come: kept like any other.  Turned down, or gone: never opened (4.6.2, 4.9.3).
+        // \~spanish Claves 0-RTT aun por llegar: se guarda como cualquier otro.  Rechazado, o ya sin claves: nunca se abre (4.6.2, 4.9.3).  \~
+        if (early_gone_ || !keep_for_later(p, h.size, s, ecn, true)) ++drops_.early;
+        return false;
+    }
+    if (!early && !can_open(s)) {
         // \~english Keys still to come: keep it (few, bounded).  Keys gone: it is late.
         // \~spanish Claves aun por llegar: se guarda (pocos, acotado).  Claves ya tiradas: llega tarde.  \~
         if (discarded_[idx(s)] || !keep_for_later(p, h.size, s, ecn)) ++drops_.no_keys;
@@ -1804,7 +1925,14 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
 
     Unprotected u;
     Opened r;
-    if (s == Space::Application) {
+    if (early) {
+        const Unprotect x =
+            unprotect_packet(crypto_, early_keys_, p, h, acks_[idx(Space::Application)].expected_pn(), u);
+        r = x == Unprotect::Ok                ? Opened::Ok
+            : x == Unprotect::Forged          ? Opened::Forged
+            : x == Unprotect::ReservedBitsSet ? Opened::ReservedBits
+                                              : Opened::Failed;
+    } else if (s == Space::Application) {
         r = open_one_rtt(p, h, u, now_us);
     } else {
         const Unprotect x = unprotect_packet(crypto_, k.read, p, h, acks_[idx(s)].expected_pn(), u);
@@ -1872,6 +2000,19 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     acks_[idx(s)].on_received(u.pn, eliciting, ecn, arrival_us_);
     restart_idle(now_us);
     sent_eliciting_since_receipt_ = false;
+
+    /* \~english
+     * 0-RTT keys at a server: kept a while after the first 1-RTT packet, for
+     * 0-RTT ones reordered behind it, and gone three PTO later (RFC 9001,
+     * 4.9.3).
+     * \~spanish
+     * Claves 0-RTT en un servidor: se guardan un rato tras el primer paquete
+     * 1-RTT, para los 0-RTT reordenados detras, y se van tres PTO despues (RFC
+     * 9001, 4.9.3).
+     * \~ */
+    if (early) ++early_opened_;
+    if (!early && s == Space::Application && early_have_ && early_discard_at_ == kNever)
+        early_discard_at_ = now_us + 3 * pto_duration();
 
     /* \~english
      * A Handshake packet proves the client's address: only an end that saw
@@ -2057,6 +2198,9 @@ void Connection::process_retry(const uint8_t *p, const PacketHeader &h, uint64_t
     }
     retried_ = true;
     recovery_.on_retry(now_us, *this);
+    // \~english 0-RTT sent before the Retry was thrown away by the server: sent again, with new numbers (17.2.3).
+    // \~spanish El 0-RTT mandado antes del Retry lo tiro el servidor: se manda otra vez, con numeros nuevos (17.2.3).  \~
+    recovery_.drop_early(now_us, this);
 }
 
 bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, PacketType type,
@@ -2235,7 +2379,7 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
 
 size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &rec,
                                 bool &eliciting, uint64_t &ack_largest,
-                                uint64_t now_us) noexcept {
+                                uint64_t now_us, bool early) noexcept {
     size_t used = 0;
     AckTracker &acks = acks_[idx(s)];
 
@@ -2257,11 +2401,11 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
         return n;
     }
 
-    // \~english An ACK when one is owed: at once, or its delay is up.
-    // \~spanish Un ACK cuando se debe: al momento, o se acabo su plazo.  \~
+    // \~english An ACK when one is owed: at once, or its delay is up.  Never in 0-RTT (12.5, 17.2.3).
+    // \~spanish Un ACK cuando se debe: al momento, o se acabo su plazo.  Nunca en 0-RTT (12.5, 17.2.3).  \~
     const uint64_t deadline = acks.ack_deadline();
-    bool acked = false;
-    if (acks.ranges() != 0 && deadline != kNever && deadline <= now_us) {
+    bool acked = early;
+    if (!early && acks.ranges() != 0 && deadline != kNever && deadline <= now_us) {
         const size_t n = acks.write_ack(p, room, now_us);
         if (n != 0) {
             ack_largest = acks.range(0).largest;
@@ -2277,7 +2421,18 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
 
     size_t n = 0;
 
-    if (s == Space::Application) {
+    /* \~english
+     * Control frames only in 1-RTT.  HANDSHAKE_DONE and RETIRE_CONNECTION_ID
+     * are never possible in 0-RTT (12.5); the rest would be allowed, and wait
+     * the one round trip until 1-RTT: in 0-RTT goes stream data and nothing
+     * this end has to take back if 0-RTT is turned down.
+     * \~spanish
+     * Tramas de control solo en 1-RTT.  HANDSHAKE_DONE y RETIRE_CONNECTION_ID
+     * nunca son posibles en 0-RTT (12.5); el resto estaria permitido, y espera el
+     * viaje de ida y vuelta hasta 1-RTT: en 0-RTT van datos de flujos y nada que
+     * este extremo tenga que deshacer si se rechaza el 0-RTT.
+     * \~ */
+    if (s == Space::Application && !early) {
         if (handshake_done_owed_ && !full(rec) && (n = write_handshake_done(p + used, room - used)) != 0) {
             used += n;
             eliciting = true;
@@ -2378,7 +2533,7 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
     // \~english CRYPTO, in every space: not flow controlled, never counted against MAX_DATA.
     // \~spanish CRYPTO, en todos los espacios: sin control de flujo, nunca cuenta contra MAX_DATA.  \~
     SendStream &cs = *crypto_send_[idx(s)];
-    while (!full(rec) && room - used > 16) {
+    while (!early && !full(rec) && room - used > 16) {
         StreamPiece piece;
         if (!cs.next(piece, room - used - 16, kNever)) break;
         if (piece.len == 0) break;
@@ -2601,7 +2756,7 @@ void Connection::write_blocked(uint8_t *p, size_t room, size_t &used, PacketReco
 }
 
 size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, bool &padded,
-                                uint64_t now_us, PathState *probe, const PeerCid *dest) noexcept {
+                                uint64_t now_us, PathState *probe, const PeerCid *dest, bool early) noexcept {
     padded = false;
     if (!recovery_.can_record(s) && state_ != ConnState::Closing) return 0;
 
@@ -2636,14 +2791,17 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     // \~spanish La cabecera, hasta el numero de paquete.  \~
     size_t h = 0;
     size_t length_at = 0;
-    const bool is_long = s != Space::Application;
+    const bool is_long = s != Space::Application || early;
     if (room < 64) return 0;
     // \~english After a Retry an Initial header carries the token: it has to fit first.
     // \~spanish Tras un Retry la cabecera de un Initial lleva el testigo: primero tiene que caber.  \~
     const size_t token_room = s == Space::Initial ? varint_size(token_len_) + token_len_ : 0;
     if (token_room + 64 > room) return 0;
     if (is_long) {
-        out[h++] = static_cast<uint8_t>(0xc0 | (long_type_bits(s, cfg_.version) << 4));
+        // \~english 0-RTT's type: 0x01 in version 1 (17.2.3), 0b10 in version 2 (RFC 9369, 3.2).
+        // \~spanish El tipo de 0-RTT: 0x01 en la version 1 (17.2.3), 0b10 en la version 2 (RFC 9369, 3.2).  \~
+        const uint8_t type = early ? (cfg_.version == kVersion2 ? 2 : 1) : long_type_bits(s, cfg_.version);
+        out[h++] = static_cast<uint8_t>(0xc0 | (type << 4));
         out[h++] = static_cast<uint8_t>(cfg_.version >> 24);
         out[h++] = static_cast<uint8_t>(cfg_.version >> 16);
         out[h++] = static_cast<uint8_t>(cfg_.version >> 8);
@@ -2741,7 +2899,7 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
             probe->challenge_interval *= 2;
         }
     } else {
-        len = write_frames(s, payload, payload_room, rec, eliciting, ack_largest, now_us);
+        len = write_frames(s, payload, payload_room, rec, eliciting, ack_largest, now_us, early);
     }
     if (len == 0) return 0;
 
@@ -2786,7 +2944,8 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
 
     if (is_long) encode_varint_width(out + length_at, 2, pn_len + len + kTagSize);
 
-    if (protect_packet(crypto_, keys_[i].write, out, pn_offset, pn_len, pn, len) != Protect::Ok) {
+    if (protect_packet(crypto_, early ? early_keys_ : keys_[i].write, out, pn_offset, pn_len, pn, len) !=
+        Protect::Ok) {
         fail(TransportError::InternalError, 0, now_us);
         return 0;
     }
@@ -2795,8 +2954,9 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     ++next_pn_[i];
     bytes_out_ += size;
     (probe != nullptr ? *probe : paths_[active_]).bytes_out += size;
+    if (early) ++early_sent_;
 
-    if (s == Space::Application) {
+    if (s == Space::Application && !early) {
         OneRtt &o = one_rtt_;
         ++o.sealed;
         if (o.first_sent_pn == kNever) o.first_sent_pn = pn;
@@ -2828,7 +2988,7 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
         records_[rec.tag % record_cap_] = rec;
         ++next_tag_;
         recovery_.on_packet_sent(s, pn, static_cast<uint32_t>(size), eliciting, in_flight, probe != nullptr,
-                                 rec.tag, ack_largest, now_us);
+                                 rec.tag, ack_largest, now_us, early);
         /* \~english
          * Sending restarts the idle timer only for the first ack-eliciting
          * packet since the last receipt (10.1): otherwise the probes of a
@@ -2925,8 +3085,15 @@ size_t Connection::build_datagram(Path &path, uint8_t *out, size_t room, uint64_
 
     size_t total = 0;
     for (size_t s = 0; s < kSpaces; ++s) {
-        if (!keys_[s].have) continue;
         const Space sp = static_cast<Space>(s);
+        // \~english A client's application data before 1-RTT keys goes in 0-RTT packets (RFC 9001, 5.6).
+        // \~spanish Los datos de aplicacion de un cliente antes de las claves 1-RTT van en paquetes 0-RTT (RFC 9001, 5.6).  \~
+        const bool early = sp == Space::Application && !keys_[s].have && early_have_ && !cfg_.is_server;
+        if (early) {
+            total += build_packet(sp, out + total, room - total, Pad::Never, padded, now_us, nullptr, nullptr, true);
+            break;
+        }
+        if (!keys_[s].have) continue;
 
         /* \~english
          * A datagram with an Initial is padded to 1200 bytes: always from a
@@ -2964,6 +3131,7 @@ uint64_t Connection::timer() const noexcept {
 
     uint64_t t = min64(min64(idle_deadline_, recovery_.timer()), one_rtt_.prev_until);
     t = min64(t, path_timer());
+    t = min64(t, early_discard_at_);
 
     /* \~english
      * An ACK that cannot be sent is no reason to wake: a server at its
@@ -3002,6 +3170,9 @@ void Connection::on_timer(uint64_t now_us) noexcept {
         one_rtt_.prev_until = kNever;
         ++key_counts_.old_discarded;
     }
+    // \~english A server's 0-RTT keys have had their three PTO since the first 1-RTT packet (RFC 9001, 4.9.3).
+    // \~spanish Las claves 0-RTT de un servidor ya tuvieron sus tres PTO desde el primer paquete 1-RTT (RFC 9001, 4.9.3).  \~
+    if (early_discard_at_ <= now_us) forget_early();
 
     run_path_timers(now_us);
     if (state_ != ConnState::Active) return;

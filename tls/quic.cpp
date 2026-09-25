@@ -24,21 +24,38 @@ namespace {
 /// \~spanish El tipo de trama al que se achaca un fallo del saludo: CRYPTO (19.6).  \~
 constexpr uint64_t kCryptoFrame = 0x06;
 
-/// \~english The session's configuration, carrying the connection's own transport parameters.
-/// \~spanish La configuracion de la sesion, con los parametros de transporte de la propia conexion.  \~
-SessionConfig with_params(const SessionConfig &cfg, const quic::Connection &conn, uint8_t *tp, size_t room,
-                          size_t &len) noexcept {
+} // namespace
+
+SessionConfig QuicHandshake::with_params(const SessionConfig &cfg, quic::Connection &conn,
+                                         QuicHandshake &self) noexcept {
+    // \~english The session carries the connection's own transport parameters.
+    // \~spanish La sesion lleva los parametros de transporte de la propia conexion.  \~
     SessionConfig out = cfg;
-    len = conn.local_transport_params(tp, room);
-    out.transport_params = len != 0 ? tp : nullptr;
-    out.transport_params_len = len;
+    self.tp_len_ = conn.local_transport_params(self.tp_, sizeof self.tp_);
+    out.transport_params = self.tp_len_ != 0 ? self.tp_ : nullptr;
+    out.transport_params_len = self.tp_len_;
+    if (cfg.server && cfg.early_data) {
+        // \~english The rememberable parameters first, then the caller's own context (RFC 9001, 4.6.3).
+        // \~spanish Primero los parametros recordables, y luego el contexto propio de quien llama (RFC 9001, 4.6.3).  \~
+        self.context_len_ = conn.early_context(self.context_, sizeof self.context_);
+        self.context_fits_ = self.context_len_ != 0 && cfg.early_context_len <= sizeof self.context_ - self.context_len_;
+        if (self.context_fits_ && cfg.early_context_len != 0) {
+            for (size_t i = 0; i < cfg.early_context_len; ++i) self.context_[self.context_len_ + i] = cfg.early_context[i];
+            self.context_len_ += cfg.early_context_len;
+        }
+        out.early_context = self.context_;
+        out.early_context_len = self.context_len_;
+    }
+    // \~english A client runs 0-RTT on what it remembered; without it there is no 0-RTT (RFC 9000, 7.4.1).
+    // \~spanish Un cliente hace 0-RTT con lo que recordo; sin eso no hay 0-RTT (RFC 9000, 7.4.1).  \~
+    if (!cfg.server && cfg.early_data && cfg.resume != nullptr && cfg.resume->early_data &&
+        !conn.remember_transport_params(cfg.resume->params, cfg.resume->params_len))
+        out.early_data = false;
     return out;
 }
 
-} // namespace
-
 QuicHandshake::QuicHandshake(Crypto &c, quic::Connection &conn, const SessionConfig &cfg) noexcept
-    : conn_(conn), cfg_(with_params(cfg, conn, tp_, sizeof tp_, tp_len_)), session_(c, cfg_) {}
+    : conn_(conn), cfg_(with_params(cfg, conn, *this)), session_(c, cfg_) {}
 
 bool QuicHandshake::fail(uint64_t code, const char *why, uint64_t now_us) noexcept {
     if (!failed_) {
@@ -54,9 +71,51 @@ bool QuicHandshake::start(uint64_t now_us) noexcept {
                                   "this end's transport parameters do not fit", now_us);
     // \~english The connection's clock is the session's: ticket ages are measured on it.
     // \~spanish El reloj de la conexion es el de la sesion: las edades de los tickets se miden con el.  \~
+    if (!context_fits_)
+        return fail(kCryptoError + static_cast<uint8_t>(Alert::InternalError), "the 0-RTT context does not fit", now_us);
     session_.set_clock(now_us);
     if (!session_.start()) return fail(session_.failure().code, session_.failure().why, now_us);
+    // \~english A client that offered 0-RTT seals with its secret from now on (RFC 9001, 4.1.4).
+    // \~spanish Un cliente que ofrecio 0-RTT sella con su secreto desde ahora (RFC 9001, 4.1.4).  \~
+    const uint8_t *early = session_.early_secret();
+    if (early != nullptr && !conn_.install_early_secret(session_.early_aead(), early, session_.early_size(), now_us))
+        return fail(kCryptoError + static_cast<uint8_t>(Alert::InternalError),
+                    "the connection could not install the 0-RTT secret", now_us);
     return step(now_us);
+}
+
+bool QuicHandshake::decide_early(uint64_t now_us) noexcept {
+    if (early_decided_) return true;
+    if (cfg_.server) {
+        // \~english Decided once the ClientHello was taken: keys to open 0-RTT with, or none of it (4.6.2).
+        // \~spanish Se decide cuando se tomo el ClientHello: claves para abrir el 0-RTT, o nada de el (4.6.2).  \~
+        if (session_.reading() == Space::Initial) return true;
+        early_decided_ = true;
+        const uint8_t *early = session_.early_secret();
+        if (early == nullptr) {
+            conn_.reject_early(now_us);
+            return true;
+        }
+        return conn_.install_early_secret(session_.early_aead(), early, session_.early_size(), now_us) ||
+               fail(kCryptoError + static_cast<uint8_t>(Alert::InternalError),
+                    "the connection could not install the 0-RTT secret", now_us);
+    }
+    /* \~english
+     * A client knows from the server's answer: a retry, or EncryptedExtensions
+     * without early_data, turned it down (RFC 9001, 4.6.2).  Applied before
+     * the server's new parameters, which the reset would otherwise undo.
+     * \~spanish
+     * Un cliente lo sabe por la respuesta del servidor: un reintento, o
+     * EncryptedExtensions sin early_data, lo rechazaron (RFC 9001, 4.6.2).  Se
+     * aplica antes que los parametros nuevos del servidor, que si no el reinicio
+     * desharia.
+     * \~ */
+    if (!session_.early_offered()) return true;
+    size_t n = 0;
+    if (!session_.retried() && session_.peer_transport_params(n) == nullptr) return true;
+    early_decided_ = true;
+    if (!session_.early_accepted()) conn_.reject_early(now_us);
+    return true;
 }
 
 bool QuicHandshake::feed(uint64_t now_us) noexcept {
@@ -125,6 +184,7 @@ bool QuicHandshake::step(uint64_t now_us) noexcept {
     if (conn_.state() != quic::ConnState::Active) return false;
     session_.set_clock(now_us);
     if (!feed(now_us)) return false;
+    if (!decide_early(now_us)) return false;
     drain();
     if (!install(Space::Handshake, handshake_installed_, now_us) ||
         !install(Space::Application, application_installed_, now_us))

@@ -52,12 +52,13 @@
  * its address is proven.  A move that is not proven falls back to the last
  * validated address.  A client moves or probes a new local address itself.
  *
- * This is the core the rest stands on, and it is not the whole of QUIC.  What
- * follows, each with its own tests, is the TLS handshake with 0-RTT, which
- * brings the transport parameters.  Until the handshake is here, the connection
- * takes secrets through `install_secrets` and learns that the handshake is
- * done through `handshake_confirmed` -- which is exactly what the handshake
- * will call.
+ * The connection knows nothing of TLS.  It takes secrets through
+ * `install_secrets` and `install_early_secret`, learns the handshake is done
+ * through `handshake_confirmed`, and is given the peer's transport parameters
+ * by `on_peer_transport_params`; tls_quic.h is what calls them.  0-RTT: a
+ * client seals application data in 0-RTT packets until it has 1-RTT keys,
+ * on the limits it remembered; a server opens them with its 0-RTT keys, in
+ * the application space's numbering, and turned down, opens none.
  *
  * \~spanish
  * El objeto que junta las piezas.  Entra un datagrama: sus paquetes pegados se
@@ -100,11 +101,13 @@
  * que no se prueba vuelve a la ultima direccion validada.  Un cliente se mueve
  * o sondea una direccion local nueva por si mismo.
  *
- * Este es el nucleo sobre el que se apoya el resto, y no es todo QUIC.  Lo que
- * sigue, con sus pruebas, es el saludo de TLS con 0-RTT, que trae los
- * parametros de transporte.  Hasta que el saludo este aqui, la conexion recibe
- * los secretos por `install_secrets` y se entera de que el saludo acabo por
- * `handshake_confirmed` -- que es justo lo que llamara el saludo.
+ * La conexion no sabe nada de TLS.  Recibe los secretos por `install_secrets` e
+ * `install_early_secret`, se entera de que el saludo acabo por
+ * `handshake_confirmed`, y le dan los parametros de transporte del otro por
+ * `on_peer_transport_params`; tls_quic.h es quien los llama.  0-RTT: un cliente
+ * sella datos de aplicacion en paquetes 0-RTT hasta tener claves 1-RTT, con los
+ * limites que recordo; un servidor los abre con sus claves 0-RTT, en la
+ * numeracion del espacio de aplicacion, y si los rechazo, no abre ninguno.
  * \~
  */
 #ifndef HTTP_VX_QUIC_CONNECTION_H
@@ -121,6 +124,7 @@
 #include "http_vx/quic_stream_recv.h"
 #include "http_vx/quic_stream_send.h"
 #include "http_vx/quic_streams.h"
+#include "http_vx/quic_transport_params.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -461,6 +465,18 @@ struct DropCounts {
     /// \~english An Initial from a server carrying a token (17.2.2).
     /// \~spanish Un Initial de un servidor que lleva testigo (17.2.2).  \~
     uint64_t initial_with_token = 0;
+    /**
+     * \~english
+     * 0-RTT packets not opened: at a client, which never does (RFC 9001,
+     * 5.6); at a server that turned 0-RTT down, which MUST NOT (4.6.2); or
+     * once their keys were gone (4.9.3).
+     * \~spanish
+     * Paquetes 0-RTT no abiertos: en un cliente, que nunca lo hace (RFC 9001,
+     * 5.6); en un servidor que rechazo el 0-RTT, que NO DEBE (4.6.2); o cuando ya
+     * no estaban sus claves (4.9.3).
+     * \~
+     */
+    uint64_t early = 0;
 };
 
 /**
@@ -620,6 +636,22 @@ public:
 
     /**
      * @brief
+     * \~english Server: the part of its transport parameters a client may remember for 0-RTT (RFC 9000, 7.4.1).
+     * \~spanish Servidor: la parte de sus parametros de transporte que un cliente puede recordar para 0-RTT (RFC 9000, 7.4.1).
+     * \~
+     *
+     * \~english
+     * Bound into the tickets it issues and compared when 0-RTT comes back: 0-RTT is only
+     * accepted with them unchanged, so no remembered limit is ever lowered.
+     * \~spanish
+     * Atada a los tickets que emite y comparada cuando vuelve el 0-RTT: solo se
+     * acepta con ella sin cambios, asi que nunca baja ningun limite recordado.
+     * \~
+     */
+    size_t early_context(uint8_t *out, size_t room) const noexcept;
+
+    /**
+     * @brief
      * \~english The peer's transport parameters, as the handshake brought them: checked, authenticated, applied.
      * \~spanish Los parametros de transporte del otro, tal como los trajo el saludo: comprobados, autenticados, aplicados.
      * \~
@@ -640,6 +672,72 @@ public:
      */
     bool on_peer_transport_params(const uint8_t *data, size_t n, uint64_t now_us) noexcept;
     bool has_peer_transport_params() const noexcept { return peer_params_known_; }
+
+    /**
+     * @brief
+     * \~english Client: the server's transport parameters from an earlier connection, for 0-RTT (RFC 9000, 7.4.1).
+     * \~spanish Cliente: los parametros de transporte del servidor de una conexion anterior, para 0-RTT (RFC 9000, 7.4.1).
+     * \~
+     *
+     * \~english
+     * Only what may be remembered is applied -- the limits, the idle
+     * timeout, the datagram size, migration -- never the ACK timing, the IDs,
+     * the preferred address or the reset token; the handshake's values
+     * replace them.  False if they do not decode, or it is too late.
+     * \~spanish
+     * Solo se aplica lo que se puede recordar -- los limites, el plazo de
+     * inactividad, el tamano de datagrama, la migracion --, nunca el tiempo de
+     * ACK, los identificadores, la direccion preferida ni el testigo; los valores
+     * del saludo los sustituyen.  Falso si no se decodifican, o ya es tarde.
+     * \~
+     */
+    bool remember_transport_params(const uint8_t *data, size_t n) noexcept;
+
+    /**
+     * @brief
+     * \~english The 0-RTT secret: a client seals its early packets with it, a server opens them (RFC 9001, 4.6, 5.6).
+     * \~spanish El secreto de 0-RTT: un cliente sella con el sus paquetes tempranos, un servidor los abre (RFC 9001, 4.6, 5.6).
+     * \~
+     *
+     * \~english
+     * A client sends in 0-RTT packets what it has for the application space
+     * until it has 1-RTT keys; what goes there is what the application chose
+     * to send before the handshake -- this does not decide it (5.6).
+     * \~spanish
+     * Un cliente manda en paquetes 0-RTT lo que tiene para el espacio de
+     * aplicacion hasta tener claves 1-RTT; lo que va ahi es lo que la aplicacion
+     * decidio mandar antes del saludo -- esto no lo decide (5.6).
+     * \~
+     */
+    bool install_early_secret(Aead a, const uint8_t *secret, size_t len, uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english 0-RTT turned down (RFC 9001, 4.6.2).
+     * \~spanish 0-RTT rechazado (RFC 9001, 4.6.2).
+     * \~
+     *
+     * \~english
+     * A server opens no 0-RTT packet from then on, kept ones included.  A
+     * client stops sending them, forgets their recovery state (RFC 9002,
+     * 6.4) and resets every stream and the connection's flow control: its
+     * application sees `early_rejected()` and starts over.
+     * \~spanish
+     * Un servidor no abre ningun paquete 0-RTT desde entonces, tampoco los
+     * guardados.  Un cliente deja de mandarlos, olvida su estado de recuperacion
+     * (RFC 9002, 6.4) y reinicia todos los flujos y el control de flujo de la
+     * conexion: su aplicacion ve `early_rejected()` y empieza de nuevo.
+     * \~
+     */
+    void reject_early(uint64_t now_us) noexcept;
+    bool early_rejected() const noexcept { return early_rejected_; }
+    /// \~english 0-RTT packets sealed (client) and opened (server).  \~spanish Paquetes 0-RTT sellados (cliente) y abiertos (servidor).  \~
+    uint64_t early_sent() const noexcept { return early_sent_; }
+    uint64_t early_opened() const noexcept { return early_opened_; }
+    /// \~english Whether the 0-RTT keys are still held (RFC 9001, 4.9.3).  \~spanish Si aun se tienen las claves 0-RTT (RFC 9001, 4.9.3).  \~
+    bool has_early_keys() const noexcept { return early_have_; }
+    /// \~english What the peer's MAX_DATA still lets this end send.  \~spanish Lo que el MAX_DATA del otro aun deja mandar a este extremo.  \~
+    uint64_t send_credit() const noexcept { return send_flow_.credit(); }
 
     /**
      * @brief
@@ -906,15 +1004,18 @@ private:
      */
     size_t build_packet(Space s, uint8_t *out, size_t room, Pad pad, bool &padded,
                         uint64_t now_us, PathState *probe = nullptr,
-                        const PeerCid *dest = nullptr) noexcept;
+                        const PeerCid *dest = nullptr, bool early = false) noexcept;
+    /// \~english @p early: a 0-RTT packet, where no ACK, CRYPTO or connection-ID frame goes (RFC 9000, 12.5).
+    /// \~spanish @p early: un paquete 0-RTT, donde no va ninguna trama ACK, CRYPTO ni de identificadores (RFC 9000, 12.5).  \~
     size_t write_frames(Space s, uint8_t *p, size_t room, PacketRecord &rec,
-                        bool &eliciting, uint64_t &ack_largest, uint64_t now_us) noexcept;
+                        bool &eliciting, uint64_t &ack_largest, uint64_t now_us, bool early = false) noexcept;
     size_t write_probe_frames(PathState &path, uint8_t *p, size_t room, bool padded) noexcept;
     size_t amplification_budget(size_t path) const noexcept;
     void restart_idle(uint64_t now_us) noexcept;
     bool can_open(Space s) const noexcept;
-    bool keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) noexcept;
-    void replay(Space s, uint64_t now_us) noexcept;
+    bool keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn, bool early = false) noexcept;
+    /// \~english @p early: the 0-RTT packets kept, and only those.  \~spanish @p early: los paquetes 0-RTT guardados, y solo esos.  \~
+    void replay(Space s, uint64_t now_us, bool early = false) noexcept;
 
     /**
      * \~english
@@ -938,6 +1039,9 @@ private:
         uint16_t len;
         uint8_t space;
         Ecn ecn;
+        /// \~english A 0-RTT packet: it waits for the 0-RTT keys, not the 1-RTT ones.
+        /// \~spanish Un paquete 0-RTT: espera a las claves 0-RTT, no a las 1-RTT.  \~
+        bool early;
         bool used;
     };
     static constexpr size_t kPendingPackets = 4;
@@ -954,6 +1058,24 @@ private:
     ConnState state_ = ConnState::Active;
 
     Keys keys_[kSpaces];
+
+    /* \~english
+     * 0-RTT: one direction only -- a client's write keys, a server's read
+     * keys (RFC 9001, 5.6) -- in the application space's numbering.
+     * \~spanish
+     * 0-RTT: una sola direccion -- las claves de escritura de un cliente, las de
+     * lectura de un servidor (RFC 9001, 5.6) -- en la numeracion del espacio de
+     * aplicacion.
+     * \~ */
+    void own_params(TransportParams &tp) const noexcept;
+    PacketKeys early_keys_;
+    bool early_have_ = false;
+    bool early_gone_ = false;
+    bool early_rejected_ = false;
+    uint64_t early_discard_at_ = kNever;
+    uint64_t early_sent_ = 0;
+    uint64_t early_opened_ = 0;
+    void forget_early() noexcept;
 
     /**
      * \~english

@@ -45,8 +45,12 @@
  * key only it has (tls_ticket.h), so it keeps no state for them; the client
  * keeps what it received, for its owner to take and use once (C.4).
  *
- * What this does not do yet: 0-RTT, and deciding whether to trust the
- * server's certificate -- the chain is kept for whoever does.
+ * **0-RTT** only with a ticket that allows it, and on a server only with a
+ * replay guard (8): fresh, never seen, the same suite, protocol and context
+ * as when the ticket was issued (4.2.10; RFC 9001, 4.6.3).
+ *
+ * What this does not do yet: deciding whether to trust the server's
+ * certificate -- the chain is kept for whoever does.
  *
  * \~spanish
  * La pieza que junta las demas: los mensajes de tls_messages.h, el calendario
@@ -82,8 +86,13 @@
  * ellos; el cliente guarda lo que recibio, para que su dueno lo tome y lo use
  * una vez (C.4).
  *
- * Lo que esto aun no hace: 0-RTT, y decidir si fiarse del certificado del
- * servidor -- la cadena se guarda para quien lo haga.
+ * **0-RTT** solo con un ticket que lo permita, y en un servidor solo con un
+ * guardian contra repeticiones (8): fresco, nunca visto, con el mismo
+ * algoritmo, protocolo y contexto que cuando se emitio el ticket (4.2.10; RFC
+ * 9001, 4.6.3).
+ *
+ * Lo que esto aun no hace: decidir si fiarse del certificado del servidor -- la
+ * cadena se guarda para quien lo haga.
  * \~
  */
 #ifndef HTTP_VX_TLS_SESSION_H

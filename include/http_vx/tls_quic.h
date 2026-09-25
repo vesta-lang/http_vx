@@ -108,10 +108,25 @@ private:
     bool feed(uint64_t now_us) noexcept;
     bool drain() noexcept;
     bool install(Space s, bool &done, uint64_t now_us) noexcept;
+    bool decide_early(uint64_t now_us) noexcept;
+    static SessionConfig with_params(const SessionConfig &cfg, quic::Connection &conn, QuicHandshake &self) noexcept;
 
     quic::Connection &conn_;
     uint8_t tp_[kMaxTransportParams] = {};
     size_t tp_len_ = 0;
+    /* \~english
+     * A server's 0-RTT context: its rememberable transport parameters, then
+     * whatever the caller's configuration adds (RFC 9001, 4.6.3).
+     * \~spanish
+     * El contexto de 0-RTT de un servidor: sus parametros de transporte
+     * recordables, y luego lo que anada la configuracion de quien llama (RFC
+     * 9001, 4.6.3).
+     * \~ */
+    static constexpr size_t kMaxContext = 1024;
+    uint8_t context_[kMaxContext] = {};
+    size_t context_len_ = 0;
+    bool context_fits_ = true;
+    bool early_decided_ = false;
     SessionConfig cfg_;
     Session session_;
     bool handshake_installed_ = false;
