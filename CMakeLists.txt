@@ -176,6 +176,7 @@ add_library(http_vx_quic STATIC
         quic/stream_recv.cpp
         quic/stream_send.cpp
         quic/streams.cpp
+        quic/transport_params.cpp
         quic/varint.cpp
 )
 target_include_directories(http_vx_quic
@@ -446,6 +447,7 @@ if (HTTP_VX_BUILD_TESTS)
         target_compile_definitions(test_quic_connection PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
+    http_vx_add_test(test_quic_transport_params tests/test_quic_transport_params.cpp)
     http_vx_add_test(test_chacha20_poly1305 tests/test_chacha20_poly1305.cpp)
     target_link_libraries(test_chacha20_poly1305 PRIVATE http_vx_chacha)
 
