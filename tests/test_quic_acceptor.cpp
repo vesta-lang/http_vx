@@ -559,6 +559,23 @@ public:
     bool mask(void *s, const uint8_t *sample, uint8_t *out) noexcept override {
         return inner.mask(s, sample, out);
     }
+    bool supports(Group g) const noexcept override { return inner.supports(g); }
+    void *generate_key(Group g, uint8_t *pub) noexcept override { return inner.generate_key(g, pub); }
+    void *import_key(Group g, const uint8_t *priv, size_t pl, const uint8_t *pub) noexcept override {
+        return inner.import_key(g, priv, pl, pub);
+    }
+    Agreed agree(void *k, const uint8_t *peer, size_t pl, uint8_t *shared) noexcept override {
+        return inner.agree(k, peer, pl, shared);
+    }
+    void *signing_key(Scheme s, const uint8_t *p, size_t l) noexcept override { return inner.signing_key(s, p, l); }
+    bool sign(void *k, const uint8_t *m, size_t n, uint8_t *sig, size_t room, size_t &len) noexcept override {
+        return inner.sign(k, m, n, sig, room, len);
+    }
+    Verified verify(Scheme s, const uint8_t *c, size_t cl, const uint8_t *m, size_t n, const uint8_t *sig,
+                    size_t sl) noexcept override {
+        return inner.verify(s, c, cl, m, n, sig, sl);
+    }
+    void forget_key(void *k) noexcept override { inner.forget_key(k); }
 
 private:
     const uint8_t *script_;

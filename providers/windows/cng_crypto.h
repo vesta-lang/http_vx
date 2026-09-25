@@ -109,10 +109,24 @@ public:
                           size_t ad_len, const uint8_t *in, size_t n,
                           uint8_t *out) noexcept override;
     bool mask(void *hp, const uint8_t *sample, uint8_t *out) noexcept override;
+    bool supports(quic::Group g) const noexcept override;
+    void *generate_key(quic::Group g, uint8_t *pub) noexcept override;
+    void *import_key(quic::Group g, const uint8_t *priv, size_t priv_len, const uint8_t *pub) noexcept override;
+    quic::Agreed agree(void *key, const uint8_t *peer, size_t peer_len, uint8_t *shared) noexcept override;
+    void *signing_key(quic::Scheme s, const uint8_t *pkcs8, size_t len) noexcept override;
+    bool sign(void *key, const uint8_t *msg, size_t n, uint8_t *sig, size_t room,
+              size_t &sig_len) noexcept override;
+    quic::Verified verify(quic::Scheme s, const uint8_t *cert, size_t cert_len, const uint8_t *msg, size_t n,
+                          const uint8_t *sig, size_t sig_len) noexcept override;
+    void forget_key(void *key) noexcept override;
 
 private:
     /// \~english The algorithm handles, opened once; opaque to keep bcrypt.h out.
     /// \~spanish Los manejadores de algoritmo, abiertos una vez; opacos para que no entre bcrypt.h.  \~
+    void *x25519_ = nullptr;
+    void *ecdh256_ = nullptr;
+    void *ecdsa256_ = nullptr;
+    void *rsa_ = nullptr;
     void *gcm_ = nullptr;
     void *ecb_ = nullptr;
     void *hmac256_ = nullptr;

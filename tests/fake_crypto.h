@@ -136,7 +136,102 @@ public:
         return true;
     }
 
+    /* \~english
+     * A key exchange that agrees and a signature that checks, and nothing
+     * more.  The public key is the private key; the shared secret mixes both
+     * public keys in a fixed order, so either end computes the same.  A
+     * "certificate" is the same bytes as the "PKCS#8" key it goes with.
+     * \~spanish
+     * Un intercambio de claves que se pone de acuerdo y una firma que se
+     * comprueba, y nada mas.  La clave publica es la privada; el secreto
+     * compartido mezcla las dos claves publicas en un orden fijo, asi que los dos
+     * extremos calculan lo mismo.  Un "certificado" son los mismos bytes que la
+     * clave "PKCS#8" con la que va.
+     * \~ */
+    struct FakeKey {
+        Group group;
+        bool signing;
+        uint8_t pub[kMaxPublicKey];
+        uint64_t id;
+    };
+
+    bool supports(Group) const noexcept override { return true; }
+
+    void *generate_key(Group g, uint8_t *pub) noexcept override {
+        uint8_t priv[32];
+        if (!random(priv, sizeof priv)) return nullptr;
+        uint8_t full[kMaxPublicKey];
+        make_public(g, priv, full);
+        return import_key(g, priv, 32, full) != nullptr ? copy_public(g, full, pub) : nullptr;
+    }
+
+    void *import_key(Group g, const uint8_t *priv, size_t priv_len, const uint8_t *pub) noexcept override {
+        if (broken || priv_len != 32) return nullptr;
+        uint8_t want[kMaxPublicKey];
+        make_public(g, priv, want);
+        if (std::memcmp(want, pub, public_key_size(g)) != 0) return nullptr;
+        FakeKey *k = new FakeKey{g, false, {}, 0};
+        std::memcpy(k->pub, want, public_key_size(g));
+        last_ = k;
+        return k;
+    }
+
+    Agreed agree(void *key, const uint8_t *peer, size_t peer_len, uint8_t *shared) noexcept override {
+        FakeKey *k = static_cast<FakeKey *>(key);
+        if (broken || k == nullptr || k->signing) return Agreed::Failed;
+        const size_t n = public_key_size(k->group);
+        uint8_t zero = 0;
+        for (size_t i = 0; i < peer_len; ++i) zero = static_cast<uint8_t>(zero | peer[i]);
+        if (peer_len != n || zero == 0) return Agreed::BadPeerKey;
+        const bool mine_first = std::memcmp(k->pub, peer, n) < 0;
+        uint64_t a = mix(0x5EC4E7, mine_first ? k->pub : peer, n);
+        a = mix(a, mine_first ? peer : k->pub, n);
+        spread(a, shared, 32);
+        return Agreed::Ok;
+    }
+
+    void *signing_key(Scheme, const uint8_t *pkcs8, size_t len) noexcept override {
+        if (broken || len == 0) return nullptr;
+        return new FakeKey{Group::X25519, true, {}, mix(0x516, pkcs8, len)};
+    }
+
+    bool sign(void *key, const uint8_t *msg, size_t n, uint8_t *sig, size_t room,
+              size_t &sig_len) noexcept override {
+        FakeKey *k = static_cast<FakeKey *>(key);
+        if (broken || k == nullptr || !k->signing || room < 64) return false;
+        spread(mix(k->id, msg, n), sig, 64);
+        sig_len = 64;
+        return true;
+    }
+
+    Verified verify(Scheme, const uint8_t *cert, size_t cert_len, const uint8_t *msg, size_t n,
+                    const uint8_t *sig, size_t sig_len) noexcept override {
+        if (broken) return Verified::Failed;
+        if (cert_len == 0) return Verified::WrongKey;
+        uint8_t want[64];
+        spread(mix(mix(0x516, cert, cert_len), msg, n), want, 64);
+        return sig_len == 64 && std::memcmp(want, sig, 64) == 0 ? Verified::Ok : Verified::Bad;
+    }
+
+    void forget_key(void *key) noexcept override { delete static_cast<FakeKey *>(key); }
+
 private:
+    FakeKey *last_ = nullptr;
+
+    static void make_public(Group g, const uint8_t *priv, uint8_t *pub) {
+        if (g == Group::X25519) {
+            std::memcpy(pub, priv, 32);
+            return;
+        }
+        pub[0] = 4;
+        std::memcpy(pub + 1, priv, 32);
+        std::memcpy(pub + 33, priv, 32);
+    }
+
+    void *copy_public(Group g, const uint8_t *full, uint8_t *pub) {
+        std::memcpy(pub, full, public_key_size(g));
+        return last_;
+    }
     uint64_t seed_ = 0x0123456789abcdefull;
 
     static uint64_t mix(uint64_t a, const uint8_t *p, size_t n) {

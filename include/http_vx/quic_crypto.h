@@ -166,6 +166,64 @@ enum class OpenResult : uint8_t {
     Failed,
 };
 
+/// \~english The key exchange groups (RFC 8446, 4.2.7).  \~spanish Los grupos de intercambio de claves (RFC 8446, 4.2.7).  \~
+enum class Group : uint8_t {
+    X25519,
+    Secp256r1,
+};
+
+/// \~english The largest public key: an uncompressed P-256 point.  \~spanish La clave publica mas grande: un punto P-256 sin comprimir.  \~
+constexpr size_t kMaxPublicKey = 65;
+/// \~english The largest shared secret.  \~spanish El secreto compartido mas grande.  \~
+constexpr size_t kMaxShared = 32;
+/// \~english The largest signature this code makes or checks: RSA-4096.  \~spanish La firma mas grande que hace o comprueba este codigo: RSA-4096.  \~
+constexpr size_t kMaxSignature = 512;
+
+/// \~english How many bytes a public key of @p g takes.  \~spanish Cuantos bytes ocupa una clave publica de @p g.  \~
+inline size_t public_key_size(Group g) noexcept {
+    return g == Group::X25519 ? 32 : 65;
+}
+
+/// \~english The signature schemes, by their TLS numbers (RFC 8446, 4.2.3).
+/// \~spanish Los esquemas de firma, por sus numeros de TLS (RFC 8446, 4.2.3).  \~
+enum class Scheme : uint16_t {
+    EcdsaSecp256r1Sha256 = 0x0403,
+    RsaPssRsaeSha256 = 0x0804,
+};
+
+/**
+ * @brief
+ * \~english How agreeing on a shared secret ended.
+ * \~spanish Como acabo acordar un secreto compartido.
+ * \~
+ *
+ * \~english
+ * The peer's key being bad -- a point off the curve, an X25519 input that
+ * gives the all-zero secret -- is the peer's doing and ends the handshake
+ * with illegal_parameter; a provider that could not run is this end's.
+ * \~spanish
+ * Que la clave del otro sea mala -- un punto fuera de la curva, una entrada de
+ * X25519 que da el secreto a ceros -- es cosa del otro y acaba el saludo con
+ * illegal_parameter; un proveedor que no pudo ejecutar es cosa de este extremo.
+ * \~
+ */
+enum class Agreed : uint8_t {
+    Ok,
+    BadPeerKey,
+    Failed,
+};
+
+/// \~english How checking a signature ended.  \~spanish Como acabo comprobar una firma.  \~
+enum class Verified : uint8_t {
+    Ok,
+    /// \~english It does not verify: decrypt_error (RFC 8446, 4.4.3).  \~spanish No se verifica: decrypt_error (RFC 8446, 4.4.3).  \~
+    Bad,
+    /// \~english The certificate's key is not of the scheme's kind, or it cannot be read.
+    /// \~spanish La clave del certificado no es del tipo del esquema, o no se puede leer.  \~
+    WrongKey,
+    Failed,
+};
+
 /**
  * @brief
  * \~english What a cryptographic provider has to supply.
@@ -344,6 +402,105 @@ public:
      */
     virtual bool mask(void *hp, const uint8_t *sample,
                       uint8_t *out) noexcept = 0;
+
+    /* \~english
+     * What TLS 1.3's handshake needs besides: a key exchange and signatures.
+     * States are opaque and the provider's, like the prepared keys; each is
+     * released with forget_key.
+     * \~spanish
+     * Lo que necesita ademas el saludo de TLS 1.3: un intercambio de claves y
+     * firmas.  Los estados son opacos y del proveedor, como las claves
+     * preparadas; cada uno se suelta con forget_key.
+     * \~ */
+
+    /// \~english Whether this provider can run @p g.  \~spanish Si este proveedor sabe ejecutar @p g.  \~
+    virtual bool supports(Group g) const noexcept = 0;
+
+    /**
+     * @brief
+     * \~english A fresh key pair: the public half in @p pub (`public_key_size(g)` bytes), the private one kept.
+     * \~spanish Un par de claves nuevo: la mitad publica en @p pub (`public_key_size(g)` bytes), la privada se guarda.
+     * \~
+     *
+     * \~english
+     * The public key as TLS carries it (RFC 8446, 4.2.8.2): X25519's 32
+     * bytes, or P-256's uncompressed point, 0x04 then X and Y.
+     * \~spanish
+     * La clave publica como la lleva TLS (RFC 8446, 4.2.8.2): los 32 bytes de
+     * X25519, o el punto sin comprimir de P-256, 0x04 y luego X e Y.
+     * \~
+     * @return \~english the private state, or null  \~spanish el estado privado, o nulo  \~
+     */
+    virtual void *generate_key(Group g, uint8_t *pub) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english A key pair given in full, for known-answer tests: the private key and its public key.
+     * \~spanish Un par de claves dado entero, para las pruebas de respuesta conocida: la clave privada y su publica.
+     * \~
+     */
+    virtual void *import_key(Group g, const uint8_t *priv, size_t priv_len, const uint8_t *pub) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english The shared secret with @p peer's public key: `public_key_size`-sized input, 32 bytes out.
+     * \~spanish El secreto compartido con la clave publica @p peer: entrada del tamano de `public_key_size`, 32 bytes de salida.
+     * \~
+     *
+     * \~english
+     * The checks RFC 8446 makes a MUST are the provider's: the peer's P-256
+     * point on the curve (4.2.8.2), and an X25519 result that is not all
+     * zero (7.4.2).  P-256's secret is the X coordinate, leading zeros kept
+     * (7.4.2).
+     * \~spanish
+     * Las comprobaciones que el RFC 8446 hace obligatorias son del proveedor: el
+     * punto P-256 del otro en la curva (4.2.8.2), y un resultado de X25519 que no
+     * sea todo ceros (7.4.2).  El secreto de P-256 es la coordenada X, con sus
+     * ceros por delante (7.4.2).
+     * \~
+     */
+    virtual Agreed agree(void *key, const uint8_t *peer, size_t peer_len, uint8_t *shared) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english A signing key from its PKCS#8 DER encoding, for scheme @p s; null if it is not one.
+     * \~spanish Una clave de firma a partir de su codificacion PKCS#8 DER, para el esquema @p s; nulo si no lo es.
+     * \~
+     */
+    virtual void *signing_key(Scheme s, const uint8_t *pkcs8, size_t len) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english Signs @p n bytes -- the message, not a hash: the scheme hashes (RFC 8446, 4.2.3).
+     * \~spanish Firma @p n bytes -- el mensaje, no un resumen: el esquema resume (RFC 8446, 4.2.3).
+     * \~
+     *
+     * \~english ECDSA's signature comes DER-encoded, as TLS carries it.
+     * \~spanish La firma ECDSA sale codificada en DER, como la lleva TLS.  \~
+     */
+    virtual bool sign(void *key, const uint8_t *msg, size_t n, uint8_t *sig, size_t room,
+                      size_t &sig_len) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english Checks a signature of scheme @p s with the key of an X.509 certificate (DER).
+     * \~spanish Comprueba una firma del esquema @p s con la clave de un certificado X.509 (DER).
+     * \~
+     *
+     * \~english
+     * Only the key is taken from the certificate: whether to trust the
+     * certificate is another question, and another call.
+     * \~spanish
+     * Del certificado solo se toma la clave: si fiarse del certificado es otra
+     * pregunta, y otra llamada.
+     * \~
+     */
+    virtual Verified verify(Scheme s, const uint8_t *cert, size_t cert_len, const uint8_t *msg, size_t n,
+                            const uint8_t *sig, size_t sig_len) noexcept = 0;
+
+    /// \~english Releases a key-exchange or signing state; null is allowed.
+    /// \~spanish Suelta un estado de intercambio de claves o de firma; se admite nulo.  \~
+    virtual void forget_key(void *key) noexcept = 0;
 };
 
 } // namespace quic

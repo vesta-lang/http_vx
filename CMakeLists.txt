@@ -280,7 +280,7 @@ if (WIN32)
     target_compile_options(http_vx_crypto_cng PRIVATE -Wall -Wextra -pedantic-errors)
     target_link_libraries(http_vx_crypto_cng
             PUBLIC http_vx_quic
-            PRIVATE http_vx_chacha bcrypt)
+            PRIVATE http_vx_chacha bcrypt crypt32)
     message(STATUS "[http_vx] QUIC provider: cng (the system's own)")
 endif ()
 
@@ -467,6 +467,15 @@ if (HTTP_VX_BUILD_TESTS)
 
     # TLS 1.3 contra el RFC 8448: las etiquetas con cualquier proveedor, los
     # secretos con los de verdad que se hayan construido.
+    http_vx_add_test(test_crypto_keys tests/test_crypto_keys.cpp)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_crypto_keys PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_crypto_keys PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_crypto_keys PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_crypto_keys PRIVATE HTTP_VX_HAVE_CNG=1)
+    endif ()
     http_vx_add_test(test_tls_messages tests/test_tls_messages.cpp)
     target_link_libraries(test_tls_messages PRIVATE http_vx_tls)
     http_vx_add_test(test_tls_schedule tests/test_tls_schedule.cpp)
