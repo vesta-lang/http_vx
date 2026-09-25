@@ -1,0 +1,250 @@
+/*
+ * http_vx -- servidor HTTP/1.1, HTTP/2 y HTTP/3
+ *
+ * Copyright (c) 2026 David Lopez T. (DesmonHak)
+ * Licencia: MIT (ver LICENSE).
+ */
+
+/**
+ * @file http_vx/quic_stream_recv.h
+ * @brief
+ * \~english The receiving part of a QUIC stream, and receive-side flow control (RFC 9000, 2-4).
+ * \~spanish La parte receptora de un flujo QUIC, y el control de flujo del lado receptor (RFC 9000, 2-4).
+ * \~
+ *
+ * \~english
+ * A stream's bytes arrive in STREAM frames that may come in any order, twice,
+ * overlapping, or with holes that a retransmission fills later; the
+ * application has to see them in order (2.2).  So they are kept until the
+ * hole before them is filled -- up to the flow control limit this end
+ * advertised, and not one byte more.
+ *
+ * **Memory follows the data, not the window.**  The window is covered by a
+ * table of 4 KiB chunks that are allocated when data lands in them and freed
+ * as soon as the application has read past them.  A hundred idle streams do
+ * not cost a hundred windows; a stream costs what is waiting in it.
+ *
+ * **Which bytes arrived is a bitmap, not a list of gaps.**  A list of gaps
+ * needs a cap, and a peer that sends one-byte fragments reaches any cap -- at
+ * which point a receiver either drops data it already acknowledged, which
+ * stalls the stream forever, or closes a connection that broke no rule.  A
+ * bitmap has no cap to reach: one bit per byte of window, bounded by the
+ * window, whatever the peer does.
+ *
+ * \~spanish
+ * Los bytes de un flujo llegan en tramas STREAM que pueden venir en cualquier
+ * orden, dos veces, solapadas, o con huecos que una retransmision rellena
+ * despues; la aplicacion los tiene que ver en orden (2.2).  Asi que se guardan
+ * hasta que se rellena el hueco de delante -- hasta el limite de control de
+ * flujo que anuncio este extremo, y ni un byte mas.
+ *
+ * **La memoria sigue a los datos, no a la ventana.**  La ventana la cubre una
+ * tabla de trozos de 4 KiB que se reservan cuando caen datos en ellos y se
+ * liberan en cuanto la aplicacion ha leido mas alla.  Cien flujos parados no
+ * cuestan cien ventanas; un flujo cuesta lo que espera en el.
+ *
+ * **Que bytes llegaron es un mapa de bits, no una lista de huecos.**  Una lista
+ * de huecos necesita un tope, y un extremo que manda fragmentos de un byte
+ * llega a cualquier tope -- y entonces quien recibe o tira datos que ya
+ * confirmo, lo que atasca el flujo para siempre, o cierra una conexion que no
+ * rompio ninguna regla.  Un mapa de bits no tiene tope al que llegar: un bit por
+ * byte de ventana, acotado por la ventana, haga lo que haga el otro extremo.
+ * \~
+ */
+#ifndef HTTP_VX_QUIC_STREAM_RECV_H
+#define HTTP_VX_QUIC_STREAM_RECV_H
+
+#include "http_vx/quic_frame.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace http_vx {
+namespace quic {
+
+/// \~english The size of a receive chunk.  \~spanish El tamano de un trozo de recepcion.  \~
+constexpr size_t kRecvChunk = 4096;
+
+/**
+ * @brief
+ * \~english Why a stream refused what it was given.
+ * \~spanish Por que un flujo rechazo lo que se le dio.
+ * \~
+ */
+enum class StreamError : uint8_t {
+    None,
+    /// \~english Past the limit this end advertised (4.1).  \~spanish Pasado del limite que anuncio este extremo (4.1).  \~
+    FlowControl,
+    /// \~english The final size changed, or data beyond it (4.5).  \~spanish El tamano final cambio, o datos mas alla de el (4.5).  \~
+    FinalSize,
+    /// \~english No memory for a chunk: this end's failure, said aloud.
+    /// \~spanish Sin memoria para un trozo: fallo de este extremo, dicho en voz alta.  \~
+    OutOfMemory,
+};
+
+/// \~english A short name for @p e.  \~spanish Un nombre corto para @p e.  \~
+const char *stream_error_name(StreamError e) noexcept;
+
+/// \~english The transport error @p e closes the connection with.
+/// \~spanish El error de transporte con el que @p e cierra la conexion.  \~
+TransportError transport_error_of(StreamError e) noexcept;
+
+/// \~english The receiving states of RFC 9000, 3.2.  \~spanish Los estados de recepcion del RFC 9000, 3.2.  \~
+enum class RecvState : uint8_t { Recv, SizeKnown, DataRecvd, DataRead, ResetRecvd, ResetRead };
+
+/**
+ * @brief
+ * \~english The receiving part of one stream.
+ * \~spanish La parte receptora de un flujo.
+ * \~
+ */
+class RecvStream {
+public:
+    /**
+     * @brief
+     * \~english A stream whose peer may send @p window bytes ahead of what was read.
+     * \~spanish Un flujo cuyo otro extremo puede mandar @p window bytes por delante de lo leido.
+     * \~
+     *
+     * \~english
+     * The initial limit is @p window: what `initial_max_stream_data_*` says.
+     * It is rounded up to a whole number of chunks.
+     * \~spanish
+     * El limite inicial es @p window: lo que dice `initial_max_stream_data_*`.
+     * Se redondea hacia arriba a un numero entero de trozos.
+     * \~
+     */
+    explicit RecvStream(uint64_t window) noexcept;
+    ~RecvStream();
+
+    RecvStream(const RecvStream &) = delete;
+    RecvStream &operator=(const RecvStream &) = delete;
+
+    /**
+     * @brief
+     * \~english The data of a STREAM frame.
+     * \~spanish Los datos de una trama STREAM.
+     * \~
+     *
+     * @param new_bytes \~english how far this moved the highest offset received: what it costs the connection's window
+     *                  \~spanish cuanto movio esto el mayor desplazamiento recibido: lo que le cuesta a la ventana de la conexion  \~
+     */
+    StreamError on_data(uint64_t offset, const uint8_t *p, size_t len, bool fin,
+                        uint64_t &new_bytes) noexcept;
+
+    /**
+     * @brief
+     * \~english A RESET_STREAM: the peer abandons the stream at @p final_size.
+     * \~spanish Un RESET_STREAM: el otro extremo abandona el flujo en @p final_size.
+     * \~
+     *
+     * @param new_bytes \~english as for `on_data`  \~spanish como en `on_data`  \~
+     * @param released  \~english bytes counted as received that will never be read: give them back to the connection's window
+     *                  \~spanish bytes contados como recibidos que nunca se van a leer: devolverlos a la ventana de la conexion  \~
+     */
+    StreamError on_reset(uint64_t final_size, uint64_t error_code, uint64_t &new_bytes,
+                         uint64_t &released) noexcept;
+
+    /**
+     * @brief
+     * \~english The bytes ready to read, in order, without copying: zero if none yet.
+     * \~spanish Los bytes listos para leer, en orden, sin copiar: cero si aun no hay.
+     * \~
+     *
+     * \~english At most to the end of the current chunk; `consume` then call again.
+     * \~spanish Como mucho hasta el final del trozo actual; `consume` y volver a llamar.  \~
+     */
+    size_t peek(const uint8_t *&p) const noexcept;
+
+    /// \~english The application read @p n bytes of what `peek` gave.
+    /// \~spanish La aplicacion leyo @p n bytes de lo que dio `peek`.  \~
+    void consume(size_t n) noexcept;
+
+    RecvState state() const noexcept { return state_; }
+    uint64_t read_offset() const noexcept { return read_; }
+    uint64_t highest() const noexcept { return highest_; }
+    uint64_t limit() const noexcept { return limit_; }
+    bool size_known() const noexcept { return size_known_; }
+    uint64_t final_size() const noexcept { return final_; }
+    uint64_t reset_code() const noexcept { return reset_code_; }
+
+    /// \~english Whether a MAX_STREAM_DATA is worth sending: half the window was read.
+    /// \~spanish Si merece la pena mandar un MAX_STREAM_DATA: se leyo media ventana.  \~
+    bool wants_update() const noexcept;
+
+    /// \~english Raises the limit to one window past what was read, and returns it.
+    /// \~spanish Sube el limite a una ventana por delante de lo leido, y lo devuelve.  \~
+    uint64_t advertise() noexcept;
+
+    /// \~english How many chunks hold memory now.  \~spanish Cuantos trozos tienen memoria ahora.  \~
+    size_t chunks_held() const noexcept { return held_; }
+
+private:
+    struct Chunk;
+
+    Chunk *chunk_for(uint64_t index, bool create) noexcept;
+    void release_below(uint64_t offset) noexcept;
+    void release_all() noexcept;
+    bool all_received() const noexcept;
+
+    uint64_t window_;
+    uint64_t limit_;
+    uint64_t read_ = 0;
+    uint64_t highest_ = 0;
+    uint64_t final_ = 0;
+    uint64_t buffered_ = 0;
+    uint64_t reset_code_ = 0;
+    bool size_known_ = false;
+    RecvState state_ = RecvState::Recv;
+
+    Chunk **slots_ = nullptr;
+    size_t nslots_ = 0;
+    size_t held_ = 0;
+};
+
+/**
+ * @brief
+ * \~english Receive-side flow control for the whole connection (MAX_DATA).
+ * \~spanish Control de flujo del lado receptor para toda la conexion (MAX_DATA).
+ * \~
+ *
+ * \~english
+ * Counted as the RFC counts it: the sum over all streams of the highest
+ * offset received, not of the bytes -- a retransmission costs nothing, and
+ * a stream reset still costs what its final size says (4.5).
+ * \~spanish
+ * Contado como lo cuenta el RFC: la suma sobre todos los flujos del mayor
+ * desplazamiento recibido, no de los bytes -- una retransmision no cuesta nada,
+ * y un flujo reiniciado sigue costando lo que dice su tamano final (4.5).
+ * \~
+ */
+class RecvFlow {
+public:
+    explicit RecvFlow(uint64_t window) noexcept : window_(window), limit_(window) {}
+
+    /// \~english Charges @p new_bytes; false if that passes the limit: FLOW_CONTROL_ERROR.
+    /// \~spanish Carga @p new_bytes; falso si eso pasa del limite: FLOW_CONTROL_ERROR.  \~
+    bool on_received(uint64_t new_bytes) noexcept;
+
+    /// \~english The application read, or a reset released, @p n bytes.
+    /// \~spanish La aplicacion leyo, o un reinicio libero, @p n bytes.  \~
+    void on_consumed(uint64_t n) noexcept { consumed_ += n; }
+
+    bool wants_update() const noexcept { return limit_ - consumed_ < window_ / 2; }
+    uint64_t advertise() noexcept;
+
+    uint64_t limit() const noexcept { return limit_; }
+    uint64_t received() const noexcept { return received_; }
+    uint64_t consumed() const noexcept { return consumed_; }
+
+private:
+    uint64_t window_;
+    uint64_t limit_;
+    uint64_t received_ = 0;
+    uint64_t consumed_ = 0;
+};
+
+} // namespace quic
+} // namespace http_vx
+
+#endif // HTTP_VX_QUIC_STREAM_RECV_H
