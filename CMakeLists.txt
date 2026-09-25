@@ -199,6 +199,7 @@ add_library(http_vx_tls STATIC
         tls/session.cpp
         tls/quic.cpp
         tls/ticket.cpp
+        tls/verify.cpp
 )
 target_include_directories(http_vx_tls
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -230,6 +231,7 @@ endif ()
 if (HTTP_VX_OPENSSL_PROVIDER AND OpenSSL_FOUND)
     add_library(http_vx_crypto_openssl STATIC
             providers/openssl/openssl_crypto.cpp
+            providers/openssl/openssl_verify.cpp
     )
     target_include_directories(http_vx_crypto_openssl
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/openssl)
@@ -278,6 +280,7 @@ target_link_libraries(http_vx_chacha PUBLIC vesta_alloc)
 if (WIN32)
     add_library(http_vx_crypto_cng STATIC
             providers/windows/cng_crypto.cpp
+            providers/windows/cng_verify.cpp
     )
     target_include_directories(http_vx_crypto_cng
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/windows)
@@ -502,6 +505,16 @@ if (HTTP_VX_BUILD_TESTS)
     if (TARGET http_vx_crypto_cng)
         target_link_libraries(test_tls_session PRIVATE http_vx_crypto_cng)
         target_compile_definitions(test_tls_session PRIVATE HTTP_VX_HAVE_CNG=1)
+    endif ()
+    http_vx_add_test(test_tls_verify tests/test_tls_verify.cpp)
+    target_link_libraries(test_tls_verify PRIVATE http_vx_tls)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_tls_verify PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_tls_verify PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_tls_verify PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_tls_verify PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
     http_vx_add_test(test_quic_tls tests/test_quic_tls.cpp)
     target_link_libraries(test_quic_tls PRIVATE http_vx_tls)

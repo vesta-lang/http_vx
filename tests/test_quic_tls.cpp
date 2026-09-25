@@ -193,6 +193,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     ccfg.alpn = o.alpn_mismatch ? kH2 : kH3;
     ccfg.alpn_count = 1;
     ccfg.server_name = "example.com";
+    ccfg.trust_any_certificate = true;
     ccfg.resume = o.resume;
     ccfg.early_data = o.early_data;
     QuicHandshake ch(client_crypto, client, ccfg);

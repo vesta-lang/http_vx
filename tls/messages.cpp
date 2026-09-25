@@ -32,13 +32,19 @@ const char *alert_name(Alert a) noexcept {
     case Alert::UnexpectedMessage:     return "unexpected_message";
     case Alert::HandshakeFailure:      return "handshake_failure";
     case Alert::BadCertificate:        return "bad_certificate";
+    case Alert::UnsupportedCertificate: return "unsupported_certificate";
+    case Alert::CertificateRevoked:    return "certificate_revoked";
+    case Alert::CertificateExpired:    return "certificate_expired";
+    case Alert::CertificateUnknown:    return "certificate_unknown";
     case Alert::IllegalParameter:      return "illegal_parameter";
+    case Alert::UnknownCa:             return "unknown_ca";
     case Alert::DecodeError:           return "decode_error";
     case Alert::DecryptError:          return "decrypt_error";
     case Alert::ProtocolVersion:       return "protocol_version";
     case Alert::InternalError:         return "internal_error";
     case Alert::MissingExtension:      return "missing_extension";
     case Alert::UnsupportedExtension:  return "unsupported_extension";
+    case Alert::CertificateRequired:   return "certificate_required";
     case Alert::NoApplicationProtocol: return "no_application_protocol";
     }
     return "unknown";

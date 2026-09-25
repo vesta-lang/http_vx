@@ -141,6 +141,10 @@ struct Ends {
         client.transport_params = kClientTp;
         client.transport_params_len = sizeof kClientTp;
         client.server_name = "example.com";
+        // \~english These tests are about the handshake; trusting chains has its own (test_tls_verify).
+        // \~spanish Estas pruebas son del saludo; fiarse de las cadenas tiene las suyas (test_tls_verify).  \~
+        client.trust_any_certificate = true;
+        server.trust_any_certificate = true;
         server.server = true;
         server.alpn = kH2H3;
         server.alpn_count = 2;
@@ -161,6 +165,36 @@ struct Ends {
 struct FakeEnds : Ends {
     explicit FakeEnds(Crypto &c) : Ends(c, kFakeCert, sizeof kFakeCert, kFakeCert, sizeof kFakeCert,
                                         Scheme::EcdsaSecp256r1Sha256) {}
+};
+
+/**
+ * @brief
+ * \~english A verifier that answers what it is told, and remembers what it was asked.
+ * \~spanish Un verificador que responde lo que se le dice, y recuerda lo que se le pregunto.
+ * \~
+ */
+struct FakeVerifier final : CertVerifier {
+    Trust answer = Trust::Trusted;
+    uint32_t code = 0;
+    size_t calls = 0;
+    Role role = Role::Client;
+    const char *host = nullptr;
+    size_t count = 0;
+    uint8_t first[64] = {};
+    size_t first_len = 0;
+
+    Verdict verify(const Chain &chain, Role r, const char *h) noexcept override {
+        ++calls;
+        role = r;
+        host = h;
+        count = chain.count;
+        first_len = chain.count != 0 && chain.lens[0] <= sizeof first ? chain.lens[0] : 0;
+        if (first_len != 0) std::memcpy(first, chain.certs[0], first_len);
+        Verdict v;
+        v.trust = answer;
+        v.code = code;
+        return v;
+    }
 };
 
 /**
@@ -1252,9 +1286,19 @@ void test_client_certificate() {
     test_support::FakeCrypto c;
     section("server: client certificate");
     const char *contexts[2] = {"TLS 1.3, client CertificateVerify", "TLS 1.3, server CertificateVerify"};
-    for (size_t i = 0; i < 2; ++i) {
+    // \~english 0 and 1 with no verifier; 2 and 3 with one that trusts, and one that does not know the issuer.
+    // \~spanish 0 y 1 sin verificador; 2 y 3 con uno que se fia, y con uno que no conoce al emisor.  \~
+    for (size_t i = 0; i < 4; ++i) {
         FakeEnds e(c);
         e.server.request_certificate = true;
+        FakeVerifier fv;
+        fv.answer = i == 3 ? Trust::UnknownIssuer : Trust::Trusted;
+        if (i >= 2) {
+            e.server.verifier = &fv;
+            e.server.trust_any_certificate = false;
+            // \~english A name the server should never check a client against.  \~spanish Un nombre contra el que un servidor nunca deberia comprobar a un cliente.  \~
+            e.server.server_name = "example.com";
+        }
         Session client(c, e.client);
         Session server(c, e.server);
         client.start();
@@ -1282,7 +1326,7 @@ void test_client_certificate() {
         c.digest(Hash::Sha256, t, tn, th);
         uint8_t content[160];
         std::memset(content, 0x20, 64);
-        std::memcpy(content + 64, contexts[i], 33);
+        std::memcpy(content + 64, contexts[i == 1 ? 1 : 0], 33);
         content[97] = 0;
         std::memcpy(content + 98, th, 32);
         void *key = c.signing_key(Scheme::EcdsaSecp256r1Sha256, kFakeCert, sizeof kFakeCert);
@@ -1305,8 +1349,175 @@ void test_client_certificate() {
                       std::memcmp(cert, kFakeCert, n) == 0,
                   "the server keeps the client's certificate");
             check(!server.complete(), "and waits for its Finished");
-        } else {
+            check(fv.calls == 0 && !server.peer_trusted(), "with no verifier, nothing is asked and nothing trusted");
+        } else if (i == 1) {
             expect(server, kDecryptError, "a client signature with the server's context (4.4.3)");
+        } else if (i == 2) {
+            expect_ok(server, "a client chain the verifier trusts");
+            check(fv.calls == 1 && fv.role == Role::Client && fv.host == nullptr && fv.count == 1 &&
+                      fv.first_len == sizeof kFakeCert && std::memcmp(fv.first, kFakeCert, sizeof kFakeCert) == 0,
+                  "the verifier sees the client's chain, as a client's, with no name to check");
+            check(server.peer_trusted() && server.peer_trust().code == 0, "and the server knows it is trusted");
+        } else {
+            expect(server, kCryptoError + 48, "a client chain from an unknown issuer: unknown_ca (6.2)");
+            check(!server.peer_trusted() && server.peer_trust().trust == Trust::UnknownIssuer,
+                  "and the verdict is kept");
+        }
+    }
+}
+
+/**
+ * @brief
+ * \~english Whether to trust the server's chain: who is asked, what with, and what each answer ends in.
+ * \~spanish Si fiarse de la cadena del servidor: a quien se pregunta, con que, y en que acaba cada respuesta.
+ * \~
+ */
+void test_verifier() {
+    test_support::FakeCrypto c;
+    section("verifier: configuration");
+    {
+        FakeEnds e(c);
+        e.client.trust_any_certificate = false;
+        Session client(c, e.client);
+        check(!client.start(), "a client with no verifier and no trust_any_certificate does not start");
+        expect(client, kCryptoError + 80, "internal_error");
+        expect_why(client, "no certificate verifier", "and says why");
+    }
+    {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        e.client.verifier = &fv;
+        Session client(c, e.client);
+        check(!client.start(), "a verifier and trust_any_certificate together do not start");
+        expect_why(client, "one or the other", "and says why");
+    }
+    {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        e.client.verifier = &fv;
+        e.client.trust_any_certificate = false;
+        e.client.server_name = nullptr;
+        Session client(c, e.client);
+        check(!client.start(), "a verifier with no server_name does not start");
+        expect_why(client, "no server_name", "and says why");
+    }
+    const char *server_cases[3] = {"no verifier", "one or the other", "never asked for"};
+    for (size_t i = 0; i < 3; ++i) {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        e.server.request_certificate = i != 2;
+        if (i == 0) e.server.trust_any_certificate = false;
+        if (i == 1) e.server.verifier = &fv;
+        if (i == 2) e.server.require_client_certificate = true;
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        expect(server, kCryptoError + 80, "a server whose certificate settings contradict each other");
+        expect_why(server, server_cases[i], "and says which");
+    }
+
+    section("verifier: server chain");
+    {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        e.client.verifier = &fv;
+        e.client.trust_any_certificate = false;
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        expect_ok(client, "a chain the verifier trusts");
+        check(client.complete() && server.complete(), "completes");
+        check(fv.calls == 1 && fv.role == Role::Server && fv.host != nullptr &&
+                  std::strcmp(fv.host, "example.com") == 0 && fv.count == 1 && fv.first_len == sizeof kFakeCert &&
+                  std::memcmp(fv.first, kFakeCert, sizeof kFakeCert) == 0,
+              "the verifier sees the server's chain, as a server's, with the name asked for");
+        check(client.peer_trusted() && client.peer_trust().code == 0, "and the client knows it is trusted");
+    }
+    {
+        FakeEnds e(c);
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        expect_ok(client, "trust_any_certificate");
+        check(client.complete() && !client.peer_trusted(), "lets a chain through without calling it trusted");
+    }
+    // \~english Each verdict, and the alert it ends in (6.2).  \~spanish Cada veredicto, y la alerta en que acaba (6.2).  \~
+    const struct {
+        Trust trust;
+        uint64_t alert;
+    } verdicts[] = {
+        {Trust::UnknownIssuer, 48}, {Trust::Expired, 45},  {Trust::Revoked, 44},     {Trust::RevocationUnknown, 46},
+        {Trust::NameMismatch, 46},  {Trust::WrongUsage, 46}, {Trust::BadSignature, 42}, {Trust::Invalid, 42},
+        {Trust::Unsupported, 43},   {Trust::Rejected, 46},  {Trust::Failed, 80},
+    };
+    for (const auto &v : verdicts) {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        fv.answer = v.trust;
+        fv.code = 0x1234;
+        e.client.verifier = &fv;
+        e.client.trust_any_certificate = false;
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        char what[96];
+        std::snprintf(what, sizeof what, "a chain the verifier calls %s", trust_name(v.trust));
+        expect(client, kCryptoError + v.alert, what);
+        check(!client.complete() && client.peer_trust().trust == v.trust && client.peer_trust().code == 0x1234,
+              "does not complete, and keeps the verdict and its code");
+        check(client.failure().alert == static_cast<Alert>(v.alert), "the alert is the verdict's");
+        check(trust_alert(v.trust) == static_cast<Alert>(v.alert), "and trust_alert names it");
+    }
+    check(trust_alert(Trust::Trusted) == Alert::None, "trusted is no alert");
+
+    section("verifier: chain length");
+    // \~english Sixteen certificates reach the verifier; seventeen are refused out loud.
+    // \~spanish Dieciseis certificados llegan al verificador; diecisiete se rechazan en voz alta.  \~
+    for (size_t count = Session::kMaxChain; count <= Session::kMaxChain + 1; ++count) {
+        FakeEnds e(c);
+        FakeVerifier fv;
+        e.client.verifier = &fv;
+        e.client.trust_any_certificate = false;
+        const uint8_t *certs[Session::kMaxChain + 1];
+        size_t lens[Session::kMaxChain + 1];
+        for (size_t i = 0; i < count; ++i) {
+            certs[i] = kFakeCert;
+            lens[i] = sizeof kFakeCert;
+        }
+        e.server.certificates = certs;
+        e.server.certificate_lens = lens;
+        e.server.certificate_count = count;
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        if (count == Session::kMaxChain) {
+            expect_ok(client, "the longest chain this end follows");
+            check(fv.calls == 1 && fv.count == count, "reaches the verifier whole");
+        } else {
+            expect(client, kCryptoError + 46, "a chain longer than this end follows: certificate_unknown");
+            check(fv.calls == 0, "never reaches the verifier");
+        }
+    }
+
+    section("verifier: client certificate required");
+    for (size_t require = 0; require < 2; ++require) {
+        FakeEnds e(c);
+        e.server.request_certificate = true;
+        e.server.require_client_certificate = require == 1;
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        if (require == 1) {
+            expect(server, kCryptoError + 116, "a client with no certificate, one required: certificate_required");
+        } else {
+            expect_ok(server, "a client with no certificate, none required");
+            check(server.complete() && !server.peer_trusted(), "goes on unauthenticated (4.4.2.4)");
         }
     }
 }
@@ -2331,6 +2542,7 @@ int main() {
     test_client_flight_rules();
     test_server_rules();
     test_client_certificate();
+    test_verifier();
     test_support::FakeCrypto fake;
     test_sealer(fake, false, "fake");
     test_resumption();

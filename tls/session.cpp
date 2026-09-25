@@ -359,6 +359,14 @@ bool Session::start() noexcept {
     if (cfg_.alpn_count == 0) return fail(Alert::InternalError, "no application protocol to offer: QUIC requires ALPN");
     if (cfg_.transport_params == nullptr)
         return fail(Alert::InternalError, "no transport parameters to send: QUIC requires them");
+    // \~english A server's chain is always checked, or not checked on purpose; never by default.
+    // \~spanish La cadena de un servidor siempre se comprueba, o se deja sin comprobar a proposito; nunca por defecto.  \~
+    if (cfg_.verifier == nullptr && !cfg_.trust_any_certificate)
+        return fail(Alert::InternalError, "no certificate verifier, and trust_any_certificate not set");
+    if (cfg_.verifier != nullptr && cfg_.trust_any_certificate)
+        return fail(Alert::InternalError, "a certificate verifier and trust_any_certificate: one or the other");
+    if (cfg_.verifier != nullptr && cfg_.server_name == nullptr)
+        return fail(Alert::InternalError, "a certificate verifier and no server_name to check the certificate against");
     if (!c_.random(random_, sizeof random_)) return fail_provider("the provider gave no random bytes");
     // \~english The first shares, in the order of supported_groups (4.2.8); at most two.
     // \~spanish Las primeras claves, en el orden de supported_groups (4.2.8); como mucho dos.  \~
@@ -598,6 +606,12 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
         return fail(Alert::InternalError, "the provider supports no suite or no group to accept");
     if (cfg_.certificate_count == 0 || cfg_.signing_key == nullptr)
         return fail(Alert::InternalError, "the server has no certificate to authenticate with");
+    if (cfg_.request_certificate && cfg_.verifier == nullptr && !cfg_.trust_any_certificate)
+        return fail(Alert::InternalError, "a client certificate asked for, no verifier, and trust_any_certificate not set");
+    if (cfg_.verifier != nullptr && cfg_.trust_any_certificate)
+        return fail(Alert::InternalError, "a certificate verifier and trust_any_certificate: one or the other");
+    if (cfg_.require_client_certificate && !cfg_.request_certificate)
+        return fail(Alert::InternalError, "a client certificate required but never asked for");
     // \~english 0-RTT without replay protection is not offered quietly: it is refused out loud (RFC 8446, 8).
     // \~spanish 0-RTT sin proteccion contra repeticiones no se ofrece en silencio: se rechaza en voz alta (RFC 8446, 8).  \~
     if (cfg_.early_data && (cfg_.replay == nullptr || !cfg_.replay->ready() || cfg_.tickets == nullptr))
@@ -1157,8 +1171,10 @@ bool Session::on_certificate(const uint8_t *m, size_t n) noexcept {
     const size_t msg_at = transcript_.size();
     if (ct.entries.len == 0) {
         if (!cfg_.server) return fail(Alert::DecodeError, "an empty server Certificate (RFC 8446, 4.4.2.4)");
-        // \~english A client with nothing to show: the server MAY go on without authenticating it (4.4.2.4).
-        // \~spanish Un cliente sin nada que ensenar: el servidor PUEDE seguir sin autenticarlo (4.4.2.4).  \~
+        // \~english A client with nothing to show: the server MAY go on without authenticating it, or abort (4.4.2.4).
+        // \~spanish Un cliente sin nada que ensenar: el servidor PUEDE seguir sin autenticarlo, o abortar (4.4.2.4).  \~
+        if (cfg_.require_client_certificate)
+            return fail(Alert::CertificateRequired, "the client sent no certificate, and one is required (RFC 8446, 4.4.2.4)");
         if (!add(m, n)) return false;
         state_ = State::WaitFinished;
         return true;
@@ -1195,9 +1211,55 @@ bool Session::on_certificate_verify(const uint8_t *m, size_t n) noexcept {
     if (v == quic::Verified::WrongKey)
         return fail(Alert::IllegalParameter, "the signature scheme does not fit the certificate's key (RFC 8446, 4.4.3)");
     if (v != quic::Verified::Ok) return fail_provider("the provider could not check the signature");
+    // \~english The peer holds the leaf's key; whether the leaf is to be trusted is the verifier's to say.
+    // \~spanish El otro tiene la clave de la hoja; si hay que fiarse de la hoja lo dice el verificador.  \~
+    if (!check_chain()) return false;
     if (!add(m, n)) return false;
     state_ = State::WaitFinished;
     return true;
+}
+
+bool Session::check_chain() noexcept {
+    if (cfg_.verifier == nullptr) return true;
+    const uint8_t *m = transcript_.bytes() + certificate_.at;
+    CertificateMessage ct;
+    if (!parse_certificate(m, certificate_.len, ct).ok()) return fail(Alert::InternalError, "the kept Certificate no longer parses");
+    const uint8_t *certs[kMaxChain];
+    size_t lens[kMaxChain];
+    Chain chain;
+    uint32_t at = 0;
+    Span s;
+    while (next_certificate(m, ct, at, s)) {
+        // \~english Past what this end follows: refused, and said -- never cut short quietly.
+        // \~spanish Pasado lo que sigue este extremo: se rechaza, y se dice -- nunca se recorta en silencio.  \~
+        if (chain.count == kMaxChain)
+            return fail(Alert::CertificateUnknown, "a certificate chain longer than this end follows");
+        certs[chain.count] = m + s.off;
+        lens[chain.count] = s.len;
+        ++chain.count;
+    }
+    chain.certs = certs;
+    chain.lens = lens;
+    // \~english A client checks the server against the name it asked for; a server has no name to check a client by.
+    // \~spanish Un cliente comprueba al servidor contra el nombre que pidio; un servidor no tiene nombre con el que comprobar a un cliente.  \~
+    trust_ = cfg_.verifier->verify(chain, cfg_.server ? Role::Client : Role::Server,
+                                   cfg_.server ? nullptr : cfg_.server_name);
+    if (trust_.trust == Trust::Trusted) return true;
+    switch (trust_.trust) {
+    case Trust::UnknownIssuer: return fail(trust_alert(trust_.trust), "the peer's certificate chain leads to no trusted anchor (RFC 8446, 6.2)");
+    case Trust::Expired: return fail(trust_alert(trust_.trust), "a certificate in the peer's chain expired or is not valid yet (RFC 8446, 6.2)");
+    case Trust::Revoked: return fail(trust_alert(trust_.trust), "a certificate in the peer's chain was revoked (RFC 8446, 6.2)");
+    case Trust::RevocationUnknown: return fail(trust_alert(trust_.trust), "the revocation of the peer's chain could not be found out");
+    case Trust::NameMismatch: return fail(trust_alert(trust_.trust), "the server's certificate is not for the name asked for");
+    case Trust::WrongUsage: return fail(trust_alert(trust_.trust), "the peer's certificate chain is not for this use");
+    case Trust::BadSignature: return fail(trust_alert(trust_.trust), "a signature in the peer's chain does not verify or is too weak (RFC 8446, 4.4.2.4)");
+    case Trust::Invalid: return fail(trust_alert(trust_.trust), "a certificate in the peer's chain is corrupt (RFC 8446, 6.2)");
+    case Trust::Unsupported: return fail(trust_alert(trust_.trust), "a certificate in the peer's chain is of a kind this end does not handle (RFC 8446, 6.2)");
+    case Trust::Rejected: return fail(trust_alert(trust_.trust), "the verifier rejected the peer's certificate chain");
+    case Trust::Trusted:
+    case Trust::Failed: break;
+    }
+    return fail(Alert::InternalError, "the certificate verifier failed");
 }
 
 bool Session::on_finished(const uint8_t *m, size_t n) noexcept {

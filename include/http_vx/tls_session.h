@@ -49,8 +49,10 @@
  * replay guard (8): fresh, never seen, the same suite, protocol and context
  * as when the ticket was issued (4.2.10; RFC 9001, 4.6.3).
  *
- * What this does not do yet: deciding whether to trust the server's
- * certificate -- the chain is kept for whoever does.
+ * **Whether to trust a certificate is not decided here** (4.4.2.4): a
+ * verifier decides it (tls_verify.h), once the peer proved it holds the
+ * key, and a handshake with no one to ask fails -- unless its owner said
+ * out loud that nobody is to.
  *
  * \~spanish
  * La pieza que junta las demas: los mensajes de tls_messages.h, el calendario
@@ -91,8 +93,10 @@
  * algoritmo, protocolo y contexto que cuando se emitio el ticket (4.2.10; RFC
  * 9001, 4.6.3).
  *
- * Lo que esto aun no hace: decidir si fiarse del certificado del servidor -- la
- * cadena se guarda para quien lo haga.
+ * **Si fiarse de un certificado no se decide aqui** (4.4.2.4): lo decide un
+ * verificador (tls_verify.h), cuando el otro demostro que tiene la clave, y un
+ * saludo sin nadie a quien preguntar falla -- salvo que su dueno haya dicho en
+ * voz alta que nadie lo haga.
  * \~
  */
 #ifndef HTTP_VX_TLS_SESSION_H
@@ -103,6 +107,7 @@
 #include "http_vx/tls_messages.h"
 #include "http_vx/tls_schedule.h"
 #include "http_vx/tls_ticket.h"
+#include "http_vx/tls_verify.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -169,6 +174,29 @@ struct SessionConfig {
      * \~
      */
     bool request_certificate = false;
+    /// \~english Server: a client that sends no certificate is refused with certificate_required (4.4.2.4).
+    /// \~spanish Servidor: a un cliente que no manda certificado se le rechaza con certificate_required (4.4.2.4).  \~
+    bool require_client_certificate = false;
+
+    /* \~english
+     * Whether to trust the peer's chain (tls_verify.h).  A client always
+     * gets one, and a server that asks for one may: with no verifier the
+     * handshake fails, unless `trust_any_certificate` says out loud that
+     * nobody is to check it -- for tests, and for whoever pins keys by other
+     * means.  A client checks the name it sends as server_name, and so it
+     * needs one.  A chain that is not trusted ends the handshake with the
+     * alert the verifier's verdict names.
+     * \~spanish
+     * Si fiarse de la cadena del otro (tls_verify.h).  Un cliente siempre
+     * recibe una, y un servidor que la pide puede recibirla: sin verificador el
+     * saludo falla, salvo que `trust_any_certificate` diga en voz alta que nadie
+     * la va a comprobar -- para pruebas, y para quien fije las claves por otros
+     * medios.  Un cliente comprueba el nombre que manda como server_name, y por
+     * eso necesita uno.  Una cadena de la que no hay que fiarse acaba el saludo
+     * con la alerta que nombra el veredicto del verificador.
+     * \~ */
+    CertVerifier *verifier = nullptr;
+    bool trust_any_certificate = false;
 
     /* \~english
      * Resumption (4.6.1, 4.2.11).  A server with a sealer issues
@@ -316,6 +344,24 @@ public:
     /// \~english The peer's certificate @p i (DER), end-entity first; false past the last, or with none.
     /// \~spanish El certificado @p i del otro (DER), el final primero; falso pasado el ultimo, o sin ninguno.  \~
     bool peer_certificate(size_t i, const uint8_t *&cert, size_t &n) const noexcept;
+    /**
+     * @brief
+     * \~english What the verifier said of the peer's chain; Trust::Failed with code 0 while none was checked.
+     * \~spanish Lo que dijo el verificador de la cadena del otro; Trust::Failed con codigo 0 mientras no se comprobo ninguna.
+     * \~
+     *
+     * \~english
+     * Trusted only when a verifier said so: a chain let through by
+     * `trust_any_certificate`, or a resumed session, has no verdict here.
+     * \~spanish
+     * Trusted solo cuando lo dijo un verificador: una cadena que dejo pasar
+     * `trust_any_certificate`, o una sesion reanudada, no tiene veredicto aqui.
+     * \~
+     */
+    const Verdict &peer_trust() const noexcept { return trust_; }
+    bool peer_trusted() const noexcept { return trust_.trust == Trust::Trusted; }
+    /// \~english The longest chain this end hands to a verifier.  \~spanish La cadena mas larga que este extremo pasa a un verificador.  \~
+    static constexpr size_t kMaxChain = 16;
 
     /// \~english Whether a HelloRetryRequest was part of it.  \~spanish Si hubo un HelloRetryRequest.  \~
     bool retried() const noexcept { return retried_; }
@@ -421,6 +467,7 @@ private:
     bool on_certificate_request(const uint8_t *m, size_t n) noexcept;
     bool on_certificate(const uint8_t *m, size_t n) noexcept;
     bool on_certificate_verify(const uint8_t *m, size_t n) noexcept;
+    bool check_chain() noexcept;
     bool on_finished(const uint8_t *m, size_t n) noexcept;
     bool on_new_session_ticket(const uint8_t *m, size_t n) noexcept;
 
@@ -501,6 +548,7 @@ private:
     size_t alpn_index_ = 0;
     Kept server_name_;
     Kept certificate_;
+    Verdict trust_;
 
     /* \~english Resumption: the PSK in use, whether one was offered and taken, and the tickets kept.
      * \~spanish Reanudacion: la PSK en uso, si se ofrecio y se tomo una, y los tickets guardados.  \~ */
