@@ -32,12 +32,17 @@
  * again -- stream bytes, a MAX_DATA, a RESET_STREAM -- and when it is
  * acknowledged, exactly that is done.
  *
+ * **1-RTT keys change during the connection** (RFC 9001, 6): either end may
+ * start an update, and they also start on their own before the AEAD's
+ * limit.  The next read keys are ready in advance and the previous ones are
+ * kept for late packets; an end that breaks the rules is closed with
+ * KEY_UPDATE_ERROR.
+ *
  * This is the core the rest stands on, and it is not the whole of QUIC.  What
- * follows, in this order, each with its own tests: Version Negotiation and
- * Retry, which happen before a connection exists; key updates; new
- * connection IDs, migration and stateless reset; and the TLS handshake with
- * 0-RTT.  Until the handshake is here, the connection takes keys through
- * `install_keys` and learns that the handshake is done through
+ * follows, in this order, each with its own tests: new connection IDs,
+ * migration and stateless reset; and the TLS handshake with 0-RTT.  Until
+ * the handshake is here, the connection takes secrets through
+ * `install_secrets` and learns that the handshake is done through
  * `handshake_confirmed` -- which is exactly what the handshake will call.
  *
  * \~spanish
@@ -60,13 +65,18 @@
  * exactamente lo que llevaba -- bytes de flujo, un MAX_DATA, un RESET_STREAM --, y
  * cuando se confirme, se haga exactamente eso.
  *
+ * **Las claves 1-RTT cambian durante la conexion** (RFC 9001, 6): cualquiera de
+ * los dos extremos puede empezar una actualizacion, y tambien empiezan solas
+ * antes del limite del AEAD.  Las claves de lectura siguientes estan listas de
+ * antemano y las anteriores se guardan para los paquetes tardios; un extremo que
+ * rompe las reglas se cierra con KEY_UPDATE_ERROR.
+ *
  * Este es el nucleo sobre el que se apoya el resto, y no es todo QUIC.  Lo que
- * sigue, en este orden, cada cosa con sus pruebas: Version Negotiation y Retry,
- * que ocurren antes de que exista una conexion; la actualizacion de claves; los
- * identificadores de conexion nuevos, la migracion y el reinicio sin estado; y
- * el saludo de TLS con 0-RTT.  Hasta que el saludo este aqui, la conexion recibe
- * las claves por `install_keys` y se entera de que el saludo acabo por
- * `handshake_confirmed` -- que es justo lo que llamara el saludo.
+ * sigue, en este orden, cada cosa con sus pruebas: los identificadores de
+ * conexion nuevos, la migracion y el reinicio sin estado; y el saludo de TLS con
+ * 0-RTT.  Hasta que el saludo este aqui, la conexion recibe los secretos por
+ * `install_secrets` y se entera de que el saludo acabo por `handshake_confirmed`
+ * -- que es justo lo que llamara el saludo.
  * \~
  */
 #ifndef HTTP_VX_QUIC_CONNECTION_H
@@ -137,6 +147,84 @@ struct ConnectionConfig {
     /// \~english How much handshake data each space may buffer (CRYPTO_BUFFER_EXCEEDED past it).
     /// \~spanish Cuantos datos del saludo puede guardar cada espacio (CRYPTO_BUFFER_EXCEEDED pasado eso).  \~
     uint64_t crypto_window = 65536;
+
+    /**
+     * \~english
+     * After how many 1-RTT packets sealed with one key a key update starts on
+     * its own (RFC 9001, 6).  Zero: half the AEAD's confidentiality limit, so
+     * the update always comes well before the limit (6.6).
+     * \~spanish
+     * Tras cuantos paquetes 1-RTT sellados con una clave empieza sola una
+     * actualizacion de claves (RFC 9001, 6).  Cero: la mitad del limite de
+     * confidencialidad del AEAD, asi que la actualizacion llega siempre mucho
+     * antes del limite (6.6).
+     * \~
+     */
+    uint64_t key_update_packets = 0;
+
+    /**
+     * \~english
+     * The AEAD limits of RFC 9001, 6.6; zero means the AEAD's own.  Only a
+     * test has a reason to lower them: the real ones are millions of packets.
+     * \~spanish
+     * Los limites del AEAD del RFC 9001, 6.6; cero es el del propio AEAD.  Solo
+     * una prueba tiene motivo para bajarlos: los de verdad son millones de
+     * paquetes.
+     * \~
+     */
+    uint64_t confidentiality_limit = 0;
+    uint64_t integrity_limit = 0;
+};
+
+/**
+ * @brief
+ * \~english What asking for a key update got (RFC 9001, 6).
+ * \~spanish Lo que consiguio pedir una actualizacion de claves (RFC 9001, 6).
+ * \~
+ */
+enum class KeyUpdate : uint8_t {
+    Started,
+    /// \~english No 1-RTT keys yet.  \~spanish Aun no hay claves 1-RTT.  \~
+    NoKeys,
+    /// \~english Not before the handshake is confirmed (6.1).  \~spanish No antes de confirmar el saludo (6.1).  \~
+    NotConfirmed,
+    /// \~english No packet of the current phase acknowledged yet (6.5).
+    /// \~spanish Aun no se confirmo ningun paquete de la fase actual (6.5).  \~
+    Unacknowledged,
+    /// \~english The previous keys are still kept for late packets (6.5).
+    /// \~spanish Las claves anteriores siguen guardadas para paquetes tardios (6.5).  \~
+    OldKeysKept,
+    /// \~english The provider failed: said, not guessed around.  \~spanish Fallo el proveedor: dicho, no rodeado.  \~
+    Failed,
+};
+
+/// \~english A short name for @p k.  \~spanish Un nombre corto para @p k.  \~
+const char *key_update_name(KeyUpdate k) noexcept;
+
+/**
+ * @brief
+ * \~english What happened to the 1-RTT keys, counted.
+ * \~spanish Lo que les paso a las claves 1-RTT, contado.
+ * \~
+ */
+struct KeyUpdateCounts {
+    /// \~english Updates this end started.  \~spanish Actualizaciones que empezo este extremo.  \~
+    uint64_t initiated = 0;
+    /// \~english Updates the peer started, answered with new write keys.
+    /// \~spanish Actualizaciones que empezo el otro extremo, contestadas con claves de escritura nuevas.  \~
+    uint64_t answered = 0;
+    /// \~english Read keys rolled forward, whoever started.  \~spanish Claves de lectura avanzadas, empezara quien empezara.  \~
+    uint64_t read_rolled = 0;
+    /// \~english Late packets opened with the previous keys.  \~spanish Paquetes tardios abiertos con las claves anteriores.  \~
+    uint64_t opened_with_old = 0;
+    /// \~english Previous keys thrown away once their time was up.  \~spanish Claves anteriores tiradas al acabar su plazo.  \~
+    uint64_t old_discarded = 0;
+    /// \~english KEY_UPDATE_ERROR: old keys on a packet numbered after new ones (6.4).
+    /// \~spanish KEY_UPDATE_ERROR: claves viejas en un paquete numerado despues de otros con las nuevas (6.4).  \~
+    uint64_t old_after_new = 0;
+    /// \~english KEY_UPDATE_ERROR: the peer updated again before its last update was acknowledged (6.2).
+    /// \~spanish KEY_UPDATE_ERROR: el otro extremo actualizo otra vez antes de que se confirmara la anterior (6.2).  \~
+    uint64_t updated_twice = 0;
 };
 
 /// \~english Where a connection is in its life (10).  \~spanish En que punto de su vida esta una conexion (10).  \~
@@ -270,11 +358,42 @@ public:
 
     /**
      * @brief
-     * \~english Installs the keys of a space, as the handshake produces them.
-     * \~spanish Instala las claves de un espacio, segun las produce el saludo.
+     * \~english Installs the secrets of a space, as the handshake produces them (RFC 9001, 4.1).
+     * \~spanish Instala los secretos de un espacio, segun los produce el saludo (RFC 9001, 4.1).
+     * \~
+     *
+     * \~english
+     * Secrets, not keys: the keys of every later 1-RTT phase come from the
+     * secret (6.1), so the connection needs it, and it is what TLS hands out.
+     * The connection derives and keeps them; the caller's copies are its own.
+     * \~spanish
+     * Secretos, no claves: las claves de cada fase 1-RTT posterior salen del
+     * secreto (6.1), asi que la conexion lo necesita, y es lo que entrega TLS.
+     * La conexion deriva y guarda; las copias de quien llama son suyas.
      * \~
      */
-    bool install_keys(Space s, KeyMaterial &read, KeyMaterial &write, uint64_t now_us) noexcept;
+    bool install_secrets(Space s, Aead a, const uint8_t *read_secret, const uint8_t *write_secret,
+                         size_t len, uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english Starts a 1-RTT key update now, if the rules allow it (RFC 9001, 6).
+     * \~spanish Empieza ahora una actualizacion de claves 1-RTT, si las reglas lo permiten (RFC 9001, 6).
+     * \~
+     *
+     * \~english
+     * They also start on their own before the AEAD's limit; this is for
+     * whoever wants one sooner.  When it cannot start, the answer says why.
+     * \~spanish
+     * Tambien empiezan solas antes del limite del AEAD; esto es para quien
+     * quiera una antes.  Cuando no puede empezar, la respuesta dice por que.
+     * \~
+     */
+    KeyUpdate update_keys(uint64_t now_us) noexcept;
+
+    /// \~english The key phase this end seals with.  \~spanish La fase de clave con la que sella este extremo.  \~
+    bool key_phase() const noexcept { return one_rtt_.write_phase; }
+    const KeyUpdateCounts &key_updates() const noexcept { return key_counts_; }
 
     /// \~english Throws a space's keys away, and what it had in flight.
     /// \~spanish Tira las claves de un espacio, y lo que tenia en vuelo.  \~
@@ -391,6 +510,17 @@ private:
 
     void fail(TransportError e, uint64_t frame_type, uint64_t now_us) noexcept;
     bool process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn, uint64_t now_us) noexcept;
+    /// \~english How a 1-RTT packet opened.  \~spanish Como se abrio un paquete 1-RTT.  \~
+    enum class Opened : uint8_t { Ok, Forged, Failed, ReservedBits, KeyUpdateViolation };
+    Opened open_one_rtt(uint8_t *p, const PacketHeader &h, Unprotected &u,
+                        uint64_t now_us) noexcept;
+    bool make_generation(const uint8_t *secret, PacketKeys &out) noexcept;
+    void drop_generation(PacketKeys &k) noexcept;
+    bool roll_read(uint64_t pn, uint64_t now_us) noexcept;
+    bool roll_write() noexcept;
+    void forget_one_rtt() noexcept;
+    uint64_t confidentiality_limit() const noexcept;
+    uint64_t integrity_limit() const noexcept;
     void process_version_negotiation(const uint8_t *p, const PacketHeader &h) noexcept;
     void process_retry(const uint8_t *p, const PacketHeader &h, uint64_t now_us) noexcept;
     bool derive_initial_keys(const uint8_t *dcid, size_t len) noexcept;
@@ -443,6 +573,60 @@ private:
     ConnState state_ = ConnState::Active;
 
     Keys keys_[kSpaces];
+
+    /**
+     * \~english
+     * The 1-RTT key phases (RFC 9001, 6).  `keys_[Application]` holds the
+     * CURRENT generation and owns both header-protection states, which never
+     * change; `next` (read side, prepared in advance so that trying it takes
+     * no more time than any other key, 6.3) and `prev` (kept 3 PTO for late
+     * packets) hold only an AEAD state and an IV, and borrow nothing.
+     * \~spanish
+     * Las fases de clave 1-RTT (RFC 9001, 6).  `keys_[Application]` tiene la
+     * generacion ACTUAL y es dueno de los dos estados de proteccion de cabecera,
+     * que no cambian nunca; `next` (lado de lectura, preparado de antemano para
+     * que probarlo no tarde mas que cualquier otra clave, 6.3) y `prev` (guardado
+     * 3 PTO para paquetes tardios) solo tienen un estado AEAD y un IV, y no
+     * toman prestado nada.
+     * \~
+     */
+    struct OneRtt {
+        Aead aead = Aead::Aes128Gcm;
+        size_t secret_len = 0;
+        /// \~english The secrets of the CURRENT read and write generations.
+        /// \~spanish Los secretos de las generaciones ACTUALES de lectura y escritura.  \~
+        uint8_t read_secret[kMaxSecret] = {};
+        uint8_t write_secret[kMaxSecret] = {};
+        PacketKeys read_next;
+        PacketKeys read_prev;
+        uint64_t prev_until = kNever;
+        bool read_phase = false;
+        bool write_phase = false;
+        /// \~english The lowest packet number opened with the current read keys (6.4).
+        /// \~spanish El numero de paquete mas bajo abierto con las claves de lectura actuales (6.4).  \~
+        uint64_t first_recv_pn = kNever;
+        /// \~english The first packet number sealed with the current write keys (6.5).
+        /// \~spanish El primer numero de paquete sellado con las claves de escritura actuales (6.5).  \~
+        uint64_t first_sent_pn = kNever;
+        uint64_t sealed = 0;
+        /**
+         * \~english
+         * The packet that brought an update the PEER started, until an ACK
+         * covering it goes out under the new keys: another update the peer
+         * starts before that is it updating twice without waiting (6.2).  Its
+         * answers to this end's updates never count.
+         * \~spanish
+         * El paquete que trajo una actualizacion que EMPEZO el otro extremo, hasta
+         * que sale un ACK que lo cubra con las claves nuevas: otra actualizacion
+         * que empiece el otro antes de eso es el actualizando dos veces sin
+         * esperar (6.2).  Sus respuestas a las actualizaciones de este extremo no
+         * cuentan nunca.
+         * \~
+         */
+        uint64_t unanswered_pn = kNever;
+    };
+    OneRtt one_rtt_;
+    KeyUpdateCounts key_counts_;
     AckTracker acks_[kSpaces];
     uint64_t next_pn_[kSpaces] = {0, 0, 0};
     Recovery recovery_;

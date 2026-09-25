@@ -144,6 +144,7 @@ Connection::~Connection() {
             forget_keys(crypto_, k.write);
         }
     }
+    forget_one_rtt();
     for (size_t s = 0; s < kSpaces; ++s) {
         drop_from_heap(crypto_recv_[s]);
         drop_from_heap(crypto_send_[s]);
@@ -189,14 +190,51 @@ size_t Connection::offered_versions(uint32_t *out, size_t room) const noexcept {
     return offered_count_;
 }
 
-bool Connection::install_keys(Space s, KeyMaterial &read, KeyMaterial &write,
-                              uint64_t now_us) noexcept {
+bool Connection::install_secrets(Space s, Aead a, const uint8_t *read_secret,
+                                 const uint8_t *write_secret, size_t len, uint64_t now_us) noexcept {
     Keys &k = keys_[idx(s)];
-    if (k.have) return false;
-    if (!prepare_keys(crypto_, read, k.read)) return false;
-    if (!prepare_keys(crypto_, write, k.write)) {
-        forget_keys(crypto_, k.read);
+    if (k.have || len > kMaxSecret) return false;
+
+    KeyMaterial m;
+    if (!derive_key_material(crypto_, cfg_.version, a, read_secret, len, m) ||
+        !prepare_keys(crypto_, m, k.read)) {
+        util::vesta_memset_noinline(&m, 0, sizeof m);
         return false;
+    }
+    if (!derive_key_material(crypto_, cfg_.version, a, write_secret, len, m) ||
+        !prepare_keys(crypto_, m, k.write)) {
+        forget_keys(crypto_, k.read);
+        util::vesta_memset_noinline(&m, 0, sizeof m);
+        return false;
+    }
+
+    /* \~english
+     * 1-RTT keeps the secrets: every later phase comes from them (6.1).  And
+     * the next read keys are made now, so that a peer's update never waits
+     * for -- or reveals through its timing -- a derivation (6.3).
+     * \~spanish
+     * 1-RTT guarda los secretos: de ellos sale cada fase posterior (6.1).  Y las
+     * claves de lectura siguientes se hacen ya, para que la actualizacion del
+     * otro extremo nunca espere a una derivacion -- ni la delate por su tiempo
+     * (6.3).
+     * \~ */
+    if (s == Space::Application) {
+        one_rtt_.aead = a;
+        one_rtt_.secret_len = len;
+        // \~english Out of line: once per phase, at most 48 bytes.
+        // \~spanish Fuera de linea: una vez por fase, como mucho 48 bytes.  \~
+        util::vesta_memcpy_noinline(one_rtt_.read_secret, read_secret, len);
+        util::vesta_memcpy_noinline(one_rtt_.write_secret, write_secret, len);
+        uint8_t next[kMaxSecret];
+        const bool ok = next_secret(crypto_, cfg_.version, a, read_secret, len, next) &&
+                        make_generation(next, one_rtt_.read_next);
+        util::vesta_memset_noinline(next, 0, sizeof next);
+        if (!ok) {
+            forget_keys(crypto_, k.read);
+            forget_keys(crypto_, k.write);
+            forget_one_rtt();
+            return false;
+        }
     }
     k.have = true;
     if (s == Space::Handshake) recovery_.set_has_handshake_keys(now_us);
@@ -207,11 +245,227 @@ bool Connection::install_keys(Space s, KeyMaterial &read, KeyMaterial &write,
     return true;
 }
 
+const char *key_update_name(KeyUpdate k) noexcept {
+    switch (k) {
+    case KeyUpdate::Started:        return "started";
+    case KeyUpdate::NoKeys:         return "no-keys";
+    case KeyUpdate::NotConfirmed:   return "not-confirmed";
+    case KeyUpdate::Unacknowledged: return "unacknowledged";
+    case KeyUpdate::OldKeysKept:    return "old-keys-kept";
+    case KeyUpdate::Failed:         return "provider-failed";
+    }
+    return "unknown";
+}
+
+bool Connection::make_generation(const uint8_t *secret, PacketKeys &out) noexcept {
+    // \~english Only the AEAD key and the IV: header protection never changes (6).
+    // \~spanish Solo la clave AEAD y el IV: la proteccion de cabecera no cambia nunca (6).  \~
+    KeyMaterial m;
+    bool ok = derive_key_material(crypto_, cfg_.version, one_rtt_.aead, secret,
+                                  one_rtt_.secret_len, m);
+    if (ok) {
+        out.aead = one_rtt_.aead;
+        out.aead_state = crypto_.prepare_aead(one_rtt_.aead, m.key);
+        out.hp_state = nullptr;
+        util::vesta_memcpy(out.iv, m.iv, kNonceSize);
+        ok = out.aead_state != nullptr;
+    }
+    util::vesta_memset_noinline(&m, 0, sizeof m);
+    return ok;
+}
+
+void Connection::drop_generation(PacketKeys &k) noexcept {
+    if (k.aead_state != nullptr) crypto_.forget(k.aead_state);
+    k.aead_state = nullptr;
+    util::vesta_memset_noinline(k.iv, 0, sizeof k.iv);
+}
+
+void Connection::forget_one_rtt() noexcept {
+    drop_generation(one_rtt_.read_next);
+    drop_generation(one_rtt_.read_prev);
+    one_rtt_.prev_until = kNever;
+    util::vesta_memset_noinline(one_rtt_.read_secret, 0, sizeof one_rtt_.read_secret);
+    util::vesta_memset_noinline(one_rtt_.write_secret, 0, sizeof one_rtt_.write_secret);
+}
+
+uint64_t Connection::confidentiality_limit() const noexcept {
+    if (cfg_.confidentiality_limit != 0) return cfg_.confidentiality_limit;
+    // \~english 6.6: 2^23 packets for AES-GCM; ChaCha20-Poly1305's is beyond any packet count.
+    // \~spanish 6.6: 2^23 paquetes para AES-GCM; el de ChaCha20-Poly1305 esta mas alla de cualquier cuenta.  \~
+    return one_rtt_.aead == Aead::ChaCha20Poly1305 ? (uint64_t{1} << 62) : (uint64_t{1} << 23);
+}
+
+uint64_t Connection::integrity_limit() const noexcept {
+    if (cfg_.integrity_limit != 0) return cfg_.integrity_limit;
+    // \~english 6.6: 2^52 forgeries for AES-GCM, 2^36 for ChaCha20-Poly1305.
+    // \~spanish 6.6: 2^52 falsificaciones para AES-GCM, 2^36 para ChaCha20-Poly1305.  \~
+    return one_rtt_.aead == Aead::ChaCha20Poly1305 ? (uint64_t{1} << 36) : (uint64_t{1} << 52);
+}
+
+bool Connection::roll_read(uint64_t pn, uint64_t now_us) noexcept {
+    // \~english The generation after the new one, made now: failing here is said, before anything moves.
+    // \~spanish La generacion siguiente a la nueva, hecha ya: fallar aqui se dice antes de mover nada.  \~
+    uint8_t current[kMaxSecret];
+    uint8_t after[kMaxSecret];
+    PacketKeys next;
+    const size_t len = one_rtt_.secret_len;
+    bool ok = next_secret(crypto_, cfg_.version, one_rtt_.aead, one_rtt_.read_secret, len, current) &&
+              next_secret(crypto_, cfg_.version, one_rtt_.aead, current, len, after) &&
+              make_generation(after, next);
+    if (ok) {
+        PacketKeys &cur = keys_[idx(Space::Application)].read;
+        drop_generation(one_rtt_.read_prev);
+        one_rtt_.read_prev.aead = cur.aead;
+        one_rtt_.read_prev.aead_state = cur.aead_state;
+        util::vesta_memcpy(one_rtt_.read_prev.iv, cur.iv, kNonceSize);
+        cur.aead_state = one_rtt_.read_next.aead_state;
+        util::vesta_memcpy(cur.iv, one_rtt_.read_next.iv, kNonceSize);
+        one_rtt_.read_next = next;
+        util::vesta_memcpy_noinline(one_rtt_.read_secret, current, len);
+
+        one_rtt_.read_phase = !one_rtt_.read_phase;
+        one_rtt_.first_recv_pn = pn;
+        // \~english Late packets under the old keys have three PTO to arrive (6.5).
+        // \~spanish Los paquetes tardios con las claves viejas tienen tres PTO para llegar (6.5).  \~
+        one_rtt_.prev_until = now_us + 3 * pto_duration();
+        ++key_counts_.read_rolled;
+    }
+    util::vesta_memset_noinline(current, 0, sizeof current);
+    util::vesta_memset_noinline(after, 0, sizeof after);
+    return ok;
+}
+
+bool Connection::roll_write() noexcept {
+    uint8_t secret[kMaxSecret];
+    PacketKeys gen;
+    const size_t len = one_rtt_.secret_len;
+    const bool ok = next_secret(crypto_, cfg_.version, one_rtt_.aead, one_rtt_.write_secret, len, secret) &&
+                    make_generation(secret, gen);
+    if (ok) {
+        PacketKeys &cur = keys_[idx(Space::Application)].write;
+        crypto_.forget(cur.aead_state);
+        cur.aead_state = gen.aead_state;
+        util::vesta_memcpy(cur.iv, gen.iv, kNonceSize);
+        util::vesta_memcpy_noinline(one_rtt_.write_secret, secret, len);
+        one_rtt_.write_phase = !one_rtt_.write_phase;
+        one_rtt_.first_sent_pn = kNever;
+        one_rtt_.sealed = 0;
+    }
+    util::vesta_memset_noinline(secret, 0, sizeof secret);
+    return ok;
+}
+
+KeyUpdate Connection::update_keys(uint64_t now_us) noexcept {
+    (void)now_us;
+    if (!keys_[idx(Space::Application)].have) return KeyUpdate::NoKeys;
+    if (!confirmed_) return KeyUpdate::NotConfirmed;
+
+    /* \~english
+     * 6.5: only once a packet sealed with the current keys was acknowledged
+     * -- which, since the peer acknowledges with ITS keys of the same phase,
+     * also means the previous update is complete -- and once the old read
+     * keys are gone, so that the peer has had its time to drop them too.
+     * \~spanish
+     * 6.5: solo cuando se confirmo un paquete sellado con las claves actuales --
+     * lo que, como el otro extremo confirma con SUS claves de la misma fase,
+     * tambien quiere decir que la actualizacion anterior acabo -- y cuando ya no
+     * estan las claves de lectura viejas, para que el otro extremo haya tenido su
+     * tiempo de tirarlas tambien.
+     * \~ */
+    const uint64_t acked = recovery_.largest_acked(Space::Application);
+    if (one_rtt_.read_phase != one_rtt_.write_phase || one_rtt_.first_sent_pn == kNever ||
+        acked == kNever || acked < one_rtt_.first_sent_pn)
+        return KeyUpdate::Unacknowledged;
+    if (one_rtt_.read_prev.aead_state != nullptr) return KeyUpdate::OldKeysKept;
+
+    if (!roll_write()) return KeyUpdate::Failed;
+    ++key_counts_.initiated;
+    // \~english The peer's next change of phase will be its answer to this one, not an update of its own.
+    // \~spanish El siguiente cambio de fase del otro extremo sera su respuesta a esta, no una actualizacion suya.  \~
+    one_rtt_.unanswered_pn = kNever;
+    return KeyUpdate::Started;
+}
+
+Connection::Opened Connection::open_one_rtt(uint8_t *p, const PacketHeader &h, Unprotected &u,
+                                            uint64_t now_us) noexcept {
+    PacketKeys &cur = keys_[idx(Space::Application)].read;
+    const Unprotect m = unmask_header(crypto_, cur.hp_state, p, h,
+                                      acks_[idx(Space::Application)].expected_pn(), u);
+    if (m != Unprotect::Ok) return Opened::Failed;
+
+    // \~english The key phase bit, readable only now that the header is unmasked.
+    // \~spanish El bit de fase de clave, legible solo ahora que la cabecera esta desenmascarada.  \~
+    const bool phase = (u.first & 0x04) != 0;
+    Unprotect r;
+    if (phase == one_rtt_.read_phase) {
+        r = open_payload(crypto_, cur, p, h, u, p + u.payload.off);
+        if (r == Unprotect::Ok && u.pn < one_rtt_.first_recv_pn) one_rtt_.first_recv_pn = u.pn;
+    } else if (one_rtt_.read_prev.aead_state != nullptr && u.pn < one_rtt_.first_recv_pn) {
+        // \~english Numbered before the update: a late packet under the old keys (6.5).
+        // \~spanish Numerado antes de la actualizacion: un paquete tardio con las claves viejas (6.5).  \~
+        r = open_payload(crypto_, one_rtt_.read_prev, p, h, u, p + u.payload.off);
+        if (r == Unprotect::Ok) ++key_counts_.opened_with_old;
+    } else {
+        /* \~english
+         * The other phase, numbered after everything under the current keys:
+         * the peer updated (6.2) -- or sealed a newer packet with keys it had
+         * already left behind (6.4).  Opened aside, because a failed attempt
+         * may leave the bytes it touched, and then the old keys may be tried.
+         * \~spanish
+         * La otra fase, numerada despues de todo lo de las claves actuales: el
+         * otro extremo actualizo (6.2) -- o sello un paquete mas nuevo con claves
+         * que ya habia dejado (6.4).  Se abre aparte, porque un intento fallido
+         * puede dejar tocados los bytes, y entonces se pueden probar las viejas.
+         * \~ */
+        uint8_t scratch[1500];
+        if (u.payload.len > sizeof scratch) return Opened::Forged;
+        r = open_payload(crypto_, one_rtt_.read_next, p, h, u, scratch);
+        if (r == Unprotect::Ok) {
+            /* \~english
+             * Who moved first: with both phases equal the peer started this
+             * update; otherwise this is its answer to ours.  Only an update the
+             * peer STARTED can be its second without waiting (6.2) -- an answer
+             * never is, however soon it comes.
+             * \~spanish
+             * Quien se movio primero: con las dos fases iguales, esta
+             * actualizacion la empezo el otro extremo; si no, es su respuesta a la
+             * nuestra.  Solo una actualizacion que EMPEZO el otro puede ser la
+             * segunda sin esperar (6.2) -- una respuesta nunca lo es, por pronto
+             * que llegue.
+             * \~ */
+            const bool peer_started = one_rtt_.write_phase == one_rtt_.read_phase;
+            if (peer_started && one_rtt_.unanswered_pn != kNever) {
+                ++key_counts_.updated_twice;
+                return Opened::KeyUpdateViolation;
+            }
+            util::vesta_memcpy(p + u.payload.off, scratch, u.payload.len);
+            if (!roll_read(u.pn, now_us)) return Opened::Failed;
+            // \~english An update this end did not start is answered with new write keys (6.2).
+            // \~spanish Una actualizacion que no empezo este extremo se contesta con claves de escritura nuevas (6.2).  \~
+            if (peer_started) {
+                if (!roll_write()) return Opened::Failed;
+                ++key_counts_.answered;
+                one_rtt_.unanswered_pn = u.pn;
+            }
+        } else if (r == Unprotect::Forged && one_rtt_.read_prev.aead_state != nullptr &&
+                   open_payload(crypto_, one_rtt_.read_prev, p, h, u, scratch) == Unprotect::Ok) {
+            ++key_counts_.old_after_new;
+            return Opened::KeyUpdateViolation;
+        }
+    }
+
+    if (r == Unprotect::Ok) return Opened::Ok;
+    if (r == Unprotect::Forged) return Opened::Forged;
+    if (r == Unprotect::ReservedBitsSet) return Opened::ReservedBits;
+    return Opened::Failed;
+}
+
 void Connection::discard_keys(Space s, uint64_t now_us) noexcept {
     Keys &k = keys_[idx(s)];
     if (!k.have) return;
     forget_keys(crypto_, k.read);
     forget_keys(crypto_, k.write);
+    if (s == Space::Application) forget_one_rtt();
     k.have = false;
     discarded_[idx(s)] = true;
     recovery_.discard_space(s, now_us);
@@ -515,17 +769,39 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     }
 
     Unprotected u;
-    const Unprotect r = unprotect_packet(crypto_, k.read, p, h, acks_[idx(s)].expected_pn(), u);
-    if (r == Unprotect::Forged) {
-        ++drops_.forged;
+    Opened r;
+    if (s == Space::Application) {
+        r = open_one_rtt(p, h, u, now_us);
+    } else {
+        const Unprotect x = unprotect_packet(crypto_, k.read, p, h, acks_[idx(s)].expected_pn(), u);
+        r = x == Unprotect::Ok                ? Opened::Ok
+            : x == Unprotect::Forged          ? Opened::Forged
+            : x == Unprotect::ReservedBitsSet ? Opened::ReservedBits
+                                              : Opened::Failed;
+    }
+    if (r == Opened::Forged) {
+        /* \~english
+         * Every failed authentication counts against the AEAD's integrity
+         * limit, across all keys; past it the connection MUST close and open
+         * nothing more (RFC 9001, 6.6).
+         * \~spanish
+         * Cada autenticacion fallida cuenta contra el limite de integridad del
+         * AEAD, entre todas las claves; pasado el, la conexion DEBE cerrarse y no
+         * abrir nada mas (RFC 9001, 6.6).
+         * \~ */
+        if (++drops_.forged > integrity_limit()) fail(TransportError::AeadLimitReached, 0, now_us);
         return false;
     }
-    if (r == Unprotect::Failed) {
+    if (r == Opened::Failed) {
         fail(TransportError::InternalError, 0, now_us);
         return false;
     }
-    if (r == Unprotect::ReservedBitsSet) {
+    if (r == Opened::ReservedBits) {
         fail(TransportError::ProtocolViolation, 0, now_us);
+        return false;
+    }
+    if (r == Opened::KeyUpdateViolation) {
+        fail(TransportError::KeyUpdateError, 0, now_us);
         return false;
     }
     if (acks_[idx(s)].classify(u.pn) != Receipt::New) {
@@ -1043,7 +1319,26 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
         length_at = h;
         h += 2;
     } else {
-        out[h++] = 0x40;
+        /* \~english
+         * The confidentiality limit (RFC 9001, 6.6): no packet past it with one
+         * key.  An update comes well before; if none could be made, the
+         * connection stops being used -- not even a CONNECTION_CLOSE, which
+         * would be one packet more under the same key.
+         * \~spanish
+         * El limite de confidencialidad (RFC 9001, 6.6): ningun paquete pasado el
+         * con una misma clave.  Una actualizacion llega mucho antes; si no se pudo
+         * hacer ninguna, la conexion deja de usarse -- ni siquiera un
+         * CONNECTION_CLOSE, que seria un paquete mas con la misma clave.
+         * \~ */
+        if (one_rtt_.sealed >= confidentiality_limit()) {
+            state_ = ConnState::Closed;
+            close_code_ = static_cast<uint64_t>(TransportError::AeadLimitReached);
+            close_app_ = false;
+            return 0;
+        }
+        // \~english The fixed bit, and the key phase this end seals with (17.3.1).
+        // \~spanish El bit fijo, y la fase de clave con la que sella este extremo (17.3.1).  \~
+        out[h++] = static_cast<uint8_t>(0x40 | (one_rtt_.write_phase ? 0x04 : 0x00));
         util::vesta_memcpy(out + h, cfg_.peer_cid, cfg_.peer_cid_len);
         h += cfg_.peer_cid_len;
     }
@@ -1092,6 +1387,22 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     const size_t size = overhead + len;
     ++next_pn_[i];
     bytes_out_ += size;
+
+    if (s == Space::Application) {
+        OneRtt &o = one_rtt_;
+        ++o.sealed;
+        if (o.first_sent_pn == kNever) o.first_sent_pn = pn;
+        // \~english The peer's update is answered once an ACK for it goes out under the new keys (6.2).
+        // \~spanish La actualizacion del otro extremo queda contestada cuando sale un ACK de ella con las claves nuevas (6.2).  \~
+        if (o.unanswered_pn != kNever && o.write_phase == o.read_phase && ack_largest != kNever &&
+            ack_largest >= o.unanswered_pn)
+            o.unanswered_pn = kNever;
+        // \~english Half-way to the limit an update starts on its own; until it can, it is asked again.
+        // \~spanish A mitad de camino del limite empieza sola una actualizacion; hasta que pueda, se vuelve a pedir.  \~
+        const uint64_t every = cfg_.key_update_packets != 0 ? cfg_.key_update_packets
+                                                            : confidentiality_limit() / 2;
+        if (o.sealed >= every) update_keys(now_us);
+    }
 
     if (state_ != ConnState::Closing) {
         // \~english PADDING keeps a packet in flight even without an ack-eliciting frame.
@@ -1176,7 +1487,7 @@ uint64_t Connection::timer() const noexcept {
     if (state_ == ConnState::Closed) return kNever;
     if (state_ != ConnState::Active) return close_deadline_;
 
-    uint64_t t = min64(idle_deadline_, recovery_.timer());
+    uint64_t t = min64(min64(idle_deadline_, recovery_.timer()), one_rtt_.prev_until);
 
     /* \~english
      * An ACK that cannot be sent is no reason to wake: a server at its
@@ -1206,6 +1517,14 @@ void Connection::on_timer(uint64_t now_us) noexcept {
     if (idle_deadline_ != kNever && now_us >= idle_deadline_) {
         state_ = ConnState::Closed;
         return;
+    }
+
+    // \~english The previous read keys have had their time (RFC 9001, 6.5).
+    // \~spanish Las claves de lectura anteriores ya tuvieron su tiempo (RFC 9001, 6.5).  \~
+    if (one_rtt_.prev_until <= now_us) {
+        drop_generation(one_rtt_.read_prev);
+        one_rtt_.prev_until = kNever;
+        ++key_counts_.old_discarded;
     }
 
     if (recovery_.timer() <= now_us) {

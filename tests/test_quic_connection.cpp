@@ -79,6 +79,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace {
@@ -123,6 +124,11 @@ struct NetShape {
     /// \~english The server makes the client prove its address with a Retry first.
     /// \~spanish El servidor hace que el cliente pruebe primero su direccion con un Retry.  \~
     bool retry;
+    /// \~english Both ends update their 1-RTT keys every this many packets (0: only near the AEAD limit).
+    /// \~spanish Los dos extremos actualizan sus claves 1-RTT cada tantos paquetes (0: solo cerca del limite del AEAD).  \~
+    uint64_t key_update_packets;
+    /// \~english The suite the handshake settles on.  \~spanish El algoritmo en el que queda el saludo.  \~
+    Aead aead;
 };
 
 const uint8_t kClientAddr[6] = {198, 51, 100, 7, 0x1f, 0x90};
@@ -138,14 +144,22 @@ AcceptorConfig acceptor_config(bool retry) {
 
 /// \~english Fixed secrets for the simulated handshake, one per direction and level.
 /// \~spanish Secretos fijos para el saludo simulado, uno por sentido y nivel.  \~
-void secret(uint8_t *out, uint8_t tag) {
-    for (int i = 0; i < 32; ++i) out[i] = static_cast<uint8_t>(tag * 17 + i);
+void secret(uint8_t *out, uint8_t tag, size_t len) {
+    for (size_t i = 0; i < len; ++i) out[i] = static_cast<uint8_t>(tag * 17 + i);
 }
 
-bool derive(Crypto &c, uint8_t tag, KeyMaterial &m) {
-    uint8_t s[32];
-    secret(s, tag);
-    return derive_key_material(c, kVersion1, Aead::Aes128Gcm, s, 32, m);
+size_t secret_len(Aead a) {
+    return hash_size(hash_of(a));
+}
+
+/// \~english Installs the secrets tagged @p read_tag / @p write_tag for a space.
+/// \~spanish Instala los secretos marcados @p read_tag / @p write_tag para un espacio.  \~
+bool install(Connection &c, Space s, Aead a, uint8_t read_tag, uint8_t write_tag, uint64_t now) {
+    uint8_t r[kMaxSecret], w[kMaxSecret];
+    const size_t len = secret_len(a);
+    secret(r, read_tag, len);
+    secret(w, write_tag, len);
+    return c.install_secrets(s, a, r, w, len, now);
 }
 
 /// \~english Reads up to @p want bytes of CRYPTO data at a level, consuming them.
@@ -180,6 +194,7 @@ struct End {
 
     Connection *c;
     bool server;
+    Aead aead = Aead::Aes128Gcm;
     int stage = 0;
     size_t crypto_got = 0;
     // \~english Per stream: what was received, and (server) how much of it was echoed back.
@@ -207,38 +222,34 @@ struct End {
  * \~
  */
 void drive_handshake(Crypto &cr, End &e, uint64_t now) {
+    (void)cr;
     Connection &c = *e.c;
-    KeyMaterial r, w;
     if (!e.server) {
         if (e.stage == 0) {
             write_crypto(c, Space::Initial, 300);
             e.stage = 1;
         }
         if (e.stage == 1 && (e.crypto_got += read_crypto(c, Space::Initial, 100 - e.crypto_got)) == 100) {
-            check(derive(cr, 2, r) && derive(cr, 1, w) &&
-                      c.install_keys(Space::Handshake, r, w, now),
+            check(install(c, Space::Handshake, e.aead, 2, 1, now),
                   "the client could not install Handshake keys");
             e.crypto_got = 0;
             e.stage = 2;
         }
         if (e.stage == 2 && (e.crypto_got += read_crypto(c, Space::Handshake, 3000 - e.crypto_got)) == 3000) {
             write_crypto(c, Space::Handshake, 50);
-            check(derive(cr, 4, r) && derive(cr, 3, w) &&
-                      c.install_keys(Space::Application, r, w, now),
+            check(install(c, Space::Application, e.aead, 4, 3, now),
                   "the client could not install 1-RTT keys");
             e.stage = 3;
         }
     } else {
         if (e.stage == 0 && (e.crypto_got += read_crypto(c, Space::Initial, 300 - e.crypto_got)) == 300) {
             write_crypto(c, Space::Initial, 100);
-            check(derive(cr, 1, r) && derive(cr, 2, w) &&
-                      c.install_keys(Space::Handshake, r, w, now),
+            check(install(c, Space::Handshake, e.aead, 1, 2, now),
                   "the server could not install Handshake keys");
             // \~english A flight larger than one datagram: certificates are.
             // \~spanish Un vuelo mayor que un datagrama: los certificados lo son.  \~
             write_crypto(c, Space::Handshake, 3000);
-            check(derive(cr, 3, r) && derive(cr, 4, w) &&
-                      c.install_keys(Space::Application, r, w, now),
+            check(install(c, Space::Application, e.aead, 3, 4, now),
                   "the server could not install 1-RTT keys");
             e.crypto_got = 0;
             e.stage = 1;
@@ -305,6 +316,7 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     cc.streams.window_bidi_local = 256 * 1024;
     cc.peer_max_data = 1u << 20;
     cc.data_window = 1u << 20;
+    cc.key_update_packets = net.key_update_packets;
 
     ConnectionConfig sc;
     sc.is_server = true;
@@ -314,6 +326,7 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     sc.streams.peer_window_bidi_local = 256 * 1024;
     sc.peer_max_data = 1u << 20;
     sc.data_window = 1u << 20;
+    sc.key_update_packets = net.key_update_packets;
 
     Connection client(cr, cc);
     check(client.ready(), "the client could not allocate its tables");
@@ -327,6 +340,8 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
 
     End ce{&client, false};
     End se{nullptr, true};
+    ce.aead = net.aead;
+    se.aead = net.aead;
 
     std::vector<Datagram> air;
     uint64_t now = 0;
@@ -515,6 +530,34 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     }
     check(acceptor.count(AdmitReason::SentInvalidToken) == 0, "an honest token was refused");
 
+    /* \~english
+     * With frequent updates, each end must have rolled its keys forward many
+     * times -- starting some and answering others -- while every byte still
+     * came back whole and nothing failed authentication.
+     * \~spanish
+     * Con actualizaciones frecuentes, cada extremo tiene que haber avanzado sus
+     * claves muchas veces -- empezando unas y contestando otras -- mientras cada
+     * byte volvia entero y nada fallaba la autenticacion.
+     * \~ */
+    if (net.key_update_packets != 0) {
+        const KeyUpdateCounts &kc = client.key_updates();
+        const KeyUpdateCounts &ks = server.key_updates();
+        // \~english At least one each way: how many fit depends on how long the run lasts (6.5 spaces them).
+        // \~spanish Al menos una en cada sentido: cuantas caben depende de lo que dure la corrida (6.5 las espacia).  \~
+        check(kc.read_rolled >= 1 && ks.read_rolled >= 1, "the keys were not updated");
+        check(kc.initiated + ks.initiated >= 1, "no end started key updates on its own");
+        // \~english Each write roll is one read roll on the other side; the very last may go unseen at the close.
+        // \~spanish Cada avance de escritura es uno de lectura al otro lado; el ultimo puede no verse al cerrar.  \~
+        const uint64_t c_wrote = kc.initiated + kc.answered;
+        const uint64_t s_wrote = ks.initiated + ks.answered;
+        check(c_wrote >= ks.read_rolled && c_wrote <= ks.read_rolled + 1 &&
+                  s_wrote >= kc.read_rolled && s_wrote <= kc.read_rolled + 1,
+              "the updates one end made are not the ones the other saw");
+    } else {
+        check(client.key_updates().read_rolled == 0 && server.key_updates().read_rolled == 0,
+              "keys were updated without being asked to");
+    }
+
     // \~english What must hold at the end.  \~spanish Lo que tiene que cumplirse al final.  \~
     check(client.is_handshake_confirmed() && server.is_handshake_confirmed(),
           "the handshake was not confirmed on both ends");
@@ -530,8 +573,21 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
     }
     check(client.state() == ConnState::Closed && server.state() == ConnState::Closed,
           "the connections did not end closed");
-    check(server.closed_by_peer() && server.close_code() == 0 && server.close_is_application(),
-          "the server did not see the client's application close with code 0");
+    if (!(server.closed_by_peer() && server.close_code() == 0 && server.close_is_application())) {
+        std::fprintf(stderr,
+                     "FAIL [%s]: the server did not see the client's application close with code 0 "
+                     "(client: code 0x%llx by %s; server: code 0x%llx by %s; key update refusals: "
+                     "old-after-new %llu+%llu, updated-twice %llu+%llu)\n",
+                     current, static_cast<unsigned long long>(client.close_code()),
+                     client.closed_by_peer() ? "peer" : "itself",
+                     static_cast<unsigned long long>(server.close_code()),
+                     server.closed_by_peer() ? "peer" : "itself",
+                     static_cast<unsigned long long>(client.key_updates().old_after_new),
+                     static_cast<unsigned long long>(server.key_updates().old_after_new),
+                     static_cast<unsigned long long>(client.key_updates().updated_twice),
+                     static_cast<unsigned long long>(server.key_updates().updated_twice));
+        ++failures;
+    }
     check(client.drops().forged == 0 && server.drops().forged == 0,
           "packets between two honest ends failed authentication");
     check(client.streams().count() == 0 && server.streams().count() == 0,
@@ -566,7 +622,8 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
         std::printf("  %-15s %d x %zu bytes echoed in %6.3f s simulated, admitted at %5.1f ms, "
                     "confirmed at %5.1f ms: %u+%u datagrams, "
                     "%u lost, %llu+%llu PTOs, %llu+%llu packets lost, %llu duplicates dropped, "
-                    "%llu kept for keys, cwnd %llu/%llu, persistent %llu+%llu\n",
+                    "%llu kept for keys, cwnd %llu/%llu, persistent %llu+%llu, "
+                    "key updates %llu+%llu (%llu late opened with old keys)\n",
                     net.name, streams, size, static_cast<double>(now) / 1e6,
                     static_cast<double>(admitted_at) / 1e3, static_cast<double>(confirmed_at) / 1e3,
                     sent_each[0],
@@ -580,7 +637,11 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                     static_cast<unsigned long long>(client.recovery().congestion_window()),
                     static_cast<unsigned long long>(server.recovery().congestion_window()),
                     static_cast<unsigned long long>(client.recovery().persistent_congestion_events()),
-                    static_cast<unsigned long long>(server.recovery().persistent_congestion_events()));
+                    static_cast<unsigned long long>(server.recovery().persistent_congestion_events()),
+                    static_cast<unsigned long long>(client.key_updates().initiated),
+                    static_cast<unsigned long long>(server.key_updates().initiated),
+                    static_cast<unsigned long long>(client.key_updates().opened_with_old +
+                                                    server.key_updates().opened_with_old));
 }
 
 /**
@@ -712,9 +773,8 @@ void test_early_one_rtt(Crypto &cr) {
 
     Connection client(cr, cc);
     Connection server(cr, sc);
-    KeyMaterial r, w;
-    check(derive(cr, 4, r) && derive(cr, 3, w) && client.install_keys(Space::Application, r, w, 0) &&
-              derive(cr, 3, r) && derive(cr, 4, w) && server.install_keys(Space::Application, r, w, 0),
+    check(install(client, Space::Application, Aead::Aes128Gcm, 4, 3, 0) &&
+              install(server, Space::Application, Aead::Aes128Gcm, 3, 4, 0),
           "the 1-RTT keys could not be installed");
 
     Stream *st = client.streams().open(true);
@@ -1080,6 +1140,354 @@ void test_changed_source(Crypto &cr) {
           "a packet with another source ID was not dropped for it");
 }
 
+/* \~english
+ * Key updates, rule by rule (RFC 9001, 6).  Two connections with 1-RTT keys
+ * installed directly talk without a network in between; packets that break
+ * one rule are made by hand with the keys of the generation that breaks it.
+ * \~spanish
+ * Actualizaciones de claves, regla a regla (RFC 9001, 6).  Dos conexiones con las
+ * claves 1-RTT instaladas directamente hablan sin red de por medio; los paquetes
+ * que rompen una regla se hacen a mano con las claves de la generacion que la
+ * rompe.
+ * \~ */
+
+/// \~english Two confirmed ends with 1-RTT keys; the client writes with tag 3, the server with 4.
+/// \~spanish Dos extremos confirmados con claves 1-RTT; el cliente escribe con la marca 3, el servidor con la 4.  \~
+struct KeyPair {
+    KeyPair(Crypto &cr, Aead a, const ConnectionConfig &cc, const ConnectionConfig &sc)
+        : client(cr, cc), server(cr, sc) {
+        check(install(client, Space::Application, a, 4, 3, 0) &&
+                  install(server, Space::Application, a, 3, 4, 0),
+              "the 1-RTT keys could not be installed");
+        client.handshake_confirmed(0);
+        server.handshake_confirmed(0);
+    }
+    Connection client;
+    Connection server;
+    uint64_t now = 1000;
+};
+
+ConnectionConfig key_client() {
+    ConnectionConfig cc = small_client(kVersion1);
+    for (int i = 0; i < 8; ++i) cc.peer_cid[i] = static_cast<uint8_t>(0x50 + i);
+    cc.streams.peer_max_streams_bidi = 4;
+    cc.streams.peer_window_bidi_remote = 1 << 20;
+    cc.peer_max_data = 1 << 20;
+    return cc;
+}
+
+/// \~english Both ends send all they have, each way, @p rounds times, @p step apart.
+/// \~spanish Los dos extremos mandan todo lo que tienen, en los dos sentidos, @p rounds veces, a @p step de distancia.  \~
+void pump(KeyPair &k, int rounds, uint64_t step = 5000) {
+    uint8_t buf[1500];
+    for (int r = 0; r < rounds; ++r) {
+        size_t n;
+        while ((n = k.client.build_datagram(buf, sizeof buf, k.now)) != 0)
+            k.server.on_datagram(buf, n, Ecn::NotEct, k.now);
+        while ((n = k.server.build_datagram(buf, sizeof buf, k.now)) != 0)
+            k.client.on_datagram(buf, n, Ecn::NotEct, k.now);
+        k.now += step;
+        if (k.client.timer() <= k.now) k.client.on_timer(k.now);
+        if (k.server.timer() <= k.now) k.server.on_timer(k.now);
+    }
+}
+
+/// \~english Writes @p text on the client's stream 0, opening it the first time.
+/// \~spanish Escribe @p text en el flujo 0 del cliente, abriendolo la primera vez.  \~
+void say(KeyPair &k, const char *text) {
+    Stream *st = k.client.streams().find(0);
+    if (st == nullptr) st = k.client.streams().open(true);
+    check(st != nullptr, "the client could not open its stream");
+    if (st == nullptr) return;
+    size_t took = 0;
+    st->send->write(reinterpret_cast<const uint8_t *>(text), std::strlen(text), took);
+}
+
+/// \~english Everything the server has received on stream 0, read out.
+/// \~spanish Todo lo que ha recibido el servidor en el flujo 0, leido.  \~
+std::string heard(KeyPair &k) {
+    std::string out;
+    Stream *st = k.server.streams().find(0);
+    if (st == nullptr || st->recv == nullptr) return out;
+    const uint8_t *p = nullptr;
+    size_t n;
+    while ((n = st->recv->peek(p)) != 0) {
+        out.append(reinterpret_cast<const char *>(p), n);
+        k.server.consume(*st, n);
+    }
+    return out;
+}
+
+/**
+ * @brief
+ * \~english A 1-RTT PING sealed by hand with the client's keys of generation @p gen.
+ * \~spanish Un PING 1-RTT sellado a mano con las claves del cliente de la generacion @p gen.
+ * \~
+ *
+ * \~english
+ * Header protection comes from generation 0 whatever @p gen is, as RFC 9001, 6
+ * says; @p tag other than 3 gives keys the server never had.
+ * \~spanish
+ * La proteccion de cabecera sale de la generacion 0 sea cual sea @p gen, como
+ * dice el RFC 9001, 6; una @p tag distinta de 3 da claves que el servidor nunca
+ * tuvo.
+ * \~
+ */
+size_t craft_one_rtt(Crypto &cr, Aead a, uint8_t tag, int gen, bool phase, uint64_t pn, uint8_t *out,
+                     bool to_client = false) {
+    const size_t len = secret_len(a);
+    uint8_t s0[kMaxSecret], s[kMaxSecret];
+    secret(s0, tag, len);
+    std::memcpy(s, s0, len);
+    for (int g = 0; g < gen; ++g) {
+        uint8_t n[kMaxSecret];
+        check(next_secret(cr, kVersion1, a, s, len, n), "next_secret failed");
+        std::memcpy(s, n, len);
+    }
+    KeyMaterial m0, mg;
+    check(derive_key_material(cr, kVersion1, a, s0, len, m0) &&
+              derive_key_material(cr, kVersion1, a, s, len, mg),
+          "key material could not be derived");
+    std::memcpy(mg.hp, m0.hp, sizeof mg.hp);
+    PacketKeys k;
+    check(prepare_keys(cr, mg, k), "keys could not be prepared");
+
+    size_t p = 0;
+    out[p++] = static_cast<uint8_t>(0x40 | (phase ? 0x04 : 0x00));
+    for (int i = 0; i < 8; ++i) out[p++] = static_cast<uint8_t>((to_client ? 0xc0 : 0x50) + i);
+    const size_t pn_offset = p;
+    const size_t body = 31;
+    out[pn_offset + 4] = 0x01;  // \~english PING  \~spanish PING  \~
+    std::memset(out + pn_offset + 5, 0, body - 1);
+    check(protect_packet(cr, k, out, pn_offset, 4, pn, body) == Protect::Ok, "a packet could not be sealed");
+    forget_keys(cr, k);
+    return pn_offset + 4 + body + kTagSize;
+}
+
+/// \~english Checks an update answer, naming the one that came when it is not the one expected.
+/// \~spanish Comprueba una respuesta a una actualizacion, nombrando la que llego cuando no es la esperada.  \~
+void expect_update(KeyUpdate got, KeyUpdate want, const char *what) {
+    if (got == want) return;
+    std::fprintf(stderr, "FAIL [%s]: %s (got %s, wanted %s)\n", current, what, key_update_name(got),
+                 key_update_name(want));
+    ++failures;
+}
+
+void test_key_update_rules(Crypto &cr, Aead a) {
+    std::snprintf(current, sizeof current, "%s/key-update/%s", cr.name(),
+                  a == Aead::Aes128Gcm ? "aes128" : a == Aead::Aes256Gcm ? "aes256" : "chacha20");
+    const ConnectionConfig cc = key_client();
+    // \~english No long header ever crosses here, so the server is told the client's ID.
+    // \~spanish Aqui no cruza nunca una cabecera larga, asi que al servidor se le dice el identificador del cliente.  \~
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    uint8_t pkt[1500];
+
+    // \~english Not without keys, not before the handshake is confirmed (6.1).
+    // \~spanish Ni sin claves, ni antes de confirmar el saludo (6.1).  \~
+    {
+        Connection bare(cr, cc);
+        check(bare.update_keys(0) == KeyUpdate::NoKeys, "an update without 1-RTT keys was not refused");
+        check(install(bare, Space::Application, a, 4, 3, 0), "1-RTT keys could not be installed");
+        check(bare.update_keys(0) == KeyUpdate::NotConfirmed, "an update before confirmation was not refused");
+    }
+
+    KeyPair k(cr, a, cc, sc);
+    expect_update(k.client.update_keys(k.now), KeyUpdate::Unacknowledged,
+                  "an update before any packet was acknowledged was not refused");
+
+    // \~english One packet acknowledged -- after the ACK delay (13.2) --: the update starts, and is answered.
+    // \~spanish Un paquete confirmado -- tras el retraso del ACK (13.2) --: la actualizacion empieza, y se contesta.  \~
+    say(k, "one ");
+    pump(k, 10);
+    expect_update(k.client.update_keys(k.now), KeyUpdate::Started, "an update the rules allow did not start");
+    check(k.client.key_phase(), "the client did not move to phase 1");
+    say(k, "two ");
+    pump(k, 10);
+    check(k.server.key_updates().answered == 1 && k.server.key_phase() &&
+              k.client.key_updates().read_rolled == 1,
+          "the server did not answer the update");
+
+    // \~english The old keys are kept for late packets: no new update until they go (6.5).
+    // \~spanish Las claves viejas se guardan para paquetes tardios: ninguna actualizacion hasta que se vayan (6.5).  \~
+    expect_update(k.client.update_keys(k.now), KeyUpdate::OldKeysKept,
+                  "an update while the old keys are kept was not refused");
+    pump(k, 20, 200000);
+    check(k.client.key_updates().old_discarded == 1 && k.server.key_updates().old_discarded == 1,
+          "the old keys were not thrown away after their time");
+
+    // \~english A packet sealed now under phase 1, delivered only after the next update.
+    // \~spanish Un paquete sellado ahora con la fase 1, entregado solo despues de la actualizacion siguiente.  \~
+    say(k, "late ");
+    uint8_t late[1500];
+    const size_t late_n = k.client.build_datagram(late, sizeof late, k.now);
+    check(late_n != 0, "the late packet was not built");
+    expect_update(k.client.update_keys(k.now), KeyUpdate::Started, "the second update did not start");
+    check(!k.client.key_phase(), "the client did not move back to phase 0");
+    say(k, "three ");
+    pump(k, 1);
+    k.server.on_datagram(late, late_n, Ecn::NotEct, k.now);
+    check(k.server.key_updates().opened_with_old == 1, "a late packet was not opened with the old keys");
+    pump(k, 5);
+    const std::string got = heard(k);
+    check(got == "one two late three ", "the stream did not arrive whole across two updates");
+
+    // \~english A forged packet in the other phase moves nothing.
+    // \~spanish Un paquete falsificado en la otra fase no mueve nada.  \~
+    {
+        const uint64_t forged = k.server.drops().forged;
+        const bool phase = k.server.key_phase();
+        const size_t n = craft_one_rtt(cr, a, 99, 0, !phase, 100000, pkt);
+        k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
+        check(k.server.drops().forged == forged + 1 && k.server.key_phase() == phase &&
+                  k.server.state() == ConnState::Active,
+              "a forged packet in the other phase was not just dropped");
+    }
+
+    // \~english Old keys on a packet numbered after the new ones: KEY_UPDATE_ERROR (6.4).
+    // \~spanish Claves viejas en un paquete numerado despues de los de las nuevas: KEY_UPDATE_ERROR (6.4).  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        const size_t n1 = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
+        v.server.on_datagram(pkt, n1, Ecn::NotEct, v.now);
+        check(v.server.key_updates().read_rolled == 1, "a well made update was not taken");
+        const size_t n0 = craft_one_rtt(cr, a, 3, 0, false, 11, pkt);
+        v.server.on_datagram(pkt, n0, Ecn::NotEct, v.now);
+        check(v.server.state() == ConnState::Closing &&
+                  v.server.close_code() == static_cast<uint64_t>(TransportError::KeyUpdateError) &&
+                  v.server.key_updates().old_after_new == 1,
+              "old keys after new ones did not close with KEY_UPDATE_ERROR");
+    }
+    // \~english ...while the same old packet numbered BEFORE the new ones is just late.
+    // \~spanish ...mientras que el mismo paquete viejo numerado ANTES de los nuevos solo llega tarde.  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        const size_t n1 = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
+        v.server.on_datagram(pkt, n1, Ecn::NotEct, v.now);
+        const size_t n0 = craft_one_rtt(cr, a, 3, 0, false, 9, pkt);
+        v.server.on_datagram(pkt, n0, Ecn::NotEct, v.now);
+        check(v.server.state() == ConnState::Active && v.server.key_updates().opened_with_old == 1,
+              "an old packet numbered before the update was refused");
+    }
+
+    // \~english A new packet arriving late lowers the line: an old one above it is still a violation (6.4).
+    // \~spanish Un paquete nuevo que llega tarde baja la linea: uno viejo por encima sigue siendo una violacion (6.4).  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        size_t n = craft_one_rtt(cr, a, 3, 1, true, 20, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        n = craft_one_rtt(cr, a, 3, 1, true, 15, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        n = craft_one_rtt(cr, a, 3, 0, false, 17, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        check(v.server.state() == ConnState::Closing && v.server.key_updates().old_after_new == 1,
+              "old keys above a late new packet were taken as late");
+    }
+
+    // \~english Answered but not acknowledged: the next update waits for an ACK of the new phase (6.5).
+    // \~spanish Contestada pero sin confirmar: la siguiente actualizacion espera un ACK de la fase nueva (6.5).  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        say(v, "go ");
+        pump(v, 10);
+        expect_update(v.client.update_keys(v.now), KeyUpdate::Started, "the first update did not start");
+        say(v, "lost ");
+        uint8_t out[1500];
+        check(v.client.build_datagram(out, sizeof out, v.now) != 0, "no packet under the new keys");
+        // \~english The server's answer, carrying no ACK at all.
+        // \~spanish La respuesta del servidor, sin ningun ACK.  \~
+        const size_t n = craft_one_rtt(cr, a, 4, 1, true, 1000, pkt, true);
+        v.client.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        check(v.client.key_updates().read_rolled == 1, "the crafted answer was not taken");
+        v.client.on_timer(v.now + 5000000);
+        check(v.client.key_updates().old_discarded == 1, "the old keys were not dropped");
+        expect_update(v.client.update_keys(v.now + 5000000), KeyUpdate::Unacknowledged,
+                      "an update with nothing of the current phase acknowledged was not refused");
+    }
+
+    // \~english A low confidentiality limit is per KEY: with updates possible, the connection goes on.
+    // \~spanish Un limite de confidencialidad bajo es por CLAVE: con actualizaciones posibles, la conexion sigue.  \~
+    {
+        ConnectionConfig tc = cc;
+        ConnectionConfig ts = sc;
+        tc.confidentiality_limit = 10;
+        ts.confidentiality_limit = 10;
+        KeyPair v(cr, a, tc, ts);
+        std::string want;
+        for (int i = 0; i < 40; ++i) {
+            say(v, "x");
+            want += "x";
+            pump(v, 1, 200000);
+        }
+        pump(v, 5);
+        check(v.client.state() == ConnState::Active && v.server.state() == ConnState::Active,
+              "a connection able to update stopped at a per-key limit");
+        check(v.client.key_updates().initiated >= 2, "the per-key limit did not drive updates");
+        check(heard(v) == want, "the stream did not arrive whole under a low limit");
+    }
+
+    // \~english Two updates in a row, the first never acknowledged: KEY_UPDATE_ERROR (6.2).
+    // \~spanish Dos actualizaciones seguidas, la primera sin confirmar: KEY_UPDATE_ERROR (6.2).  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        n = craft_one_rtt(cr, a, 3, 2, false, 11, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        check(v.server.state() == ConnState::Closing &&
+                  v.server.close_code() == static_cast<uint64_t>(TransportError::KeyUpdateError) &&
+                  v.server.key_updates().updated_twice == 1,
+              "a second update without waiting did not close with KEY_UPDATE_ERROR");
+    }
+    // \~english ...while once the server has acknowledged the first, the second is fine.
+    // \~spanish ...mientras que una vez que el servidor confirmo la primera, la segunda vale.  \~
+    {
+        KeyPair v(cr, a, cc, sc);
+        size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        uint8_t out[1500];
+        check(v.server.build_datagram(out, sizeof out, v.now + 30000) != 0,
+              "the server did not acknowledge the update");
+        n = craft_one_rtt(cr, a, 3, 2, false, 11, pkt);
+        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now + 40000);
+        check(v.server.state() == ConnState::Active && v.server.key_updates().read_rolled == 2 &&
+                  v.server.key_updates().answered == 2,
+              "a second update after the first was acknowledged was refused");
+    }
+
+    // \~english Past the integrity limit the connection closes with AEAD_LIMIT_REACHED (6.6).
+    // \~spanish Pasado el limite de integridad la conexion se cierra con AEAD_LIMIT_REACHED (6.6).  \~
+    {
+        ConnectionConfig tight = sc;
+        tight.integrity_limit = 3;
+        KeyPair v(cr, a, cc, tight);
+        for (uint64_t i = 0; i < 4; ++i) {
+            const size_t n = craft_one_rtt(cr, a, 99, 0, false, 20 + i, pkt);
+            v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+            check(v.server.state() == (i < 3 ? ConnState::Active : ConnState::Closing),
+                  "the integrity limit was not applied at exactly its value");
+        }
+        check(v.server.close_code() == static_cast<uint64_t>(TransportError::AeadLimitReached),
+              "the integrity limit did not close with AEAD_LIMIT_REACHED");
+    }
+
+    // \~english At the confidentiality limit with no update possible, the connection stops (6.6).
+    // \~spanish En el limite de confidencialidad sin actualizacion posible, la conexion se para (6.6).  \~
+    {
+        ConnectionConfig tight = cc;
+        tight.confidentiality_limit = 6;
+        KeyPair v(cr, a, tight, sc);
+        std::string big(20000, 'x');
+        say(v, big.c_str());
+        uint8_t out[1500];
+        int sent = 0;
+        while (v.client.build_datagram(out, sizeof out, v.now) != 0) ++sent;
+        check(sent == 6 && v.client.state() == ConnState::Closed &&
+                  v.client.close_code() == static_cast<uint64_t>(TransportError::AeadLimitReached),
+              "the confidentiality limit did not stop the connection at exactly its value");
+    }
+}
+
 void run_all(Crypto &cr) {
     std::printf("-- %s --\n", cr.name());
     /* \~english
@@ -1092,13 +1500,18 @@ void run_all(Crypto &cr) {
      * cliente no confirmaria nunca, ni abriria un flujo.
      * \~ */
     const NetShape shapes[] = {
-        {"clean", 0, 0, 20000, 0, 0, 0, false},
-        {"lossy", 5, 2, 20000, 10000, 0, 0, false},
-        {"hostile", 20, 5, 30000, 40000, 0, 0, false},
-        {"handshake-lost", 3, 0, 20000, 5000, 2, 0, false},
-        {"handshake-done-lost", 0, 0, 20000, 0, 0, 150000, false},
-        {"retry-clean", 0, 0, 20000, 0, 0, 0, true},
-        {"retry-lossy", 5, 2, 20000, 10000, 0, 0, true},
+        {"clean", 0, 0, 20000, 0, 0, 0, false, 0, Aead::Aes128Gcm},
+        {"lossy", 5, 2, 20000, 10000, 0, 0, false, 0, Aead::Aes128Gcm},
+        {"hostile", 20, 5, 30000, 40000, 0, 0, false, 0, Aead::Aes128Gcm},
+        {"handshake-lost", 3, 0, 20000, 5000, 2, 0, false, 0, Aead::Aes128Gcm},
+        {"handshake-done-lost", 0, 0, 20000, 0, 0, 150000, false, 0, Aead::Aes128Gcm},
+        {"retry-clean", 0, 0, 20000, 0, 0, 0, true, 0, Aead::Aes128Gcm},
+        {"retry-lossy", 5, 2, 20000, 10000, 0, 0, true, 0, Aead::Aes128Gcm},
+        // \~english Keys updated every 40 packets, one suite each: a clean network must not notice.
+        // \~spanish Claves actualizadas cada 40 paquetes, un algoritmo en cada una: una red limpia no debe notarlo.  \~
+        {"keys-clean", 0, 0, 20000, 0, 0, 0, false, 40, Aead::Aes128Gcm},
+        {"keys-lossy", 5, 2, 20000, 10000, 0, 0, false, 40, Aead::Aes256Gcm},
+        {"keys-hostile", 20, 5, 30000, 40000, 0, 0, false, 40, Aead::ChaCha20Poly1305},
     };
     for (const NetShape &net : shapes)
         for (uint64_t seed = 1; seed <= 3; ++seed) run(cr, net, seed, 4, 100000);
@@ -1108,6 +1521,9 @@ void run_all(Crypto &cr) {
     test_version_negotiation(cr);
     test_retry_rules(cr);
     test_changed_source(cr);
+    test_key_update_rules(cr, Aead::Aes128Gcm);
+    test_key_update_rules(cr, Aead::Aes256Gcm);
+    test_key_update_rules(cr, Aead::ChaCha20Poly1305);
 }
 
 } // namespace
