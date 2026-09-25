@@ -156,6 +156,25 @@ target_compile_options(http_vx_proto PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 
 # ---------------------------------------------------------------------------
+# QUIC.  Va en su propia libreria y AL LADO de `reactor/`, no debajo de
+# `proto/` (R27): es un transporte, no una sintaxis de HTTP, y lo usa HTTP/3
+# como HTTP/1.1 y HTTP/2 usan TCP.
+#
+# Y sin ninguna cabecera del sistema, por lo mismo que `core/` y `proto/`
+# (R6): lo que lee QUIC es lo que manda un desconocido, y tiene que poder
+# darsele bytes torcidos desde una prueba corriente sin abrir ningun puerto.
+# ---------------------------------------------------------------------------
+add_library(http_vx_quic STATIC
+        quic/packet.cpp
+        quic/varint.cpp
+)
+target_include_directories(http_vx_quic
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_quic PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_quic PUBLIC vesta_alloc)
+
+# ---------------------------------------------------------------------------
 # Un servidor que se EJECUTA, y sin red por ningun sitio: lee una peticion de su
 # entrada estandar y escribe la respuesta en su salida.  Eso es un transporte de
 # verdad y no un sustituto -- HTTP por una tuberia es como se le habla al demonio
@@ -286,6 +305,8 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_stream tests/test_h2_stream.cpp)
     http_vx_add_test(test_h2_writer tests/test_h2_writer.cpp)
     http_vx_add_test(test_http2_service tests/test_http2_service.cpp)
+    http_vx_add_test(test_quic_packet tests/test_quic_packet.cpp)
+    http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)

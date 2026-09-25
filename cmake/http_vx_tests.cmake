@@ -23,7 +23,8 @@ function(http_vx_add_test name)
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fuzz
             PRIVATE ${HTTP_VX_ALLOC_INCLUDE})
     target_compile_options(${name} PRIVATE -Wall -Wextra -pedantic-errors)
-    target_link_libraries(${name} PRIVATE http_vx_proto http_vx_core vesta_alloc)
+    target_link_libraries(${name}
+            PRIVATE http_vx_proto http_vx_quic http_vx_core vesta_alloc)
     add_test(NAME ${name} COMMAND ${name})
 
     # Y con PLAZO.  Ninguna de estas pruebas tarda mas de una decima, asi que
