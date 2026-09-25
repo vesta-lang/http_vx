@@ -181,6 +181,8 @@ CngCrypto::CngCrypto() noexcept {
                         nullptr, 0);
     hmac384_ = open_alg(BCRYPT_SHA384_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG,
                         nullptr, 0);
+    sha256_ = open_alg(BCRYPT_SHA256_ALGORITHM, 0, nullptr, 0);
+    sha384_ = open_alg(BCRYPT_SHA384_ALGORITHM, 0, nullptr, 0);
     hkdf_ = open_alg(kHkdfAlgorithm, 0, nullptr, 0);
 
     // \~english The first one missing is named, so that the refusal says why.
@@ -189,6 +191,8 @@ CngCrypto::CngCrypto() noexcept {
     else if (ecb_ == nullptr) missing_ = "AES-ECB";
     else if (hmac256_ == nullptr) missing_ = "HMAC-SHA256";
     else if (hmac384_ == nullptr) missing_ = "HMAC-SHA384";
+    else if (sha256_ == nullptr) missing_ = "SHA256";
+    else if (sha384_ == nullptr) missing_ = "SHA384";
     else if (hkdf_ == nullptr) missing_ = "HKDF";
 }
 
@@ -197,7 +201,22 @@ CngCrypto::~CngCrypto() {
     close_alg(ecb_);
     close_alg(hmac256_);
     close_alg(hmac384_);
+    close_alg(sha256_);
+    close_alg(sha384_);
     close_alg(hkdf_);
+}
+
+bool CngCrypto::digest(quic::Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept {
+    void *alg = h == quic::Hash::Sha384 ? sha384_ : sha256_;
+    if (alg == nullptr || n > ULONG_MAX) return false;
+    BCRYPT_HASH_HANDLE hh = nullptr;
+    if (!ok(BCryptCreateHash(static_cast<BCRYPT_ALG_HANDLE>(alg), &hh, nullptr, 0, nullptr, 0, 0)))
+        return false;
+    bool done = true;
+    if (n != 0) done = ok(BCryptHashData(hh, const_cast<PUCHAR>(in), static_cast<ULONG>(n), 0));
+    done = done && ok(BCryptFinishHash(hh, out, static_cast<ULONG>(quic::hash_size(h)), 0));
+    BCryptDestroyHash(hh);
+    return done;
 }
 
 bool CngCrypto::ready() const noexcept {

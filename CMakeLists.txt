@@ -185,6 +185,23 @@ target_compile_options(http_vx_quic PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_quic PUBLIC vesta_alloc)
 
 # ---------------------------------------------------------------------------
+# TLS 1.3, el propio.  La R22 deja fuera las bibliotecas de TLS y pone la linea
+# en las primitivas, que pone el proveedor; lo que es TLS -- el calendario de
+# claves, los mensajes del saludo, la maquina de estados -- se escribe aqui y
+# se comprueba contra las trazas del RFC 8448.  Aparte de `quic/` porque no es
+# solo de QUIC: el mismo saludo puede servir un dia a HTTP/1.1 y HTTP/2 sobre
+# TCP.  Sin ninguna cabecera del sistema, por la R6, como el resto.
+# ---------------------------------------------------------------------------
+add_library(http_vx_tls STATIC
+        tls/schedule.cpp
+)
+target_include_directories(http_vx_tls
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_tls PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_tls PUBLIC http_vx_quic vesta_alloc)
+
+# ---------------------------------------------------------------------------
 # Un proveedor criptografico para QUIC, sobre la libcrypto de OpenSSL.
 #
 # APARTE y OPCIONAL, por la R22: `http_vx_quic` no enlaza ninguna biblioteca de
@@ -445,6 +462,19 @@ if (HTTP_VX_BUILD_TESTS)
             target_link_libraries(test_quic_vectors PRIVATE http_vx_crypto_cng)
             target_compile_definitions(test_quic_vectors PRIVATE HTTP_VX_HAVE_CNG=1)
         endif ()
+    endif ()
+
+    # TLS 1.3 contra el RFC 8448: las etiquetas con cualquier proveedor, los
+    # secretos con los de verdad que se hayan construido.
+    http_vx_add_test(test_tls_schedule tests/test_tls_schedule.cpp)
+    target_link_libraries(test_tls_schedule PRIVATE http_vx_tls)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_tls_schedule PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_tls_schedule PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_tls_schedule PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_tls_schedule PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)

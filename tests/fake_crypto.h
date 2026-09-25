@@ -36,6 +36,7 @@
 #define HTTP_VX_TESTS_FAKE_CRYPTO_H
 
 #include "http_vx/quic_crypto.h"
+#include "http_vx/quic_protection.h"
 
 #include <cstring>
 
@@ -70,6 +71,12 @@ public:
             seed_ = seed_ * 6364136223846793005ull + 1442695040888963407ull;
             out[i] = static_cast<uint8_t>(seed_ >> 56);
         }
+        return true;
+    }
+
+    bool digest(Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept override {
+        if (broken) return false;
+        spread(mix(0xD16E57, in, n), out, hash_size(h));
         return true;
     }
 

@@ -74,6 +74,7 @@ public:
     const char *name() const noexcept override;
     bool supports(quic::Aead a) const noexcept override;
     bool random(uint8_t *out, size_t n) noexcept override;
+    bool digest(quic::Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept override;
     bool extract(quic::Hash h, const uint8_t *salt, size_t salt_len,
                  const uint8_t *ikm, size_t ikm_len,
                  uint8_t *prk) noexcept override;

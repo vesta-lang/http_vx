@@ -235,6 +235,25 @@ public:
 
     /**
      * @brief
+     * \~english The hash of @p n bytes: writes `hash_size(h)` bytes to @p out.
+     * \~spanish El resumen de @p n bytes: escribe `hash_size(h)` bytes en @p out.
+     * \~
+     *
+     * \~english
+     * What TLS 1.3 hashes its transcript with (RFC 8446, 4.4.1).  One call over
+     * the whole input: the handshake keeps its messages and hashes them at the
+     * few points it needs to, so no provider has to copy a running state.
+     * \~spanish
+     * Con lo que TLS 1.3 resume su transcripcion (RFC 8446, 4.4.1).  Una llamada
+     * sobre toda la entrada: el saludo guarda sus mensajes y los resume en los
+     * pocos puntos en que lo necesita, asi que ningun proveedor tiene que copiar
+     * un estado a medias.
+     * \~
+     */
+    virtual bool digest(Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept = 0;
+
+    /**
+     * @brief
      * \~english HKDF-Extract (RFC 5869): writes `hash_size(h)` bytes to @p prk.
      * \~spanish HKDF-Extract (RFC 5869): escribe `hash_size(h)` bytes en @p prk.
      * \~

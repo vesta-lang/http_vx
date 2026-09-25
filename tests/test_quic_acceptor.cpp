@@ -534,6 +534,9 @@ public:
         for (; i < n && left_ != 0; ++i, --left_) out[i] = *script_++;
         return i == n || inner.random(out + i, n - i);
     }
+    bool digest(Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept override {
+        return inner.digest(h, in, n, out);
+    }
     bool extract(Hash h, const uint8_t *s, size_t sl, const uint8_t *k, size_t kl,
                  uint8_t *prk) noexcept override {
         return inner.extract(h, s, sl, k, kl, prk);

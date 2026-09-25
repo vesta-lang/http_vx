@@ -179,6 +179,16 @@ bool OpensslCrypto::supports(quic::Aead a) const noexcept {
     return aead_cipher(a) != nullptr;
 }
 
+bool OpensslCrypto::digest(quic::Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept {
+    const EVP_MD *md = h == quic::Hash::Sha384 ? EVP_sha384() : EVP_sha256();
+    // \~english EVP_Digest wants a non-null pointer even for nothing to hash.
+    // \~spanish EVP_Digest quiere un puntero no nulo aunque no haya nada que resumir.  \~
+    static const uint8_t kEmpty = 0;
+    unsigned int len = 0;
+    return EVP_Digest(n != 0 ? in : &kEmpty, n, out, &len, md, nullptr) == 1 &&
+           len == quic::hash_size(h);
+}
+
 bool OpensslCrypto::extract(quic::Hash h, const uint8_t *salt,
                             size_t salt_len, const uint8_t *ikm,
                             size_t ikm_len, uint8_t *prk) noexcept {
