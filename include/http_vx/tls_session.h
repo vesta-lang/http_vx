@@ -30,11 +30,11 @@
  * as bytes: reading them is the connection's.  No KeyUpdate (6), no
  * EndOfEarlyData (8.3), no post-handshake client authentication (4.4).
  *
- * **Keys are handed out when their rule allows, not when they exist.**  The
- * server has the client's 1-RTT secret as soon as it sends its Finished, and
- * MUST NOT read 1-RTT packets before the handshake is complete (RFC 9001,
- * 5.7): read_secret says no until then.  The connection does not have to
- * remember the rule.
+ * **Secrets are handed out as they exist, both directions of a level
+ * together.**  The server has both 1-RTT secrets once it writes its
+ * Finished, and may send with them then; that it MUST NOT open 1-RTT packets
+ * before the handshake is complete (RFC 9001, 5.7) is a rule about opening
+ * packets, and the connection -- which opens them -- is where it is kept.
  *
  * **A failure says what and why.**  Every refusal leaves the QUIC error code
  * -- 0x0100 plus the alert (RFC 9001, 4.8), or a transport error where RFC
@@ -61,11 +61,11 @@
  * cosa de la conexion.  Sin KeyUpdate (6), sin EndOfEarlyData (8.3), sin
  * autenticacion del cliente tras el saludo (4.4).
  *
- * **Las claves se entregan cuando su regla lo permite, no cuando existen.**  El
- * servidor tiene el secreto 1-RTT del cliente en cuanto manda su Finished, y NO
- * DEBE leer paquetes 1-RTT antes de que el saludo este completo (RFC 9001,
- * 5.7): read_secret dice que no hasta entonces.  La conexion no tiene que
- * acordarse de la regla.
+ * **Los secretos se entregan en cuanto existen, las dos direcciones de un nivel
+ * juntas.**  El servidor tiene los dos secretos 1-RTT cuando escribe su
+ * Finished, y puede mandar con ellos desde entonces; que NO DEBA abrir paquetes
+ * 1-RTT antes de que el saludo este completo (RFC 9001, 5.7) es una regla sobre
+ * abrir paquetes, y se guarda en la conexion, que es quien los abre.
  *
  * **Un fallo dice que y por que.**  Cada rechazo deja el codigo de error de
  * QUIC -- 0x0100 mas la alerta (RFC 9001, 4.8), o un error de transporte donde

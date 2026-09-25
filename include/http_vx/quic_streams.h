@@ -203,6 +203,18 @@ public:
 
     /**
      * @brief
+     * \~english The peer's transport parameters for streams: its stream limits and its initial windows (18.2).
+     * \~spanish Los parametros de transporte del otro para los flujos: sus limites de flujos y sus ventanas iniciales (18.2).
+     * \~
+     *
+     * \~english Every stream opened from now on sends within them; the ones already open are raised to them.
+     * \~spanish Cada flujo abierto desde ahora manda dentro de ellos; los ya abiertos suben hasta ellos.  \~
+     */
+    void on_peer_params(uint64_t max_bidi, uint64_t max_uni, uint64_t window_bidi_local,
+                        uint64_t window_bidi_remote, uint64_t window_uni) noexcept;
+
+    /**
+     * @brief
      * \~english Removes every stream whose parts have both finished, and counts it closed.
      * \~spanish Quita cada flujo cuyas partes han terminado las dos, y lo cuenta como cerrado.
      * \~

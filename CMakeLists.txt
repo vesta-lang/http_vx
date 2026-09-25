@@ -197,6 +197,7 @@ add_library(http_vx_tls STATIC
         tls/messages.cpp
         tls/schedule.cpp
         tls/session.cpp
+        tls/quic.cpp
 )
 target_include_directories(http_vx_tls
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -500,6 +501,16 @@ if (HTTP_VX_BUILD_TESTS)
     if (TARGET http_vx_crypto_cng)
         target_link_libraries(test_tls_session PRIVATE http_vx_crypto_cng)
         target_compile_definitions(test_tls_session PRIVATE HTTP_VX_HAVE_CNG=1)
+    endif ()
+    http_vx_add_test(test_quic_tls tests/test_quic_tls.cpp)
+    target_link_libraries(test_quic_tls PRIVATE http_vx_tls)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_quic_tls PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_quic_tls PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_quic_tls PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_quic_tls PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)

@@ -15,6 +15,7 @@
 
 #include "http_vx/quic_connection.h"
 
+#include "http_vx/quic_transport_params.h"
 #include "http_vx/quic_varint.h"
 
 #include "util/alloc/alloc_tag.h"
@@ -305,6 +306,145 @@ bool Connection::install_secrets(Space s, Aead a, const uint8_t *read_secret,
     // \~english Whatever arrived before these keys can be opened now.
     // \~spanish Lo que llego antes que estas claves ya se puede abrir.  \~
     replay(s, now_us);
+    return true;
+}
+
+bool Connection::set_original_ids(const uint8_t *odcid, size_t odcid_len, const uint8_t *retry_scid,
+                                  size_t retry_len) noexcept {
+    if (!cfg_.is_server || odcid_len > kMaxConnectionId || retry_len > kMaxConnectionId) return false;
+    util::vesta_memcpy_noinline(original_dcid_, odcid, odcid_len);
+    original_dcid_len_ = odcid_len;
+    util::vesta_memcpy_noinline(retry_scid_, retry_scid, retry_len);
+    retry_scid_len_ = retry_len;
+    original_known_ = true;
+    return true;
+}
+
+namespace {
+
+/// \~english Copies an ID into a transport parameter.  \~spanish Copia un identificador en un parametro de transporte.  \~
+void set_tp_cid(TpConnectionId &t, const uint8_t *cid, size_t len) noexcept {
+    t.present = true;
+    t.len = static_cast<uint8_t>(len);
+    util::vesta_memcpy_noinline(t.bytes, cid, len);
+}
+
+/// \~english Whether a transport parameter names exactly this ID.  \~spanish Si un parametro de transporte nombra exactamente este identificador.  \~
+bool tp_names(const TpConnectionId &t, const uint8_t *cid, size_t len) noexcept {
+    if (!t.present || t.len != len) return false;
+    uint8_t d = 0;
+    for (size_t i = 0; i < len; ++i) d = static_cast<uint8_t>(d | (t.bytes[i] ^ cid[i]));
+    return d == 0;
+}
+
+} // namespace
+
+size_t Connection::local_transport_params(uint8_t *out, size_t room) const noexcept {
+    TransportParams tp;
+    // \~english The source ID of this end's first Initial (7.3): the first local ID.
+    // \~spanish El identificador de origen del primer Initial de este extremo (7.3): el primer identificador local.  \~
+    set_tp_cid(tp.initial_source_connection_id, local_cids_[0].cid, cfg_.local_cid_len);
+    if (cfg_.is_server) {
+        // \~english The client's first destination, before any Retry, and the Retry's source (7.3).
+        // \~spanish El primer destino del cliente, antes de cualquier Retry, y el origen del Retry (7.3).  \~
+        if (original_known_) {
+            set_tp_cid(tp.original_destination_connection_id, original_dcid_, original_dcid_len_);
+            if (retry_scid_len_ != 0) set_tp_cid(tp.retry_source_connection_id, retry_scid_, retry_scid_len_);
+        } else {
+            set_tp_cid(tp.original_destination_connection_id, odcid_, odcid_len_);
+        }
+        // \~english The token of the ID the handshake used: only a server sends one (18.2).
+        // \~spanish El testigo del identificador que uso el saludo: solo un servidor lo manda (18.2).  \~
+        if (cfg_.local_cid_len != 0) {
+            tp.has_stateless_reset_token = true;
+            util::vesta_memcpy_noinline(tp.stateless_reset_token, local_cids_[0].token, kResetTokenSize);
+        }
+        tp.disable_active_migration = cfg_.disable_active_migration;
+    }
+    // \~english Milliseconds on the wire: rounded up, so the promise is never shorter than what is kept (18.2).
+    // \~spanish Milisegundos en el cable: redondeado hacia arriba, para que la promesa nunca sea mas corta que lo que se cumple (18.2).  \~
+    tp.max_idle_timeout_ms = (cfg_.idle_timeout_us + 999) / 1000;
+    tp.max_ack_delay_ms = (cfg_.ack.max_ack_delay_us + 999) / 1000;
+    tp.ack_delay_exponent = cfg_.ack.ack_delay_exponent;
+    tp.initial_max_data = cfg_.data_window;
+    tp.initial_max_stream_data_bidi_local = cfg_.streams.window_bidi_local;
+    tp.initial_max_stream_data_bidi_remote = cfg_.streams.window_bidi_remote;
+    tp.initial_max_stream_data_uni = cfg_.streams.window_uni;
+    tp.initial_max_streams_bidi = streams_.max_streams(true);
+    tp.initial_max_streams_uni = streams_.max_streams(false);
+    tp.active_connection_id_limit = cfg_.active_cid_limit;
+    return encode_transport_params(tp, out, room);
+}
+
+bool Connection::on_peer_transport_params(const uint8_t *data, size_t n, uint64_t now_us) noexcept {
+    if (peer_params_known_) return state_ == ConnState::Active;
+    TransportParams tp;
+    // \~english A server's parameters are what a client reads, and the other way round.
+    // \~spanish Los parametros de un servidor son lo que lee un cliente, y al reves.  \~
+    if (decode_transport_params(data, n, !cfg_.is_server, tp) != TpError::None) {
+        fail(TransportError::TransportParameterError, 0, now_us);
+        return false;
+    }
+
+    /* \~english
+     * 7.3: the IDs are the ones the Initial packets carried.  The peer's
+     * source ID is the first one it gave, still entry 0; a client also
+     * checks the destination it first chose, and the Retry it took or did
+     * not take.
+     * \~spanish
+     * 7.3: los identificadores son los que llevaron los paquetes Initial.  El
+     * identificador de origen del otro es el primero que dio, aun la entrada 0;
+     * un cliente comprueba ademas el destino que eligio primero, y el Retry que
+     * acepto o no.
+     * \~ */
+    bool ids = tp_names(tp.initial_source_connection_id, peer_cids_[0].cid, peer_cids_[0].len);
+    if (!cfg_.is_server) {
+        ids = ids && tp_names(tp.original_destination_connection_id, odcid_, odcid_len_);
+        ids = ids && (retried_ ? tp_names(tp.retry_source_connection_id, retry_scid_, retry_scid_len_)
+                               : !tp.retry_source_connection_id.present);
+    }
+    if (!ids) {
+        fail(TransportError::TransportParameterError, 0, now_us);
+        return false;
+    }
+    peer_params_known_ = true;
+
+    // \~english The peer's ACK timing: recovery, and the PTO this end computes (RFC 9002, A.3).
+    // \~spanish El tiempo de ACK del otro: la recuperacion, y el PTO que calcula este extremo (RFC 9002, A.3).  \~
+    cfg_.recovery.max_ack_delay_us = tp.max_ack_delay_ms * 1000;
+    recovery_.set_peer_ack_params(tp.max_ack_delay_ms * 1000, static_cast<uint8_t>(tp.ack_delay_exponent), now_us);
+
+    // \~english The idle timeout is the smaller of the two, or the only one that is not zero (10.1).
+    // \~spanish El plazo de inactividad es el menor de los dos, o el unico que no es cero (10.1).  \~
+    const uint64_t peer_idle = tp.max_idle_timeout_ms * 1000;
+    if (peer_idle != 0 && (cfg_.idle_timeout_us == 0 || peer_idle < cfg_.idle_timeout_us))
+        cfg_.idle_timeout_us = peer_idle;
+    restart_idle(now_us);
+
+    // \~english No datagram larger than the peer is willing to receive (18.2); 1200 is the least it may say.
+    // \~spanish Ningun datagrama mayor de lo que el otro esta dispuesto a recibir (18.2); 1200 es lo minimo que puede decir.  \~
+    if (tp.max_udp_payload_size < cfg_.max_datagram) cfg_.max_datagram = static_cast<size_t>(tp.max_udp_payload_size);
+
+    send_flow_.on_max_data(tp.initial_max_data);
+    streams_.on_peer_params(tp.initial_max_streams_bidi, tp.initial_max_streams_uni,
+                            tp.initial_max_stream_data_bidi_local, tp.initial_max_stream_data_bidi_remote,
+                            tp.initial_max_stream_data_uni);
+
+    // \~english How many IDs this end may have handed out: never past its own table (5.1.1).
+    // \~spanish Cuantos identificadores puede tener repartidos este extremo: nunca mas que su propia tabla (5.1.1).  \~
+    cfg_.peer_active_cid_limit =
+        static_cast<size_t>(tp.active_connection_id_limit < kMaxCids ? tp.active_connection_id_limit : kMaxCids);
+    if (keys_[idx(Space::Application)].have) top_up_cids();
+
+    if (!cfg_.is_server) {
+        // \~english The server's first ID gets its reset token (10.3); and it may forbid moving (9).
+        // \~spanish El primer identificador del servidor recibe su testigo (10.3); y puede prohibir moverse (9).  \~
+        if (tp.has_stateless_reset_token) {
+            util::vesta_memcpy_noinline(peer_cids_[0].token, tp.stateless_reset_token, kResetTokenSize);
+            peer_cids_[0].has_token = true;
+        }
+        cfg_.peer_disable_active_migration = tp.disable_active_migration;
+    }
     return true;
 }
 

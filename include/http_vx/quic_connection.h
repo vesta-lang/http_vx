@@ -578,6 +578,71 @@ public:
 
     /**
      * @brief
+     * \~english Server: the IDs the acceptor saw, which the transport parameters must name (RFC 9000, 7.3).
+     * \~spanish Servidor: los identificadores que vio el acceptor, que los parametros de transporte deben nombrar (RFC 9000, 7.3).
+     * \~
+     *
+     * \~english
+     * @p odcid is the destination of the client's very first Initial --
+     * before any Retry.  @p retry_scid is the Retry's source ID when there was
+     * one, and empty otherwise.  Without this call a server names the ID its
+     * Initial keys came from, which is right only when there was no Retry.
+     * \~spanish
+     * @p odcid es el destino del primerisimo Initial del cliente -- antes de
+     * cualquier Retry.  @p retry_scid es el identificador de origen del Retry
+     * cuando lo hubo, y vacio si no.  Sin esta llamada un servidor nombra el
+     * identificador del que salieron sus claves Initial, lo que solo es correcto
+     * cuando no hubo Retry.
+     * \~
+     */
+    bool set_original_ids(const uint8_t *odcid, size_t odcid_len, const uint8_t *retry_scid,
+                          size_t retry_len) noexcept;
+
+    /**
+     * @brief
+     * \~english This end's transport parameters, encoded: what it runs with, and the IDs of 7.3.
+     * \~spanish Los parametros de transporte de este extremo, codificados: con lo que funciona, y los identificadores de 7.3.
+     * \~
+     *
+     * \~english
+     * Built from the configuration the connection actually uses -- its
+     * windows, its stream limits, its ACK delay -- so what it announces and
+     * what it enforces cannot drift apart.
+     * \~spanish
+     * Hechos con la configuracion que la conexion usa de verdad -- sus ventanas,
+     * sus limites de flujos, su retardo de ACK --, asi que lo que anuncia y lo
+     * que hace cumplir no pueden separarse.
+     * \~
+     *
+     * @return \~english the size, or 0 if it does not fit  \~spanish el tamano, o 0 si no cabe  \~
+     */
+    size_t local_transport_params(uint8_t *out, size_t room) const noexcept;
+
+    /**
+     * @brief
+     * \~english The peer's transport parameters, as the handshake brought them: checked, authenticated, applied.
+     * \~spanish Los parametros de transporte del otro, tal como los trajo el saludo: comprobados, autenticados, aplicados.
+     * \~
+     *
+     * \~english
+     * An invalid value, or IDs that do not match the ones the Initial
+     * packets carried (7.3), closes the connection with
+     * TRANSPORT_PARAMETER_ERROR; the answer is false then.  Applied as soon
+     * as they arrive: a server needs the client's limits for what it sends
+     * before the handshake completes.  A second call changes nothing.
+     * \~spanish
+     * Un valor invalido, o identificadores que no casan con los que llevaron los
+     * paquetes Initial (7.3), cierra la conexion con TRANSPORT_PARAMETER_ERROR;
+     * la respuesta es falso entonces.  Se aplican en cuanto llegan: un servidor
+     * necesita los limites del cliente para lo que manda antes de que acabe el
+     * saludo.  Una segunda llamada no cambia nada.
+     * \~
+     */
+    bool on_peer_transport_params(const uint8_t *data, size_t n, uint64_t now_us) noexcept;
+    bool has_peer_transport_params() const noexcept { return peer_params_known_; }
+
+    /**
+     * @brief
      * \~english Starts a 1-RTT key update now, if the rules allow it (RFC 9001, 6).
      * \~spanish Empieza ahora una actualizacion de claves 1-RTT, si las reglas lo permiten (RFC 9001, 6).
      * \~
@@ -1075,6 +1140,11 @@ private:
     bool retried_ = false;
     uint8_t retry_scid_[kMaxConnectionId] = {};
     size_t retry_scid_len_ = 0;
+    /// \~english Server: the IDs of 7.3, as the acceptor saw them.  \~spanish Servidor: los identificadores de 7.3, como los vio el acceptor.  \~
+    uint8_t original_dcid_[kMaxConnectionId] = {};
+    size_t original_dcid_len_ = 0;
+    bool original_known_ = false;
+    bool peer_params_known_ = false;
     /// \~english The Retry token, repeated in every Initial from then on.  \~spanish El testigo del Retry, repetido en cada Initial desde entonces.  \~
     uint8_t *token_ = nullptr;
     size_t token_len_ = 0;

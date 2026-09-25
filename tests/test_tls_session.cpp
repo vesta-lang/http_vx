@@ -485,9 +485,9 @@ void test_fake_handshakes() {
         check(server.aead() == Aead::Aes128Gcm, "the server's first choice");
     }
     {
-        // \~english The server has its secrets before the client's Finished, and reads none of 1-RTT until then.
-        // \~spanish El servidor tiene sus secretos antes del Finished del cliente, y no lee 1-RTT hasta entonces.  \~
-        section("fake: 1-RTT waits");
+        // \~english The server has its 1-RTT secrets with its first flight, before the client's Finished.
+        // \~spanish El servidor tiene sus secretos 1-RTT con su primer vuelo, antes del Finished del cliente.  \~
+        section("fake: 1-RTT early");
         FakeEnds e(c);
         Session client(c, e.client);
         Session server(c, e.server);
@@ -497,13 +497,12 @@ void test_fake_handshakes() {
         server.receive(Space::Initial, p, n);
         client.sent(Space::Initial, n);
         expect_ok(server, "first flight");
-        check(server.write_secret(Space::Application) != nullptr, "the server may send 0.5-RTT");
-        check(server.read_secret(Space::Application) == nullptr, "but reads no 1-RTT before the handshake is complete");
+        check(server.write_secret(Space::Application) != nullptr && server.read_secret(Space::Application) != nullptr,
+              "the server has both 1-RTT secrets: it may send 0.5-RTT");
         check(server.read_secret(Space::Handshake) != nullptr, "it reads Handshake");
         check(server.reading() == Space::Handshake, "and reads there");
-        check(!server.complete(), "not complete yet");
+        check(!server.complete(), "not complete yet: the connection keeps 1-RTT shut until then");
         pump(client, server);
-        check(server.read_secret(Space::Application) != nullptr, "now it reads 1-RTT");
         check_agreed(client, server, kFakeCert, sizeof kFakeCert);
     }
     {
@@ -1165,7 +1164,7 @@ void test_server_rules() {
         flip(f, Handshake::Finished, 0);
         server.receive(Space::Handshake, f.b, f.n);
         expect(server, kDecryptError, "a client Finished one bit off (4.4.4)");
-        check(!server.complete() && server.read_secret(Space::Application) == nullptr, "and 1-RTT stays shut");
+        check(!server.complete(), "and the handshake is not complete");
     }
     {
         // \~english A ClientHello after the handshake is renegotiation, which TLS 1.3 forbids (4.1.2).

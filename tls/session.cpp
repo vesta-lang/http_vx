@@ -935,11 +935,8 @@ bool Session::on_new_session_ticket(const uint8_t *m, size_t n) noexcept {
 
 const uint8_t *Session::read_secret(Space s) const noexcept {
     if (s == Space::Handshake && has_handshake_keys_) return cfg_.server ? hs_client_ : hs_server_;
-    if (s != Space::Application) return nullptr;
-    // \~english A server reads no 1-RTT before the handshake is complete (RFC 9001, 5.7).
-    // \~spanish Un servidor no lee 1-RTT antes de que el saludo este completo (RFC 9001, 5.7).  \~
-    if (cfg_.server) return complete_ ? ap_client_ : nullptr;
-    return has_application_keys_ ? ap_server_ : nullptr;
+    if (s != Space::Application || !has_application_keys_) return nullptr;
+    return cfg_.server ? ap_client_ : ap_server_;
 }
 
 const uint8_t *Session::write_secret(Space s) const noexcept {

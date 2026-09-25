@@ -326,6 +326,33 @@ void StreamTable::on_max_streams(bool bidirectional, uint64_t maximum) noexcept 
     }
 }
 
+void StreamTable::on_peer_params(uint64_t max_bidi, uint64_t max_uni, uint64_t window_bidi_local,
+                                 uint64_t window_bidi_remote, uint64_t window_uni) noexcept {
+    // \~english The initial limits are a MAX_STREAMS that came with the handshake (4.6).
+    // \~spanish Los limites iniciales son un MAX_STREAMS que llego con el saludo (4.6).  \~
+    on_max_streams(true, max_bidi);
+    on_max_streams(false, max_uni);
+    cfg_.peer_window_bidi_local = window_bidi_local;
+    cfg_.peer_window_bidi_remote = window_bidi_remote;
+    cfg_.peer_window_uni = window_uni;
+    /* \~english
+     * A stream opened before the parameters came -- in 0-RTT -- takes the
+     * new window too, as the handshake's values replace the remembered ones
+     * (7.4.1).  Its limit never goes down.
+     * \~spanish
+     * Un flujo abierto antes de que llegaran los parametros -- en 0-RTT -- toma
+     * tambien la ventana nueva, porque los valores del saludo sustituyen a los
+     * recordados (7.4.1).  Su limite nunca baja.
+     * \~ */
+    for (size_t i = 0; i < capacity_; ++i) {
+        Stream &s = slots_[i];
+        if (s.id == kNever || s.send == nullptr) continue;
+        const bool uni = stream_is_uni(s.id);
+        const bool local = is_local(s.id);
+        s.send->on_max_stream_data(uni ? window_uni : local ? window_bidi_remote : window_bidi_local);
+    }
+}
+
 size_t StreamTable::collect() noexcept {
     size_t removed = 0;
     for (size_t i = 0; i < capacity_; ++i) {
