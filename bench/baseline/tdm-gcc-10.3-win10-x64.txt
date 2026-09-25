@@ -1,12 +1,12 @@
 http_vx -- medidas
-  maquina: tdm-gcc-10.3 win10-x64
+  maquina: tdm-gcc-10.3-win10-x64
   fecha:   Sep 25 2026
   guardar en bench/baseline/<maquina>.txt
 
-  servir (tdm-gcc-10.3 win10-x64)
+  servir (tdm-gcc-10.3-win10-x64)
     peticiones por ronda                    900
-    peticiones por segundo              2483444
-    por peticion                            403 ns
+    peticiones por segundo              2284264
+    por peticion                            438 ns
 
     SIN llamadas al sistema: el backend entrega los bytes
     desde memoria.  Es el coste de la maquinaria de HTTP
@@ -14,33 +14,37 @@ http_vx -- medidas
     cuestan mas que todo esto junto -- por eso lo que se
     cuenta arriba es CUANTAS, no cuanto.
 
-  llamadas por peticion (tdm-gcc-10.3 win10-x64) -- R15
+  llamadas por peticion (tdm-gcc-10.3-win10-x64) -- R15
+    avisos                                 1.00
     lecturas                               1.00
     escrituras                             1.00
-    una peticion sencilla deberia ser una y una
+    una peticion sencilla: un aviso, una lectura y una
+    escritura.  El aviso es lo que compra la R1 -- sin el,
+    una conexion parada tendria buffer -- y una peticion
+    ENCADENADA no lo paga, porque sus bytes ya estan aqui.
 
-  partir la entrada (tdm-gcc-10.3 win10-x64) -- R12: sin retroceso
+  partir la entrada (tdm-gcc-10.3-win10-x64) -- R12: sin retroceso
     (cada fila analiza la MISMA cabeza de 82 B, 200000 veces,
      entregada en mas o menos trozos)
     trozos     seg (las 200k)        cab/s vs 1 trozo      MB/s
-    1                  0.0199     10071254      1.00x       788
-    2                  0.0201      9936407      1.01x       777
-    4                  0.0215      9323053      1.08x       729
-    8                  0.0231      8657934      1.16x       677
-    16                 0.0267      7488589      1.34x       586
-    32                 0.0367      5447780      1.85x       426
+    1                  0.0186     10738947      1.00x       840
+    2                  0.0202      9899569      1.08x       774
+    4                  0.0213      9368954      1.15x       733
+    8                  0.0231      8661008      1.24x       677
+    16                 0.0271      7376018      1.46x       577
+    32                 0.0364      5500157      1.95x       430
 
     la misma pregunta a una cabeza 16 veces mayor:
     trozos      seg (las 20k)        cab/s vs 1 trozo
-    1                  0.0300       667583      1.00x
-    32                 0.0321       623107      1.07x
+    1                  0.0275       727151      1.00x
+    32                 0.0293       683665      1.06x
 
     la proporcion de la cabeza GRANDE debe ser MENOR o igual
     que la de la pequena.  Si es mayor, el analizador
     vuelve a empezar, y eso es cuadratico contra quien mande
     una peticion byte a byte a proposito.
 
-  memoria por conexion (tdm-gcc-10.3 win10-x64)
+  memoria por conexion (tdm-gcc-10.3-win10-x64)
     registro caliente                        24 B
     registro frio                            56 B
     plazo + casilla libre                    16 B
@@ -48,13 +52,11 @@ http_vx -- medidas
     un millon de conexiones                91.6 MB
     bytes en el pozo                          0 B
 
-    conexiones adoptadas 1024, buffers prestados 64
-    en una interfaz por FINALIZACION, una conexion parada
-    tiene un buffer: para enterarse de que llega algo hace
-    falta una lectura pendiente, y una lectura nombra el
-    buffer.  A 16 KB y un millon, 16 GB -- que es lo que la
-    R1 existe para evitar.  Lo arregla la lectura de LONGITUD
-    CERO (recepcion de cero bytes de IOCP, buffers provistos
-    de io_uring): acaba cuando hay algo, y solo entonces se
-    coge buffer.  Falta, y por eso sale aqui.
+    conexiones adoptadas 1024, buffers prestados 0
+    una conexion parada NO tiene buffer: la lectura se pide
+    en dos mitades, y la primera -- "avisame cuando haya
+    algo" -- no nombra ninguno.  Es la recepcion de cero
+    bytes de IOCP y el descriptor vigilado de epoll.  Lo que
+    acota el pozo son las RESPUESTAS en vuelo, no las
+    conexiones abiertas.
 

@@ -105,6 +105,22 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
         c.result = 0;
         return c;
 
+    case OpKind::Ready:
+        /* \~english
+         * It is ready, and nothing was read to find that out.  @c wait decided
+         * it by looking at the same bytes a read would have taken, and left
+         * them where they are -- which is the whole of what this operation is:
+         * the answer to "is there something" without the buffer that answering
+         * "what is it" would need.
+         * \~spanish
+         * Esta listo, y no se leyo nada para averiguarlo.  @c wait lo decidio
+         * mirando los mismos bytes que se habria llevado una lectura, y los dejo
+         * donde estan -- que es todo lo que es esta operacion: la respuesta a "hay
+         * algo" sin el buffer que necesitaria contestar "que es".
+         * \~ */
+        c.result = 0;
+        return c;
+
     case OpKind::Close:
         /* \~english
          * Counted rather than done, because there is no socket to close: what
@@ -278,8 +294,9 @@ size_t MemoryBackend::wait(Completion *out, size_t cap,
     for (size_t k = 0; k < was; ++k) {
         const Op op = pending_[(pending_head_ + k) % kMaxPending];
 
-        const bool is_read =
-            op.kind == OpKind::Recv || op.kind == OpKind::RecvFrom;
+        const bool is_read = op.kind == OpKind::Recv ||
+                             op.kind == OpKind::RecvFrom ||
+                             op.kind == OpKind::Ready;
 
         /* \~english
          * An accept waits for a connection the way a read waits for bytes, and

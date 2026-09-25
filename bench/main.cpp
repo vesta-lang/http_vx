@@ -93,6 +93,20 @@ class Counted final : public http_vx::Backend {
     bool submit(const http_vx::Op &op) noexcept override {
         if (!inner_.submit(op)) return false;
 
+        /* \~english
+         * The notice is counted, and it is counted SEPARATELY.  It is a system
+         * call like the others -- a zero-byte receive, a watched descriptor --
+         * so a count that left it out would be this measurement reporting a
+         * server that asks less of the system than it does, which is the one
+         * thing a count is for.
+         * \~spanish
+         * El aviso se cuenta, y se cuenta APARTE.  Es una llamada al sistema como
+         * las demas -- una recepcion de cero bytes, un descriptor vigilado -- asi
+         * que una cuenta que se lo dejara fuera seria esta medida diciendo que un
+         * servidor le pide al sistema menos de lo que le pide, que es lo unico
+         * para lo que sirve una cuenta.
+         * \~ */
+        if (op.kind == http_vx::OpKind::Ready) ++notices;
         if (op.kind == http_vx::OpKind::Recv) ++reads;
         if (op.kind == http_vx::OpKind::Send) ++writes;
         return true;
@@ -107,6 +121,7 @@ class Counted final : public http_vx::Backend {
 
     http_vx::MemoryBackend &inner() noexcept { return inner_; }
 
+    size_t notices = 0;
     size_t reads = 0;
     size_t writes = 0;
 
@@ -190,7 +205,7 @@ const char *kRequest = "GET /bench HTTP/1.1\r\nHost: example.com\r\n"
  * \~
  */
 double serve_many(size_t rounds, size_t pieces, size_t *served,
-                  size_t *reads, size_t *writes) {
+                  size_t *notices, size_t *reads, size_t *writes) {
     Rig rig(8, 8);
 
     const http_vx::ConnHandle c = rig.shard.adopt(7, 0);
@@ -226,6 +241,7 @@ double serve_many(size_t rounds, size_t pieces, size_t *served,
     const Clock::time_point end = Clock::now();
 
     if (served != nullptr) *served = rig.handler.served;
+    if (notices != nullptr) *notices = rig.io.notices;
     if (reads != nullptr) *reads = rig.io.reads;
     if (writes != nullptr) *writes = rig.io.writes;
 
@@ -287,50 +303,46 @@ void report_memory(const char *tag) {
     std::printf("    %-34s %8zu B\n", "bytes en el pozo", held);
 
     /* \~english
-     * And the finding this measurement exists to make.  R1 says an idle
-     * connection has no buffer, and on a COMPLETION interface that is not
-     * free: to notice that anything arrived at all, a read has to be
-     * outstanding, and a read names the buffer the kernel will write into.  So
-     * a connection that has said nothing since it arrived is holding one.
+     * And the measurement R1 either survives or does not: a thousand
+     * connections adopted and NOTHING lent.
      *
-     * At sixteen kilobytes and a million connections that is sixteen
-     * gigabytes, which is exactly the number R1 exists to prevent.
+     * This printed the opposite for a while, and said so rather than hiding
+     * it.  On a completion interface, noticing that anything arrived needs a
+     * read outstanding, and a read names the buffer the kernel will write into
+     * -- so a connection that had said nothing was holding sixteen kilobytes,
+     * which at a million is sixteen gigabytes and is exactly what R1 exists to
+     * prevent.
      *
-     * The answer is not to change the interface: it is the zero-length read
-     * that both real backends have for this -- IOCP's zero-byte receive, and
-     * io_uring's provided buffers.  A read of nothing completes when there is
-     * something, and only THEN is a buffer taken.  Neither backend is written
-     * yet, so the number below is what it would be today and is printed rather
-     * than explained away.
+     * What fixed it is asking in two halves: `Ready` costs no buffer and says
+     * when there is something, and only THEN is one taken.  The line below is
+     * what makes the number in the table mean anything -- a fixed cost per
+     * connection is only a fixed cost if nothing else is quietly held beside
+     * it.
      *
      * \~spanish
-     * Y el hallazgo para el que existe esta medida.  La R1 dice que una conexion
-     * parada no tiene buffer, y en una interfaz por FINALIZACION eso no sale
-     * gratis: para enterarse siquiera de que llego algo tiene que haber una
-     * lectura pendiente, y una lectura nombra el buffer en el que escribira el
-     * nucleo.  Asi que una conexion que no ha dicho nada desde que llego tiene
-     * uno.
+     * Y la medida a la que la R1 sobrevive o no: mil conexiones adoptadas y NADA
+     * prestado.
      *
-     * A dieciseis kilobytes y un millon de conexiones eso son dieciseis
-     * gigabytes, que es exactamente el numero que la R1 existe para evitar.
+     * Esto imprimio lo contrario durante un tiempo, y lo decia en vez de
+     * esconderlo.  En una interfaz por finalizacion, enterarse de que llego algo
+     * necesita una lectura pendiente, y una lectura nombra el buffer en el que
+     * escribira el nucleo -- asi que una conexion que no habia dicho nada tenia
+     * dieciseis kilobytes, que a un millon son dieciseis gigabytes y es
+     * exactamente lo que la R1 existe para evitar.
      *
-     * La respuesta no es cambiar la interfaz: es la lectura de longitud cero que
-     * los dos backends de verdad tienen para esto -- la recepcion de cero bytes
-     * de IOCP, y los buffers provistos de io_uring --.  Una lectura de nada
-     * acaba cuando hay algo, y solo ENTONCES se coge un buffer.  Ninguno de los
-     * dos backends esta escrito todavia, asi que el numero de abajo es el que
-     * seria hoy y se imprime en vez de explicarse.
+     * Lo arreglo preguntar en dos mitades: `Ready` no cuesta buffer y dice cuando
+     * hay algo, y solo ENTONCES se coge uno.  La linea de abajo es lo que hace
+     * que el numero de la tabla signifique algo -- un coste fijo por conexion
+     * solo es un coste fijo si no hay nada mas guardado por lo bajo a su lado.
      * \~ */
     std::printf("\n    conexiones adoptadas %zu, buffers prestados %zu\n",
                 static_cast<size_t>(rig.shard.conns().count()), lent);
-    std::printf("    en una interfaz por FINALIZACION, una conexion parada\n"
-                "    tiene un buffer: para enterarse de que llega algo hace\n"
-                "    falta una lectura pendiente, y una lectura nombra el\n"
-                "    buffer.  A 16 KB y un millon, 16 GB -- que es lo que la\n"
-                "    R1 existe para evitar.  Lo arregla la lectura de LONGITUD\n"
-                "    CERO (recepcion de cero bytes de IOCP, buffers provistos\n"
-                "    de io_uring): acaba cuando hay algo, y solo entonces se\n"
-                "    coge buffer.  Falta, y por eso sale aqui.\n");
+    std::printf("    una conexion parada NO tiene buffer: la lectura se pide\n"
+                "    en dos mitades, y la primera -- \"avisame cuando haya\n"
+                "    algo\" -- no nombra ninguno.  Es la recepcion de cero\n"
+                "    bytes de IOCP y el descriptor vigilado de epoll.  Lo que\n"
+                "    acota el pozo son las RESPUESTAS en vuelo, no las\n"
+                "    conexiones abiertas.\n");
 }
 
 /**
@@ -570,18 +582,57 @@ void report_syscalls(const char *tag) {
     const size_t kRounds = 400;
 
     size_t served = 0;
+    size_t notices = 0;
     size_t reads = 0;
     size_t writes = 0;
-    serve_many(kRounds, 1, &served, &reads, &writes);
+    serve_many(kRounds, 1, &served, &notices, &reads, &writes);
 
     if (served == 0) return;
 
     std::printf("\n  llamadas por peticion (%s) -- R15\n", tag);
+    std::printf("    %-34s %8.2f\n", "avisos",
+                static_cast<double>(notices) / static_cast<double>(served));
     std::printf("    %-34s %8.2f\n", "lecturas",
                 static_cast<double>(reads) / static_cast<double>(served));
     std::printf("    %-34s %8.2f\n", "escrituras",
                 static_cast<double>(writes) / static_cast<double>(served));
-    std::printf("    una peticion sencilla deberia ser una y una\n");
+
+    /* \~english
+     * And the trade, said out loud where the number is.  R15 says a simple
+     * request should cost one read and one write, and it still does -- but
+     * there is now a third call in front of them, and it is not free.
+     *
+     * It buys R1: a connection between requests holds no buffer.  A server
+     * that made this number one-and-one by taking a buffer up front would hold
+     * sixteen gigabytes at a million connections, so what is being traded is a
+     * system call per request against memory that scales with connections
+     * rather than with traffic.
+     *
+     * A PIPELINED request does not pay it -- the bytes are already in a buffer
+     * this end is holding, so the read goes straight in -- which is the
+     * argument in one line: the call is only paid where the alternative was
+     * holding memory for nothing.
+     *
+     * \~spanish
+     * Y el cambio, dicho en voz alta donde esta el numero.  La R15 dice que una
+     * peticion sencilla deberia costar una lectura y una escritura, y las sigue
+     * costando -- pero ahora hay una tercera llamada por delante, y no es gratis.
+     *
+     * Compra la R1: una conexion entre peticiones no tiene buffer.  Un servidor
+     * que hiciera este numero uno-y-uno cogiendo buffer por delante tendria
+     * dieciseis gigabytes al millon de conexiones, asi que lo que se cambia es
+     * una llamada al sistema por peticion contra una memoria que crece con las
+     * conexiones en vez de con el trafico.
+     *
+     * Una peticion ENCADENADA no lo paga -- los bytes ya estan en un buffer que
+     * tiene este extremo, asi que la lectura va directa -- que es el argumento en
+     * una linea: la llamada solo se paga donde la alternativa era guardar memoria
+     * para nada.
+     * \~ */
+    std::printf("    una peticion sencilla: un aviso, una lectura y una\n"
+                "    escritura.  El aviso es lo que compra la R1 -- sin el,\n"
+                "    una conexion parada tendria buffer -- y una peticion\n"
+                "    ENCADENADA no lo paga, porque sus bytes ya estan aqui.\n");
 }
 
 /**
@@ -623,7 +674,8 @@ void report_speed(const char *tag) {
 
     for (int round = 0; round < 3; ++round) {
         size_t got = 0;
-        const double secs = serve_many(kRounds, 1, &got, nullptr, nullptr);
+        const double secs =
+            serve_many(kRounds, 1, &got, nullptr, nullptr, nullptr);
         if (secs <= 0.0 || got == 0) continue;
 
         const double rate = static_cast<double>(got) / secs;

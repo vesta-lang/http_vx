@@ -586,6 +586,81 @@ void test_four_sockets_at_once() {
 
 /**
  * @brief
+ * \~english A connection between requests holds no buffer, over a real socket.
+ * \~spanish Una conexion entre peticiones no tiene buffer, por un socket de verdad.
+ * \~
+ *
+ * \~english
+ * R1, end to end and on a real port.  The connection is open, the client is
+ * still there, the server will answer the moment it says something -- and the
+ * pool is untouched.  That is the sentence the whole design is built around:
+ * sixteen kilobytes times a million is sixteen gigabytes, and a server that
+ * held one per open connection could not make the claim this project makes.
+ *
+ * It is worth having over a socket as well as in memory because the two halves
+ * are asked with a real system call here: a receive of zero bytes on Windows,
+ * a descriptor watched with nothing to write into on Linux.  What the memory
+ * backend proves is that the LOOP does the right thing; what this proves is
+ * that the right thing is a thing an operating system will actually do.
+ *
+ * \~spanish
+ * La R1, de punta a punta y en un puerto de verdad.  La conexion esta abierta, el
+ * cliente sigue ahi, el servidor contestara en cuanto diga algo -- y el pozo esta
+ * intacto.  Esa es la frase alrededor de la que esta construido todo el diseno:
+ * dieciseis kilobytes por un millon son dieciseis gigabytes, y un servidor que
+ * tuviera uno por conexion abierta no podria hacer la afirmacion que hace este
+ * proyecto.
+ *
+ * Merece tenerlo por un socket ademas de en memoria porque aqui las dos mitades
+ * se piden con una llamada al sistema de verdad: una recepcion de cero bytes en
+ * Windows, un descriptor vigilado sin nada donde escribir en Linux.  Lo que
+ * demuestra el backend de memoria es que el BUCLE hace lo correcto; lo que
+ * demuestra esto es que lo correcto es algo que un sistema operativo va a hacer.
+ * \~
+ */
+void test_an_idle_socket_holds_no_buffer() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    Client c;
+    check(c.open(s.port()), "the client could not connect");
+
+    check(insist(s, c, "GET /idle HTTP/1.1\r\nHost: a\r\n\r\n"),
+          "the request never went out");
+    check(pump(s, c, answered), "the answer never came back");
+
+    /* \~english
+     * A few more turns so the answer's own buffer comes back -- it is the
+     * operating system's until the write completes, and giving it back before
+     * then is the mistake the whole handle design exists to prevent.
+     * \~spanish
+     * Unas vueltas mas para que vuelva el buffer de la propia respuesta -- es del
+     * sistema operativo hasta que acabe la escritura, y devolverlo antes es la
+     * equivocacion que existe para evitar todo el diseno de las referencias.
+     * \~ */
+    for (int i = 0; i < 100; ++i) {
+        s.shard.poll(1, 0);
+        breathe();
+    }
+
+    check(s.shard.conns().count() == 1,
+          "the connection did not stay open");
+    check(s.shard.buffers().lent() == 0,
+          "a connection waiting for its next request is holding a buffer");
+
+    /* \~english
+     * And it is still a connection: it answers the next one.
+     * \~spanish
+     * Y sigue siendo una conexion: contesta a la siguiente.
+     * \~ */
+    check(insist(s, c, "GET /again HTTP/1.1\r\nHost: a\r\n\r\n"),
+          "the second request never went out");
+    check(pump(s, c, answered_twice),
+          "a connection that held no buffer could not be served again");
+}
+
+/**
+ * @brief
  * \~english A socket being read from while an answer is still going out.
  * \~spanish Un socket del que se lee mientras todavia sale una respuesta.
  * \~
@@ -700,6 +775,7 @@ int main() {
     test_a_finished_connection_closes_its_socket();
     test_two_requests_on_one_socket();
     test_four_sockets_at_once();
+    test_an_idle_socket_holds_no_buffer();
     test_both_directions_at_once_over_a_socket();
 
 #ifdef _WIN32

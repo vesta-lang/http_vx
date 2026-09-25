@@ -89,6 +89,60 @@ enum class OpKind : uint8_t {
     /// \~spanish Coger la conexion siguiente que llegue.  \~
     Accept,
 
+    /**
+     * \~english
+     * Say when there is something to read, and take no buffer to do it.
+     *
+     * **This is what R1 is made of, and without it the requirement is not
+     * met.**  A completion-based read has to be given somewhere to write before
+     * there is anything to write, so a connection waiting for its next request
+     * holds a buffer for as long as it waits -- and a connection waiting for
+     * its next request is what a keep-alive connection IS, almost all of the
+     * time.  Sixteen kilobytes times a million is sixteen gigabytes held to
+     * receive nothing.
+     *
+     * So the question is asked in two halves.  This half costs no memory at
+     * all: it is the socket saying it has something, and the buffer is taken
+     * only then -- which is the sentence R1 is written in.
+     *
+     * **It is deliberately not a @c Recv with no buffer**, because a @c Recv
+     * that completes with zero means the peer closed its end, and this
+     * completing with zero means the opposite: go and read.  Two meanings on
+     * one number is how a server comes to hang up on the clients that were
+     * about to say something.
+     *
+     * Every platform has it and each calls it something else -- a zero-length
+     * receive on Windows, a provided buffer on io_uring, and on epoll it is not
+     * a trick at all but the only thing epoll ever did.
+     *
+     * \~spanish
+     * Decir cuando hay algo que leer, y no coger ningun buffer para ello.
+     *
+     * **De esto esta hecha la R1, y sin ello el requisito no se cumple.**  A una
+     * lectura por finalizacion hay que darle donde escribir antes de que haya
+     * nada que escribir, asi que una conexion que espera su peticion siguiente
+     * tiene un buffer todo el rato que espere -- y una conexion que espera su
+     * peticion siguiente es lo que ES una conexion mantenida viva, casi todo el
+     * tiempo.  Dieciseis kilobytes por un millon son dieciseis gigabytes
+     * guardados para no recibir nada.
+     *
+     * Asi que la pregunta se hace en dos mitades.  Esta no cuesta memoria
+     * ninguna: es el socket diciendo que tiene algo, y el buffer se coge solo
+     * entonces -- que es la frase en la que esta escrita la R1.
+     *
+     * **A proposito no es un @c Recv sin buffer**, porque un @c Recv que acaba
+     * con cero quiere decir que el otro extremo cerro su lado, y este acabando
+     * con cero quiere decir lo contrario: ve y lee.  Dos significados en un
+     * numero es como un servidor acaba colgandole a los clientes que iban a
+     * decir algo.
+     *
+     * Lo tienen todas las plataformas y cada una lo llama de otra forma -- una
+     * recepcion de longitud cero en Windows, un buffer provisto en io_uring, y en
+     * epoll no es ningun truco sino lo unico que ha hecho epoll nunca.
+     * \~
+     */
+    Ready,
+
     /// \~english Read into the buffer.  \~spanish Leer al buffer.  \~
     Recv,
 

@@ -257,6 +257,53 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     if (h.queued >= cfg_.max_queued) return;
 
     /* \~english
+     * **A connection between messages asks to be TOLD, and takes no buffer.**
+     * That is R1, and without this half it is not met: a read has to be given
+     * somewhere to write before there is anything to write, so a connection
+     * waiting for its next request would hold sixteen kilobytes for as long as
+     * it waited -- and waiting for the next request is what a kept-alive
+     * connection does almost all of the time.  At a million connections that is
+     * sixteen gigabytes held to receive nothing.
+     *
+     * One with half a message in hand does not go this way: it already has the
+     * buffer, the rest has to land right behind what arrived, and there is
+     * nothing to be told -- the socket has already said it has something.
+     *
+     * \~spanish
+     * **Una conexion entre mensajes pide que le AVISEN, y no coge buffer.**  Eso
+     * es la R1, y sin esta mitad no se cumple: a una lectura hay que darle donde
+     * escribir antes de que haya nada que escribir, asi que una conexion
+     * esperando su peticion siguiente tendria dieciseis kilobytes todo el rato
+     * que esperara -- y esperar la peticion siguiente es lo que hace una conexion
+     * mantenida viva casi todo el tiempo --.  A un millon de conexiones eso son
+     * dieciseis gigabytes guardados para no recibir nada.
+     *
+     * Una con medio mensaje en la mano no va por aqui: ya tiene el buffer, el
+     * resto tiene que caer justo detras de lo que llego, y no hay nada que
+     * avisar -- el socket ya dijo que tenia algo.
+     * \~ */
+    if (h.reading == kNoBuffer) {
+        Op ask;
+        ask.conn = c;
+        ask.kind = OpKind::Ready;
+        ask.buffer = kNoBuffer;
+        ask.offset = 0;
+        ask.length = 0;
+        ask.fd = h.fd;
+
+        if (!io_->submit(ask)) return;
+
+        h.flags |= kReadPending;
+        return;
+    }
+
+    read_into_buffer(c, h);
+}
+
+void Shard::read_into_buffer(ConnHandle c, ConnHot &h) noexcept {
+    if ((h.flags & kReadPending) != 0 || closing(h)) return;
+
+    /* \~english
      * Half a message from the last read goes back into the SAME buffer, so
      * the rest lands right after it.  Only a connection between messages takes
      * a fresh one -- which is also when it had none, because a connection that
@@ -270,15 +317,18 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     uint32_t b = h.reading;
 
     /* \~english
-     * The buffer is taken HERE, when there is a reason to read, and not when
-     * the connection arrived.  That is R1.  Not getting one is not a failure
-     * either: the connection does not read this time round, its deadline is
-     * still armed, and TCP slows the peer down by itself.
+     * The buffer is taken HERE, when the socket has already said it has
+     * something.  That is the second half of R1: not "when the connection
+     * arrived", and not even "when this end decided to read" -- when there are
+     * bytes.  Not getting one is not a failure either: the connection does not
+     * read this time round, its deadline is still armed, and TCP slows the peer
+     * down by itself.
      * \~spanish
-     * El buffer se coge AQUI, cuando hay razon para leer, y no cuando llego la
-     * conexion.  Eso es la R1.  Y que no haya tampoco es un fallo: la conexion
-     * no lee esta vuelta, su plazo sigue armado, y TCP frena al otro extremo el
-     * solo.
+     * El buffer se coge AQUI, cuando el socket ya ha dicho que tiene algo.  Esa es
+     * la segunda mitad de la R1: no "cuando llego la conexion", y ni siquiera
+     * "cuando este extremo decidio leer" -- cuando hay bytes.  Y que no haya
+     * tampoco es un fallo: la conexion no lee esta vuelta, su plazo sigue armado,
+     * y TCP frena al otro extremo el solo.
      * \~ */
     if (b == kNoBuffer) {
         b = pool_.acquire();
@@ -767,6 +817,57 @@ void Shard::on_write(const Completion &done) noexcept {
     want_read(done.conn, *h);
 }
 
+void Shard::on_ready(const Completion &done) noexcept {
+    ConnHot *h = conns_.hot(done.conn);
+
+    if (h == nullptr) return;
+
+    h->flags &= static_cast<uint16_t>(~kReadPending);
+
+    if (closing(*h)) {
+        leave_if_done(done.conn, *h);
+        return;
+    }
+
+    /* \~english
+     * A socket that cannot be waited on any more is one whose peer is gone or
+     * whose connection broke.  There is no buffer to give back -- the whole
+     * point of asking this way is that there was none -- so this is the one
+     * path here that costs nothing at all.
+     * \~spanish
+     * Un socket al que ya no se puede esperar es uno cuyo otro extremo se fue o
+     * cuya conexion se rompio.  No hay ningun buffer que devolver -- de eso
+     * trataba preguntar asi, de que no habia ninguno -- asi que este es el unico
+     * camino de aqui que no cuesta nada en absoluto.
+     * \~ */
+    if (!done.ok()) {
+        close(done.conn);
+        return;
+    }
+
+    /* \~english
+     * There are bytes.  NOW a buffer is worth having, and the read that goes
+     * after them is the ordinary one: the same operation, the same buffer, the
+     * same completion as it has always been.
+     *
+     * The deadline is not pushed out here.  Something arriving is activity and
+     * it will push it out when it is READ, one completion later; doing it twice
+     * would give a peer that connects and says one byte every minute a
+     * connection that never times out.
+     *
+     * \~spanish
+     * Hay bytes.  AHORA merece la pena un buffer, y la lectura que va a por ellos
+     * es la corriente: la misma operacion, el mismo buffer y la misma
+     * finalizacion de siempre.
+     *
+     * Aqui no se empuja el plazo.  Que llegue algo es actividad y lo empujara
+     * cuando se LEA, una finalizacion despues; hacerlo dos veces le daria a un
+     * extremo que se conecta y dice un byte por minuto una conexion que no vence
+     * nunca.
+     * \~ */
+    read_into_buffer(done.conn, *h);
+}
+
 size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
     if (io_ == nullptr) return 0;
 
@@ -778,6 +879,10 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
 
     for (size_t i = 0; i < made; ++i) {
         switch (done[i].kind) {
+        case OpKind::Ready:
+            on_ready(done[i]);
+            break;
+
         case OpKind::Recv:
         case OpKind::RecvFrom:
             on_read(done[i]);

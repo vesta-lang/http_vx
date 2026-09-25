@@ -408,6 +408,49 @@ bool IocpBackend::start_accept(const Op &op, Context *c) noexcept {
     return true;
 }
 
+bool IocpBackend::start_ready(const Op &op, Context *c) noexcept {
+    if (op.fd < 0) return false;
+
+    /* \~english
+     * A receive of ZERO bytes into nothing.  Windows finishes it when the
+     * socket has something to give -- or when the peer closes, which is also
+     * something to find out -- and it is the whole of R1 on this platform: the
+     * question "is there anything" asked without the sixteen kilobytes that
+     * asking "what is it" would cost.
+     *
+     * The buffer is a real address with a length of zero rather than null,
+     * because the provider is entitled to look at the array even when it is
+     * told there is nothing in it, and one of them does.
+     *
+     * \~spanish
+     * Una recepcion de CERO bytes en nada.  Windows la acaba cuando el socket
+     * tiene algo que dar -- o cuando el otro extremo cierra, que tambien es algo
+     * que hay que saber -- y es toda la R1 en esta plataforma: la pregunta "hay
+     * algo" hecha sin los dieciseis kilobytes que costaria preguntar "que es".
+     *
+     * El buffer es una direccion de verdad con longitud cero y no un nulo, porque
+     * el proveedor tiene derecho a mirar el array aunque le digan que no lleva
+     * nada, y alguno lo hace.
+     * \~ */
+    WSABUF wsa;
+    wsa.len = 0;
+    wsa.buf = reinterpret_cast<CHAR *>(c->addrs);
+
+    DWORD flags = 0;
+    DWORD moved = 0;
+
+    if (WSARecv(as_socket(op.fd), &wsa, 1, &moved, &flags, &c->ov, nullptr) ==
+        SOCKET_ERROR) {
+        const int e = WSAGetLastError();
+        if (e != WSA_IO_PENDING) {
+            last_error_ = e;
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool IocpBackend::start_recv(const Op &op, Context *c) noexcept {
     Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
     if (b == nullptr || op.fd < 0) return false;
@@ -505,6 +548,10 @@ bool IocpBackend::submit(const Op &op) noexcept {
     switch (op.kind) {
     case OpKind::Accept:
         started = start_accept(op, c);
+        break;
+
+    case OpKind::Ready:
+        started = start_ready(op, c);
         break;
 
     case OpKind::Recv:

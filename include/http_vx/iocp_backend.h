@@ -232,6 +232,7 @@ class IocpBackend final : public Backend {
     bool remember_failure(const Op &op, int32_t error) noexcept;
 
     bool start_accept(const Op &op, Context *c) noexcept;
+    bool start_ready(const Op &op, Context *c) noexcept;
     bool start_recv(const Op &op, Context *c) noexcept;
     bool start_send(const Op &op, Context *c) noexcept;
     bool start_close(const Op &op) noexcept;

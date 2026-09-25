@@ -447,9 +447,28 @@ class Shard {
     void release() noexcept;
 
   private:
-    /// \~english Gets a buffer and asks for a read, if one is wanted.
-    /// \~spanish Consigue un buffer y pide una lectura, si hace falta.  \~
+    /**
+     * @brief
+     * \~english Asks for the next thing this connection has to say.
+     * \~spanish Pide lo siguiente que tenga que decir esta conexion.
+     * \~
+     *
+     * \~english
+     * Which of the two halves it asks for depends on whether there is half a
+     * message in hand: one that has none asks to be TOLD when there is
+     * something, which costs no buffer, and one that has some reads straight
+     * into the buffer it already holds.
+     * \~spanish
+     * Cual de las dos mitades pide depende de si tiene medio mensaje en la mano:
+     * una que no tiene ninguno pide que le AVISEN cuando haya algo, que no cuesta
+     * buffer, y una que tiene algo lee directamente al buffer que ya tiene.
+     * \~
+     */
     void want_read(ConnHandle c, ConnHot &h) noexcept;
+
+    /// \~english Gets a buffer and reads, now that there is something to read.
+    /// \~spanish Consigue un buffer y lee, ahora que hay algo que leer.  \~
+    void read_into_buffer(ConnHandle c, ConnHot &h) noexcept;
 
     /// \~english Sends @p buffer, or queues it behind what is already going.
     /// \~spanish Manda @p buffer, o lo encola detras de lo que ya va.  \~
@@ -473,6 +492,10 @@ class Shard {
 
     void on_read(const Completion &done) noexcept;
     void on_write(const Completion &done) noexcept;
+
+    /// \~english The socket says it has something: now get a buffer and read.
+    /// \~spanish El socket dice que tiene algo: ahora si, buffer y lectura.  \~
+    void on_ready(const Completion &done) noexcept;
 
     /**
      * @brief

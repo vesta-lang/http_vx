@@ -63,6 +63,31 @@ Completion StdioBackend::finish(const Op &op) noexcept {
     case OpKind::Close:
         return c;
 
+    case OpKind::Ready:
+        /* \~english
+         * Always, at once.  A pipe is not something that can be asked whether
+         * it has anything without taking it, so the honest answer is "go and
+         * read", and the read below blocks until there is something -- which is
+         * what reading a pipe has always done here.
+         *
+         * It costs one extra completion per message and buys nothing, and that
+         * is right: what the asking-in-two-halves buys is a buffer not held by
+         * an idle connection, and a server that talks down a pipe has exactly
+         * one connection.  R1 is about a million of them.
+         *
+         * \~spanish
+         * Siempre, en el acto.  A una tuberia no se le puede preguntar si tiene
+         * algo sin llevarselo, asi que la respuesta honesta es "ve y lee", y la
+         * lectura de abajo se queda esperando hasta que haya algo -- que es lo que
+         * ha hecho siempre aqui leer de una tuberia.
+         *
+         * Cuesta una finalizacion mas por mensaje y no compra nada, y eso esta
+         * bien: lo que compra preguntar en dos mitades es un buffer que no tiene
+         * una conexion parada, y un servidor que habla por una tuberia tiene
+         * exactamente una conexion.  La R1 va de un millon de ellas.
+         * \~ */
+        return c;
+
     case OpKind::Recv:
     case OpKind::RecvFrom: {
         if (b == nullptr || in_ < 0) {
@@ -187,8 +212,9 @@ size_t StdioBackend::wait(Completion *done, size_t cap,
             const size_t at = (head_ + k) % kStdioPending;
             const Op op = pending_[at];
 
-            const bool is_read =
-                op.kind == OpKind::Recv || op.kind == OpKind::RecvFrom;
+            const bool is_read = op.kind == OpKind::Recv ||
+                                 op.kind == OpKind::RecvFrom ||
+                                 op.kind == OpKind::Ready;
 
             if (made < cap && is_read != writes) {
                 done[made] = finish(op);

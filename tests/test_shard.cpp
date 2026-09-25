@@ -333,70 +333,100 @@ void test_an_idle_connection_holds_no_buffer() {
     check(r.service.opened == 1, "the service was not told");
 
     /* \~english
-     * A read is outstanding, so exactly one buffer is out -- the one the
-     * operating system is writing into.
+     * **Nothing is out.**  The connection is waiting to be told that there is
+     * something, which costs no memory at all -- and this line is R1: a
+     * connection that has arrived and said nothing has a record in an array and
+     * a socket, and that is all.
+     *
+     * The first version of this test asserted the opposite, in a body under a
+     * name that promised this one: it checked that a connection with a read
+     * outstanding held ONE buffer, and explained why that was fine.  It was not
+     * fine -- sixteen kilobytes times a million is sixteen gigabytes held to
+     * receive nothing -- and the test had been written to agree with the code
+     * rather than with the requirement.
+     *
      * \~spanish
-     * Hay una lectura pendiente, asi que hay exactamente un buffer fuera -- ese
-     * en el que esta escribiendo el sistema operativo.
+     * **No hay nada fuera.**  La conexion espera a que le avisen de que hay algo,
+     * que no cuesta memoria ninguna -- y esta linea es la R1: una conexion que ha
+     * llegado y no ha dicho nada tiene un registro de un array y un socket, y se
+     * acabo.
+     *
+     * La primera version de esta prueba afirmaba lo contrario, en un cuerpo bajo
+     * un nombre que prometia esto: comprobaba que una conexion con una lectura
+     * pendiente tenia UN buffer, y explicaba por que estaba bien.  No estaba bien
+     * -- dieciseis kilobytes por un millon son dieciseis gigabytes guardados para
+     * no recibir nada -- y la prueba se habia escrito para darle la razon al
+     * codigo en vez de al requisito.
      * \~ */
-    check(r.shard.buffers().lent() == 1,
-          "a connection with a read outstanding is not holding one buffer");
+    check(r.shard.buffers().lent() == 0,
+          "a connection that has said nothing is holding a buffer");
 
     const char *msg = "hello";
     check(r.io.feed(reinterpret_cast<const uint8_t *>(msg), std::strlen(msg)),
           "the peer could not send");
 
+    /* \~english
+     * Two turns, because the question was asked in two halves: one says there
+     * is something, and the one after it goes and gets it.
+     * \~spanish
+     * Dos vueltas, porque la pregunta se hizo en dos mitades: una dice que hay
+     * algo, y la de despues va a por ello.
+     * \~ */
+    check(r.shard.poll(1, 0) == 1, "nobody was told there was something");
     check(r.shard.poll(1, 0) == 1, "the read did not come back");
     check(r.service.calls == 1, "the service did not see the bytes");
     check(r.service.seen == std::strlen(msg),
           "the service saw the wrong number of bytes");
 
     /* \~english
-     * Now it is answering AND reading again, so it holds two: the one the
-     * answer is going out of, and the one the next request will arrive in.
-     * That is the high-water mark of the pool and the number to size it by --
-     * not how many connections talk at once, but how many are mid-exchange.
+     * Now it is answering and waiting to be told, so it holds ONE: the buffer
+     * the answer is going out of.  That is the high-water mark of the pool and
+     * the number to size it by -- not how many connections talk at once, and
+     * not even how many are mid-exchange, but how many ANSWERS are in flight.
      * \~spanish
-     * Ahora esta contestando Y leyendo otra vez, asi que tiene dos: aquel del
-     * que sale la respuesta, y aquel en el que llegara la peticion siguiente.
-     * Ese es el pico del pozo y el numero por el que dimensionarlo -- no cuantas
-     * conexiones hablan a la vez, sino cuantas estan a mitad de intercambio.
+     * Ahora esta contestando y esperando a que le avisen, asi que tiene UNO: el
+     * buffer del que sale la respuesta.  Ese es el pico del pozo y el numero por
+     * el que dimensionarlo -- no cuantas conexiones hablan a la vez, y ni siquiera
+     * cuantas estan a mitad de intercambio, sino cuantas RESPUESTAS hay en vuelo.
      * \~ */
-    check(r.shard.buffers().lent() == 2,
-          "a connection answering and reading is not holding two buffers");
+    check(r.shard.buffers().lent() == 1,
+          "a connection answering is not holding exactly one buffer");
 
     check(r.shard.poll(2, 0) == 1, "the write did not come back");
     check(r.io.written_size() == std::strlen(msg), "the answer did not go out");
 
     /* \~english
-     * And it is reading again, which is keep-alive: one buffer, for the read.
+     * And it is back to waiting to be told, which is keep-alive: NOTHING.  The
+     * high-water mark of the pool is how many connections are mid-exchange, and
+     * a kept-alive one between requests is not one of them.
      * \~spanish
-     * Y esta leyendo otra vez, que es mantener viva la conexion: un buffer, el
-     * de la lectura.
+     * Y vuelve a esperar a que le avisen, que es mantener viva la conexion:
+     * NADA.  El pico del pozo es cuantas conexiones estan a mitad de intercambio,
+     * y una mantenida viva entre peticiones no es una de ellas.
      * \~ */
-    check(r.shard.buffers().lent() == 1,
-          "a connection reading again is not holding one buffer");
+    check(r.shard.buffers().lent() == 0,
+          "a connection between requests is holding a buffer");
 
     r.shard.close(c);
-    check(r.service.closed == 0,
-          "a connection with a read outstanding left straight away");
 
     /* \~english
-     * The buffer is the operating system's until the completion arrives, so
-     * closing does NOT hand it back now.  Handing it back here is a
-     * use-after-free the kernel performs, into memory that by then belongs to
-     * somebody else.
+     * It still does not leave, and the reason is unchanged: something of this
+     * connection's is in the operating system's hands -- here the question of
+     * whether there is anything to read -- and a connection cannot be let go of
+     * while an operation naming it is outstanding.  What changed is that the
+     * thing being held is no longer memory.
      * \~spanish
-     * El buffer es del sistema operativo hasta que llegue la finalizacion, asi
-     * que cerrar NO lo devuelve ahora.  Devolverlo aqui es un uso despues de
-     * liberar que hace el nucleo, sobre una memoria que para entonces es de
-     * otro.
+     * Sigue sin irse, y la razon no ha cambiado: algo de esta conexion esta en
+     * manos del sistema operativo -- aqui la pregunta de si hay algo que leer --
+     * y una conexion no se puede soltar con una operacion que la nombra
+     * pendiente.  Lo que ha cambiado es que lo que se tiene ya no es memoria.
      * \~ */
-    check(r.shard.buffers().lent() == 1,
-          "closing handed back a buffer the operating system still had");
+    check(r.service.closed == 0,
+          "a connection with something outstanding left straight away");
 
     r.io.end_of_stream();
     r.shard.poll(3, 0);
+    r.shard.poll(4, 0);
 
     check(r.service.closed == 1, "the connection did not finish leaving");
     check(r.shard.buffers().lent() == 0,
@@ -515,19 +545,40 @@ void test_a_connection_without_a_buffer_still_expires() {
 
     const ConnHandle first = r.shard.adopt(7, 0);
     check(first.valid(), "the first connection was not adopted");
-    check(r.shard.buffers().lent() == 1, "the first read took no buffer");
 
     const ConnHandle second = r.shard.adopt(8, 0);
     check(second.valid(), "the second connection was not adopted");
     check(r.shard.conns().count() == 2, "the second connection was refused");
 
     /* \~english
-     * There was no buffer for it, so it is not reading -- and that is not an
-     * error anywhere.
+     * Two connections and no buffers at all, because waiting to be told costs
+     * none.  The pool being empty is now something that can only happen when
+     * there are bytes -- which is what makes a pool smaller than the connection
+     * table the design rather than a gamble.
      * \~spanish
-     * No habia buffer para ella, asi que no esta leyendo -- y eso no es un error
-     * en ningun sitio.
+     * Dos conexiones y ningun buffer, porque esperar a que te avisen no cuesta
+     * ninguno.  Que el pozo este vacio es ahora algo que solo puede pasar cuando
+     * hay bytes -- que es lo que hace que un pozo menor que la tabla de conexiones
+     * sea el diseno y no una apuesta.
      * \~ */
+    check(r.shard.buffers().lent() == 0,
+          "connections that have said nothing are holding buffers");
+
+    /* \~english
+     * Now there is something, and there is one buffer for two connections.  The
+     * first takes it; the second is told there are bytes, finds no buffer, and
+     * does not read -- which is not an error anywhere.
+     * \~spanish
+     * Ahora hay algo, y hay un buffer para dos conexiones.  La primera se lo
+     * lleva; a la segunda le avisan de que hay bytes, no encuentra buffer, y no
+     * lee -- que no es un error en ningun sitio.
+     * \~ */
+    const char *msg = "hello";
+    check(r.io.feed(reinterpret_cast<const uint8_t *>(msg), std::strlen(msg)),
+          "the peer could not send");
+
+    r.shard.poll(1, 0);
+
     check(r.shard.buffers().lent() == 1,
           "the second connection got a buffer that did not exist");
 
@@ -580,16 +631,20 @@ void test_answering_nothing_keeps_the_pool_whole() {
     for (int i = 0; i < 50; ++i) {
         const char *msg = "x";
         r.io.feed(reinterpret_cast<const uint8_t *>(msg), 1);
+
+        check(r.shard.poll(1, 0) == 1, "nobody was told there was something");
         check(r.shard.poll(1, 0) == 1, "the read did not come back");
 
         /* \~english
-         * One buffer, for the read that was started again.  Never two, never
-         * creeping.
+         * And none held afterwards, fifty times over.  What this is looking for
+         * is a pool that creeps: one buffer not given back per exchange is a
+         * server that works perfectly for an hour.
          * \~spanish
-         * Un buffer, el de la lectura que se volvio a empezar.  Nunca dos, y
-         * nunca subiendo.
+         * Y ninguno guardado despues, cincuenta veces seguidas.  Lo que se busca
+         * aqui es un pozo que suba: un buffer sin devolver por intercambio es un
+         * servidor que funciona perfectamente durante una hora.
          * \~ */
-        check(r.shard.buffers().lent() == 1,
+        check(r.shard.buffers().lent() == 0,
               "answering nothing left a buffer behind");
     }
 
@@ -613,6 +668,7 @@ void test_a_service_can_end_it() {
 
     const char *msg = "bad";
     r.io.feed(reinterpret_cast<const uint8_t *>(msg), std::strlen(msg));
+    r.shard.poll(1, 0);
     r.shard.poll(1, 0);
 
     check(r.service.closed == 1, "the connection was not closed");
@@ -677,6 +733,7 @@ void test_both_directions_at_once() {
 
     const char *first = "aaaaaaaa";
     r.io.feed(reinterpret_cast<const uint8_t *>(first), std::strlen(first));
+    check(r.shard.poll(1, 0) == 1, "nobody was told there was something");
     check(r.shard.poll(1, 0) == 1, "the first read did not come back");
 
     const http_vx::ConnHot *h = r.shard.conns().hot(c);
@@ -693,8 +750,21 @@ void test_both_directions_at_once() {
           "the answer is not going out");
     check(h != nullptr && (h->flags & kReadPending) != 0,
           "reading stopped while the answer was going out");
-    check(r.shard.buffers().lent() == 2,
-          "a connection reading and writing is not holding two buffers");
+
+    /* \~english
+     * And ONE buffer, not two: the answer is going out of one, and the read
+     * that is outstanding is the half that costs nothing -- the connection is
+     * waiting to be told there is something, and will take a buffer when there
+     * is.  So the pool's high-water mark is one per answer IN FLIGHT rather
+     * than two per connection mid-exchange.
+     * \~spanish
+     * Y UN buffer, no dos: la respuesta sale de uno, y la lectura pendiente es la
+     * mitad que no cuesta nada -- la conexion espera a que le avisen de que hay
+     * algo, y cogera buffer cuando lo haya --.  Asi que el pico del pozo es uno
+     * por respuesta EN VUELO y no dos por conexion a mitad de intercambio.
+     * \~ */
+    check(r.shard.buffers().lent() == 1,
+          "a connection answering and waiting is not holding one buffer");
 
     /* \~english
      * The peer sends again while the first answer is still going out.  The
@@ -822,6 +892,7 @@ void test_half_a_message_waits_for_the_rest() {
      * \~ */
     const char *first = "GET /some";
     io.feed(reinterpret_cast<const uint8_t *>(first), std::strlen(first));
+    check(shard.poll(1, 0) == 1, "nobody was told there was something");
     check(shard.poll(1, 0) == 1, "the first read did not come back");
 
     check(service.calls == 1, "the service was not asked");
@@ -868,16 +939,16 @@ void test_half_a_message_waits_for_the_rest() {
           "the message was not put back together in order");
 
     /* \~english
-     * And with nothing left over there is one buffer out, the one the next
-     * request will arrive in -- not two, which is what a shard that kept the
-     * spent half as well would show.
+     * And with nothing left over there is NOTHING out: the connection is back
+     * to waiting to be told, which is where a kept-alive connection spends
+     * almost all of its life and where it costs nothing.
      * \~spanish
-     * Y sin nada que sobre hay un buffer fuera, aquel en el que llegara la
-     * peticion siguiente -- no dos, que es lo que ensenaria un fragmento que se
-     * hubiera quedado ademas la mitad ya gastada.
+     * Y sin nada que sobre no hay NADA fuera: la conexion vuelve a esperar a que
+     * le avisen, que es donde pasa casi toda su vida una conexion mantenida viva
+     * y donde no cuesta nada.
      * \~ */
-    check(shard.buffers().lent() == 1,
-          "a connection between messages is holding more than the next read");
+    check(shard.buffers().lent() == 0,
+          "a connection between messages is holding a buffer");
 }
 
 } // namespace

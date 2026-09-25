@@ -68,7 +68,7 @@ namespace {
 /// \~spanish Si @p kind es de los que leen.  \~
 bool reads(OpKind kind) noexcept {
     return kind == OpKind::Recv || kind == OpKind::RecvFrom ||
-           kind == OpKind::Accept;
+           kind == OpKind::Accept || kind == OpKind::Ready;
 }
 
 /**
@@ -345,6 +345,41 @@ int EpollBackend::try_now(const Op &op) noexcept {
         const int taken = accept4(op.fd, nullptr, nullptr,
                                   SOCK_NONBLOCK | SOCK_CLOEXEC);
         return taken;
+    }
+
+    case OpKind::Ready: {
+        /* \~english
+         * One byte looked at and left where it was.  `MSG_PEEK` is the whole
+         * answer here: there is no buffer to read into -- not having one is the
+         * point -- and what is being asked is only whether a read would find
+         * anything.
+         *
+         * A zero would have been simpler and is wrong: a receive of zero bytes
+         * returns zero on Linux whatever the socket is doing, so it would say
+         * "ready" about every socket in the server, for ever.
+         *
+         * Zero from a real peek IS the answer though -- it is the peer having
+         * closed -- and it is reported as ready on purpose: the read that
+         * follows finds the end of the stream, which is a thing the loop above
+         * needs to be told about the ordinary way.
+         *
+         * \~spanish
+         * Un byte mirado y dejado donde estaba.  `MSG_PEEK` es toda la respuesta
+         * aqui: no hay buffer en el que leer -- no tenerlo es de lo que se trata
+         * -- y lo unico que se pregunta es si una lectura encontraria algo.
+         *
+         * Un cero habria sido mas simple y esta mal: una recepcion de cero bytes
+         * devuelve cero en Linux haga lo que haga el socket, asi que diria "listo"
+         * de todos los sockets del servidor, para siempre.
+         *
+         * Un cero de un vistazo de verdad SI es la respuesta -- es el otro extremo
+         * habiendo cerrado -- y se dice que esta listo a proposito: la lectura que
+         * viene detras encuentra el fin del flujo, que es algo de lo que hay que
+         * avisar al bucle de encima por la via corriente.
+         * \~ */
+        uint8_t peek = 0;
+        const ssize_t n = ::recv(op.fd, &peek, 1, MSG_PEEK);
+        return n < 0 ? -1 : 0;
     }
 
     case OpKind::Recv:
