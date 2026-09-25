@@ -288,19 +288,17 @@ void report_memory(const char *tag) {
     const size_t held = rig.shard.buffers().bytes_held();
     const size_t lent = rig.shard.buffers().lent();
 
-    std::printf("\n  memoria por conexion (%s)\n", tag);
-    std::printf("    %-34s %8zu B\n", "registro caliente",
-                sizeof(http_vx::ConnHot));
-    std::printf("    %-34s %8zu B\n", "registro frio",
-                sizeof(http_vx::ConnCold));
-    std::printf("    %-34s %8zu B\n", "plazo + casilla libre",
+    std::printf("\n  memory per connection (%s)\n", tag);
+    std::printf("    %-34s %8zu B\n", "hot record", sizeof(http_vx::ConnHot));
+    std::printf("    %-34s %8zu B\n", "cold record", sizeof(http_vx::ConnCold));
+    std::printf("    %-34s %8zu B\n", "deadline + free slot",
                 sizeof(uint32_t) + 12);
-    std::printf("    %-34s %8zu B\n", "FIJO POR CONEXION", fixed_per_conn);
-    std::printf("    %-34s %8.1f MB\n", "un millon de conexiones",
+    std::printf("    %-34s %8zu B\n", "FIXED PER CONNECTION", fixed_per_conn);
+    std::printf("    %-34s %8.1f MB\n", "one million connections",
                 static_cast<double>(fixed_per_conn) * 1000000.0 /
                     (1024.0 * 1024.0));
 
-    std::printf("    %-34s %8zu B\n", "bytes en el pozo", held);
+    std::printf("    %-34s %8zu B\n", "bytes held in the pool", held);
 
     /* \~english
      * And the measurement R1 either survives or does not: a thousand
@@ -335,14 +333,14 @@ void report_memory(const char *tag) {
      * que el numero de la tabla signifique algo -- un coste fijo por conexion
      * solo es un coste fijo si no hay nada mas guardado por lo bajo a su lado.
      * \~ */
-    std::printf("\n    conexiones adoptadas %zu, buffers prestados %zu\n",
+    std::printf("\n    connections adopted %zu, buffers lent %zu\n",
                 static_cast<size_t>(rig.shard.conns().count()), lent);
-    std::printf("    una conexion parada NO tiene buffer: la lectura se pide\n"
-                "    en dos mitades, y la primera -- \"avisame cuando haya\n"
-                "    algo\" -- no nombra ninguno.  Es la recepcion de cero\n"
-                "    bytes de IOCP y el descriptor vigilado de epoll.  Lo que\n"
-                "    acota el pozo son las RESPUESTAS en vuelo, no las\n"
-                "    conexiones abiertas.\n");
+    std::printf("    an idle connection holds NO buffer: the read is asked\n"
+                "    for in two halves, and the first -- \"tell me when there\n"
+                "    is something\" -- names none.  It is the zero-byte\n"
+                "    receive on Windows and the watched descriptor on epoll.\n"
+                "    What bounds the pool is the ANSWERS in flight, not the\n"
+                "    connections open.\n");
 }
 
 /**
@@ -421,12 +419,12 @@ void report_slicing(const char *tag) {
      * porque es lo que dice la palabra.  Un numero cuyas unidades hay que sacar
      * de otro sitio es un numero que se va a leer mal.
      * \~ */
-    std::printf("\n  partir la entrada (%s) -- R12: sin retroceso\n", tag);
-    std::printf("    (cada fila analiza la MISMA cabeza de %zu B, %zu veces,\n"
-                "     entregada en mas o menos trozos)\n",
+    std::printf("\n  slicing the input (%s) -- R12: no going back\n", tag);
+    std::printf("    (every row parses the SAME %zu B head, %zu times,\n"
+                "     delivered in more or fewer pieces)\n",
                 std::strlen(kRequest), kRounds);
-    std::printf("    %-10s %14s %12s %10s %9s\n", "trozos", "seg (las 200k)",
-                "cab/s", "vs 1 trozo", "MB/s");
+    std::printf("    %-10s %14s %12s %10s %9s\n", "pieces", "sec (all 200k)",
+                "heads/s", "vs 1 piece", "MB/s");
 
     double first = 0.0;
 
@@ -543,19 +541,19 @@ void report_slicing(const char *tag) {
     const double big_one = slicing_cost(big, 20000, 1);
     const double big_many = slicing_cost(big, 20000, 32);
 
-    std::printf("\n    la misma pregunta a una cabeza %zu veces mayor:\n",
+    std::printf("\n    the same question asked of a head %zu times larger:\n",
                 std::strlen(big) / std::strlen(kRequest));
-    std::printf("    %-10s %14s %12s %10s\n", "trozos", "seg (las 20k)",
-                "cab/s", "vs 1 trozo");
+    std::printf("    %-10s %14s %12s %10s\n", "pieces", "sec (all 20k)",
+                "heads/s", "vs 1 piece");
     std::printf("    %-10d %14.4f %12.0f %9.2fx\n", 1, big_one,
                 20000.0 / big_one, 1.0);
     std::printf("    %-10d %14.4f %12.0f %9.2fx\n", 32, big_many,
                 20000.0 / big_many, big_many / big_one);
 
-    std::printf("\n    la proporcion de la cabeza GRANDE debe ser MENOR o igual\n"
-                "    que la de la pequena.  Si es mayor, el analizador\n"
-                "    vuelve a empezar, y eso es cuadratico contra quien mande\n"
-                "    una peticion byte a byte a proposito.\n");
+    std::printf("\n    the ratio for the LARGE head must be LOWER than or\n"
+                "    equal to the one for the small head.  If it is higher,\n"
+                "    the parser starts over, and that is quadratic against\n"
+                "    somebody sending a request a byte at a time on purpose.\n");
 }
 
 /**
@@ -589,12 +587,12 @@ void report_syscalls(const char *tag) {
 
     if (served == 0) return;
 
-    std::printf("\n  llamadas por peticion (%s) -- R15\n", tag);
-    std::printf("    %-34s %8.2f\n", "avisos",
+    std::printf("\n  system calls per request (%s) -- R15\n", tag);
+    std::printf("    %-34s %8.2f\n", "notices",
                 static_cast<double>(notices) / static_cast<double>(served));
-    std::printf("    %-34s %8.2f\n", "lecturas",
+    std::printf("    %-34s %8.2f\n", "reads",
                 static_cast<double>(reads) / static_cast<double>(served));
-    std::printf("    %-34s %8.2f\n", "escrituras",
+    std::printf("    %-34s %8.2f\n", "writes",
                 static_cast<double>(writes) / static_cast<double>(served));
 
     /* \~english
@@ -629,10 +627,10 @@ void report_syscalls(const char *tag) {
      * una linea: la llamada solo se paga donde la alternativa era guardar memoria
      * para nada.
      * \~ */
-    std::printf("    una peticion sencilla: un aviso, una lectura y una\n"
-                "    escritura.  El aviso es lo que compra la R1 -- sin el,\n"
-                "    una conexion parada tendria buffer -- y una peticion\n"
-                "    ENCADENADA no lo paga, porque sus bytes ya estan aqui.\n");
+    std::printf("    a simple request: one notice, one read and one write.\n"
+                "    The notice is what buys R1 -- without it an idle\n"
+                "    connection would hold a buffer -- and a PIPELINED\n"
+                "    request does not pay it, because its bytes are here.\n");
 }
 
 /**
@@ -685,10 +683,10 @@ void report_speed(const char *tag) {
         }
     }
 
-    std::printf("\n  servir (%s)\n", tag);
-    std::printf("    %-34s %8zu\n", "peticiones por ronda", served);
-    std::printf("    %-34s %8.0f\n", "peticiones por segundo", best);
-    std::printf("    %-34s %8.0f ns\n", "por peticion",
+    std::printf("\n  serving (%s)\n", tag);
+    std::printf("    %-34s %8zu\n", "requests per round", served);
+    std::printf("    %-34s %8.0f\n", "requests per second", best);
+    std::printf("    %-34s %8.0f ns\n", "per request",
                 best > 0.0 ? 1e9 / best : 0.0);
 
     /* \~english
@@ -715,11 +713,11 @@ void report_speed(const char *tag) {
      * cuenta la R15 y agrupa la R18.  Un servidor que hiciera este numero el
      * doble de bueno y dos llamadas por peticion iria mas lento.
      * \~ */
-    std::printf("\n    SIN llamadas al sistema: el backend entrega los bytes\n"
-                "    desde memoria.  Es el coste de la maquinaria de HTTP\n"
-                "    sola.  Sobre un socket, una lectura y una escritura\n"
-                "    cuestan mas que todo esto junto -- por eso lo que se\n"
-                "    cuenta arriba es CUANTAS, no cuanto.\n");
+    std::printf("\n    NO system calls: the backend hands the bytes over from\n"
+                "    memory.  This is the cost of the HTTP machinery alone.\n"
+                "    Over a socket, one read and one write cost more than all\n"
+                "    of it together -- which is why what is counted above is\n"
+                "    HOW MANY of them, not how long.\n");
 }
 
 } // namespace
@@ -747,15 +745,46 @@ int main(int argc, char **argv) {
      * \~ */
     const char *tag = argc > 1 ? argv[1] : "sin-etiqueta";
 
-    std::printf("http_vx -- medidas\n");
-    std::printf("  maquina: %s\n", tag);
-    std::printf("  fecha:   %s\n", __DATE__);
-    std::printf("  guardar en bench/baseline/<maquina>.txt\n");
+    /* \~english
+     * A second argument runs ONE measurement, and it is not a convenience: the
+     * four of them do wildly different amounts of work -- slicing parses over a
+     * million heads and serving does nine hundred requests -- so a profiler
+     * pointed at all four reports where the SLICING went and says nothing about
+     * the path every request takes.
+     *
+     * That is not a hypothetical either: the first profile taken of this
+     * binary came back sixty-four per cent inside the parser, which was true
+     * and useless.
+     *
+     * \~spanish
+     * Un segundo argumento corre UNA medida, y no es una comodidad: las cuatro
+     * hacen cantidades de trabajo muy distintas -- el troceado analiza mas de un
+     * millon de cabezas y servir hace novecientas peticiones -- asi que un
+     * perfilador apuntado a las cuatro informa de donde se fue el TROCEADO y no
+     * dice nada del camino por el que pasan todas las peticiones.
+     *
+     * Y tampoco es hipotetico: el primer perfil que se saco de este binario
+     * volvio con un sesenta y cuatro por ciento dentro del analizador, que era
+     * cierto y no servia para nada.
+     * \~ */
+    const char *only = argc > 2 ? argv[2] : nullptr;
 
-    report_speed(tag);
-    report_syscalls(tag);
-    report_slicing(tag);
-    report_memory(tag);
+    const bool all = only == nullptr;
+    const bool want_speed = all || std::strcmp(only, "serving") == 0;
+    const bool want_syscalls = all || std::strcmp(only, "syscalls") == 0;
+    const bool want_slicing = all || std::strcmp(only, "slicing") == 0;
+    const bool want_memory = all || std::strcmp(only, "memory") == 0;
+
+    std::printf("http_vx -- measurements\n");
+    std::printf("  machine: %s\n", tag);
+    std::printf("  date:    %s\n", __DATE__);
+    std::printf("  save in bench/baseline/<machine>.txt\n");
+    if (!all) std::printf("  ONLY: %s\n", only);
+
+    if (want_speed) report_speed(tag);
+    if (want_syscalls) report_syscalls(tag);
+    if (want_slicing) report_slicing(tag);
+    if (want_memory) report_memory(tag);
 
     std::printf("\n");
     return 0;

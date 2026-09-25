@@ -1,62 +1,62 @@
-http_vx -- medidas
-  maquina: tdm-gcc-10.3-win10-x64
-  fecha:   Sep 25 2026
-  guardar en bench/baseline/<maquina>.txt
+http_vx -- measurements
+  machine: tdm-gcc-10.3-win10-x64
+  date:    Sep 25 2026
+  save in bench/baseline/<machine>.txt
 
-  servir (tdm-gcc-10.3-win10-x64)
-    peticiones por ronda                    900
-    peticiones por segundo              2284264
-    por peticion                            438 ns
+  serving (tdm-gcc-10.3-win10-x64)
+    requests per round                      900
+    requests per second                 2369668
+    per request                             422 ns
 
-    SIN llamadas al sistema: el backend entrega los bytes
-    desde memoria.  Es el coste de la maquinaria de HTTP
-    sola.  Sobre un socket, una lectura y una escritura
-    cuestan mas que todo esto junto -- por eso lo que se
-    cuenta arriba es CUANTAS, no cuanto.
+    NO system calls: the backend hands the bytes over from
+    memory.  This is the cost of the HTTP machinery alone.
+    Over a socket, one read and one write cost more than all
+    of it together -- which is why what is counted above is
+    HOW MANY of them, not how long.
 
-  llamadas por peticion (tdm-gcc-10.3-win10-x64) -- R15
-    avisos                                 1.00
-    lecturas                               1.00
-    escrituras                             1.00
-    una peticion sencilla: un aviso, una lectura y una
-    escritura.  El aviso es lo que compra la R1 -- sin el,
-    una conexion parada tendria buffer -- y una peticion
-    ENCADENADA no lo paga, porque sus bytes ya estan aqui.
+  system calls per request (tdm-gcc-10.3-win10-x64) -- R15
+    notices                                1.00
+    reads                                  1.00
+    writes                                 1.00
+    a simple request: one notice, one read and one write.
+    The notice is what buys R1 -- without it an idle
+    connection would hold a buffer -- and a PIPELINED
+    request does not pay it, because its bytes are here.
 
-  partir la entrada (tdm-gcc-10.3-win10-x64) -- R12: sin retroceso
-    (cada fila analiza la MISMA cabeza de 82 B, 200000 veces,
-     entregada en mas o menos trozos)
-    trozos     seg (las 200k)        cab/s vs 1 trozo      MB/s
-    1                  0.0186     10738947      1.00x       840
-    2                  0.0202      9899569      1.08x       774
-    4                  0.0213      9368954      1.15x       733
-    8                  0.0231      8661008      1.24x       677
-    16                 0.0271      7376018      1.46x       577
-    32                 0.0364      5500157      1.95x       430
+  slicing the input (tdm-gcc-10.3-win10-x64) -- R12: no going back
+    (every row parses the SAME 82 B head, 200000 times,
+     delivered in more or fewer pieces)
+    pieces     sec (all 200k)      heads/s vs 1 piece      MB/s
+    1                  0.0180     11122171      1.00x       870
+    2                  0.0187     10713291      1.04x       838
+    4                  0.0204      9785598      1.14x       765
+    8                  0.0232      8618312      1.29x       674
+    16                 0.0330      6053031      1.84x       473
+    32                 0.0446      4481481      2.48x       350
 
-    la misma pregunta a una cabeza 16 veces mayor:
-    trozos      seg (las 20k)        cab/s vs 1 trozo
-    1                  0.0275       727151      1.00x
-    32                 0.0293       683665      1.06x
+    the same question asked of a head 16 times larger:
+    pieces      sec (all 20k)      heads/s vs 1 piece
+    1                  0.0317       630599      1.00x
+    32                 0.0327       611574      1.03x
 
-    la proporcion de la cabeza GRANDE debe ser MENOR o igual
-    que la de la pequena.  Si es mayor, el analizador
-    vuelve a empezar, y eso es cuadratico contra quien mande
-    una peticion byte a byte a proposito.
+    the ratio for the LARGE head must be LOWER than or
+    equal to the one for the small head.  If it is higher,
+    the parser starts over, and that is quadratic against
+    somebody sending a request a byte at a time on purpose.
 
-  memoria por conexion (tdm-gcc-10.3-win10-x64)
-    registro caliente                        24 B
-    registro frio                            56 B
-    plazo + casilla libre                    16 B
-    FIJO POR CONEXION                        96 B
-    un millon de conexiones                91.6 MB
-    bytes en el pozo                          0 B
+  memory per connection (tdm-gcc-10.3-win10-x64)
+    hot record                               24 B
+    cold record                              56 B
+    deadline + free slot                     16 B
+    FIXED PER CONNECTION                     96 B
+    one million connections                91.6 MB
+    bytes held in the pool                    0 B
 
-    conexiones adoptadas 1024, buffers prestados 0
-    una conexion parada NO tiene buffer: la lectura se pide
-    en dos mitades, y la primera -- "avisame cuando haya
-    algo" -- no nombra ninguno.  Es la recepcion de cero
-    bytes de IOCP y el descriptor vigilado de epoll.  Lo que
-    acota el pozo son las RESPUESTAS en vuelo, no las
-    conexiones abiertas.
+    connections adopted 1024, buffers lent 0
+    an idle connection holds NO buffer: the read is asked
+    for in two halves, and the first -- "tell me when there
+    is something" -- names none.  It is the zero-byte
+    receive on Windows and the watched descriptor on epoll.
+    What bounds the pool is the ANSWERS in flight, not the
+    connections open.
 
