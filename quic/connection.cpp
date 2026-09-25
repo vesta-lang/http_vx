@@ -139,7 +139,21 @@ Connection::Connection(Crypto &crypto, const ConnectionConfig &config) noexcept
     if (records_ != nullptr)
         for (size_t i = 0; i < record_cap_; ++i) records_[i].tag = 0;
 
-    if (!cfg_.is_server) validated_ = true;
+    /* \~english
+     * The handshake's path.  A client's peer address needs no proof: the
+     * server's answers prove it (8.1), and the anti-amplification limit never
+     * binds a client (21.1.1.1).
+     * \~spanish
+     * El camino del saludo.  La direccion del otro de un cliente no necesita
+     * prueba: la prueban las respuestas del servidor (8.1), y el limite
+     * antiamplificacion nunca ata a un cliente (21.1.1.1).
+     * \~ */
+    PathState &first = paths_[0];
+    first.addr = cfg_.path;
+    first.used = true;
+    first.validated = !cfg_.is_server;
+    first.peer_seq = 0;
+    first.local_seq_seen = 0;
 
     /* \~english
      * Sequence 0 on each side is the ID the handshake already uses.  Ours
@@ -211,8 +225,23 @@ bool Connection::derive_initial_keys(const uint8_t *dcid, size_t len) noexcept {
 }
 
 void Connection::set_address_validated(uint64_t now_us) noexcept {
-    validated_ = true;
+    paths_[active_].validated = true;
     recovery_.set_amplification_blocked(false, now_us);
+}
+
+const char *migration_name(Migration m) noexcept {
+    switch (m) {
+    case Migration::Started:        return "started";
+    case Migration::NotClient:      return "not-client";
+    case Migration::NotConfirmed:   return "not-confirmed";
+    case Migration::Disabled:       return "disabled";
+    case Migration::ZeroLengthId:   return "zero-length-id";
+    case Migration::UnknownServer:  return "unknown-server";
+    case Migration::SamePath:       return "same-path";
+    case Migration::NoConnectionId: return "no-connection-id";
+    case Migration::Failed:         return "failed";
+    }
+    return "unknown";
 }
 
 size_t Connection::offered_versions(uint32_t *out, size_t room) const noexcept {
@@ -633,6 +662,7 @@ bool Connection::use_peer_cid(PeerCid &c) noexcept {
     util::vesta_memcpy_noinline(cfg_.peer_cid, c.cid, c.len);
     cfg_.peer_cid_len = c.len;
     peer_seq_in_use_ = c.seq;
+    paths_[active_].peer_seq = c.seq;
     c.used = true;
     ++cid_counts_.switched;
     draw_spin_bit();
@@ -700,6 +730,10 @@ bool Connection::on_new_connection_id(const Frame &f, const uint8_t *payload, ui
         for (PeerCid &c : peer_cids_) {
             if (!c.active || c.seq >= peer_retire_prior_to_) continue;
             if (c.seq == peer_seq_in_use_) lost_current = true;
+            // \~english Another path that sent with it needs a new one before it sends again.
+            // \~spanish Otro camino que mandaba con el necesita uno nuevo antes de volver a mandar.  \~
+            for (PathState &path : paths_)
+                if (path.used && path.peer_seq == c.seq) path.peer_seq = kNever;
             c.active = false;
             ++cid_counts_.retired;
             if (!owe_retire(c.seq)) {
@@ -728,12 +762,18 @@ bool Connection::on_new_connection_id(const Frame &f, const uint8_t *payload, ui
     slot->active = true;
     ++cid_counts_.received;
 
-    // \~english The one in use was retired: move to the lowest that is left.
-    // \~spanish Se retiro el que estaba en uso: se pasa al mas bajo que quede.  \~
+    /* \~english
+     * The one in use was retired: move to one no other path has used (9.5),
+     * or, if there is none, to the lowest that is left.
+     * \~spanish
+     * Se retiro el que estaba en uso: se pasa a uno que no haya usado ningun
+     * otro camino (9.5), o, si no hay, al mas bajo que quede.
+     * \~ */
     if (lost_current) {
-        PeerCid *next = nullptr;
-        for (PeerCid &c : peer_cids_)
-            if (c.active && (next == nullptr || c.seq < next->seq)) next = &c;
+        PeerCid *next = unused_peer_cid();
+        if (next == nullptr)
+            for (PeerCid &c : peer_cids_)
+                if (c.active && (next == nullptr || c.seq < next->seq)) next = &c;
         if (next != nullptr) use_peer_cid(*next);
     }
 
@@ -783,14 +823,28 @@ bool Connection::on_retire_connection_id(const Frame &f, uint64_t now_us) noexce
     return true;
 }
 
-bool Connection::check_stateless_reset(const uint8_t *tail) const noexcept {
-    // \~english Only the tokens of IDs packets were sent to, and not retired (10.3.1).
-    // \~spanish Solo los testigos de identificadores a los que se mandaron paquetes, y sin retirar (10.3.1).  \~
+bool Connection::check_stateless_reset(const uint8_t *tail, const Address &from) const noexcept {
+    /* \~english
+     * Only the tokens of IDs packets were sent to, not retired, and sent to
+     * the address this datagram came from: 10.3.1 compares "with all
+     * stateless reset tokens associated with the remote address on which the
+     * datagram was received".
+     * \~spanish
+     * Solo los testigos de identificadores a los que se mandaron paquetes, sin
+     * retirar, y mandados a la direccion de la que llego este datagrama: 10.3.1
+     * compara "con todos los testigos asociados a la direccion remota por la que
+     * se recibio el datagrama".
+     * \~ */
     // \~english Every candidate compared in full, in constant time: no early exit to time.
     // \~spanish Cada candidato comparado entero, en tiempo constante: sin salida temprana que medir.  \~
     bool hit = false;
-    for (const PeerCid &c : peer_cids_)
-        if (c.active && c.used && c.has_token) hit = bytes_equal(c.token, tail, kResetTokenSize) || hit;
+    for (const PeerCid &c : peer_cids_) {
+        if (!c.active || !c.used || !c.has_token) continue;
+        bool sent_there = false;
+        for (const PathState &p : paths_)
+            if (p.used && p.peer_seq == c.seq && same_address(p.addr.peer, from)) sent_there = true;
+        if (sent_there) hit = bytes_equal(c.token, tail, kResetTokenSize) || hit;
+    }
     return hit;
 }
 
@@ -867,6 +921,7 @@ bool Connection::keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) no
         Pending &q = pending_[i];
         if (q.used) continue;
         util::vesta_memcpy(q.bytes, p, n);
+        q.path = rx_addr_;
         q.arrived_us = arrival_us_;
         q.len = static_cast<uint16_t>(n);
         q.space = static_cast<uint8_t>(s);
@@ -898,6 +953,8 @@ void Connection::replay(Space s, uint64_t now_us) noexcept {
         // \~english Its ACK Delay counts from when it arrived, not from now (13.2.5).
         // \~spanish Su ACK Delay cuenta desde que llego, no desde ahora (13.2.5).  \~
         arrival_us_ = q.arrived_us;
+        rx_addr_ = q.path;
+        rx_path_ = find_path(q.path);
         process_packet(q.bytes, h, q.ecn, now_us);
     }
 }
@@ -914,12 +971,313 @@ void Connection::restart_idle(uint64_t now_us) noexcept {
     idle_deadline_ = now_us + max64(cfg_.idle_timeout_us, 3 * pto_duration());
 }
 
-size_t Connection::amplification_budget() const noexcept {
-    // \~english 8.1: until the client's address is proven, three times what came from it.
-    // \~spanish 8.1: hasta probar la direccion del cliente, tres veces lo que llego de el.  \~
-    if (validated_) return static_cast<size_t>(-1);
-    const uint64_t allowed = 3 * bytes_in_;
-    return allowed > bytes_out_ ? static_cast<size_t>(allowed - bytes_out_) : 0;
+size_t Connection::amplification_budget(size_t path) const noexcept {
+    /* \~english
+     * 8: until an address is proven, three times what came from it -- per
+     * address, so a migrated peer starts again from zero (9.3.1).  Never a
+     * client's limit: it applies to answering an unproven address, not to
+     * starting a connection or a migration (21.1.1.1).
+     * \~spanish
+     * 8: hasta probar una direccion, tres veces lo que llego de ella -- por
+     * direccion, asi que un otro que migra empieza otra vez de cero (9.3.1).
+     * Nunca es el limite de un cliente: se aplica a contestar a una direccion sin
+     * probar, no a empezar una conexion ni una migracion (21.1.1.1).
+     * \~ */
+    const PathState &p = paths_[path];
+    if (!cfg_.is_server || p.validated) return static_cast<size_t>(-1);
+    const uint64_t allowed = 3 * p.bytes_in;
+    return allowed > p.bytes_out ? static_cast<size_t>(allowed - p.bytes_out) : 0;
+}
+
+size_t Connection::find_path(const Path &p) const noexcept {
+    for (size_t i = 0; i < kMaxPaths; ++i)
+        if (paths_[i].used && same_path(paths_[i].addr, p)) return i;
+    return kNoPath;
+}
+
+size_t Connection::claim_path(const Path &p, uint64_t now_us) noexcept {
+    // \~english A free slot, or else the least recently used one that is neither in use nor the fallback.
+    // \~spanish Un hueco libre, o si no el usado hace mas tiempo que no este en uso ni sea el de respaldo.  \~
+    size_t pick = kNoPath;
+    for (size_t i = 0; i < kMaxPaths && pick == kNoPath; ++i)
+        if (!paths_[i].used) pick = i;
+    if (pick == kNoPath)
+        for (size_t i = 0; i < kMaxPaths; ++i) {
+            if (i == active_ || i == fallback_) continue;
+            if (pick == kNoPath || paths_[i].last_used < paths_[pick].last_used) pick = i;
+        }
+    free_path(pick);
+    PathState &slot = paths_[pick];
+    slot.addr = p;
+    slot.used = true;
+    slot.last_used = now_us;
+    return pick;
+}
+
+void Connection::free_path(size_t i) noexcept {
+    /* \~english
+     * The peer's ID it sent with is retired, unless another path still uses
+     * it: once sent to this address it may not go to another (9.5), so
+     * keeping it would only use up the peer's room.
+     * \~spanish
+     * El identificador del otro con el que mandaba se retira, salvo que otro
+     * camino lo siga usando: mandado ya a esta direccion no puede ir a otra
+     * (9.5), asi que guardarlo solo gastaria el sitio del otro.
+     * \~ */
+    const uint64_t seq = paths_[i].peer_seq;
+    bool shared = false;
+    for (size_t j = 0; j < kMaxPaths; ++j)
+        if (j != i && paths_[j].used && paths_[j].peer_seq == seq) shared = true;
+    PeerCid *c = seq == kNever ? nullptr : peer_cid_by_seq(seq);
+    if (c != nullptr && !shared && seq != peer_seq_in_use_ && owe_retire(seq)) {
+        c->active = false;
+        ++cid_counts_.retired;
+    }
+    if (i == fallback_) fallback_ = kNoPath;
+    paths_[i] = PathState{};
+}
+
+Connection::PeerCid *Connection::unused_peer_cid() noexcept {
+    PeerCid *best = nullptr;
+    for (PeerCid &c : peer_cids_)
+        if (c.active && !c.used && (best == nullptr || c.seq < best->seq)) best = &c;
+    return best;
+}
+
+bool Connection::assign_peer_cid(size_t i, bool may_share) noexcept {
+    PathState &p = paths_[i];
+    // \~english A zero-length ID is the same everywhere: there is nothing to choose.
+    // \~spanish Un identificador de longitud cero es el mismo en todas partes: no hay nada que elegir.  \~
+    if (cfg_.peer_cid_len == 0) {
+        p.peer_seq = peer_seq_in_use_;
+        return true;
+    }
+    /* \~english
+     * 9.5: a peer that reached this end on a new address with the same ID
+     * it used before -- a NAT rebinding, not a move -- MAY go on being sent
+     * that path's ID.  Anything else gets one never used anywhere.
+     * \~spanish
+     * 9.5: a un otro que llego a este extremo desde una direccion nueva con el
+     * mismo identificador que antes -- un cambio de NAT, no una mudanza -- PUEDE
+     * seguir mandandosele el identificador de aquel camino.  Cualquier otro caso
+     * recibe uno no usado en ningun sitio.
+     * \~ */
+    if (may_share && p.local_seq_seen != kNever)
+        for (size_t j = 0; j < kMaxPaths; ++j) {
+            const PathState &q = paths_[j];
+            if (j == i || !q.used || q.peer_seq == kNever || q.local_seq_seen != p.local_seq_seen) continue;
+            p.peer_seq = q.peer_seq;
+            return true;
+        }
+    PeerCid *c = unused_peer_cid();
+    if (c == nullptr) return false;
+    c->used = true;
+    p.peer_seq = c->seq;
+    return true;
+}
+
+uint64_t Connection::local_seq_of(const uint8_t *cid, size_t len) const noexcept {
+    if (len != cfg_.local_cid_len) return kNever;
+    for (const LocalCid &l : local_cids_)
+        if (l.active && bytes_equal(l.cid, cid, len)) return l.seq;
+    return kNever;
+}
+
+uint64_t Connection::initial_pto() const noexcept {
+    // \~english The PTO of a path with no sample yet: kInitialRtt (RFC 9002, 6.2.2).
+    // \~spanish El PTO de un camino aun sin muestra: kInitialRtt (RFC 9002, 6.2.2).  \~
+    return kInitialRttUs + max64(4 * (kInitialRttUs / 2), kGranularityUs) + cfg_.recovery.max_ack_delay_us;
+}
+
+bool Connection::start_validation(size_t i, uint64_t now_us) noexcept {
+    /* \~english
+     * 8.2.4: abandoned after three times the larger of the current PTO and
+     * a new path's; challenges repeated no faster than the PTO, doubling
+     * each time (8.2.1, 9.4).  Each challenge carries new data.
+     * \~spanish
+     * 8.2.4: se abandona tras tres veces el mayor del PTO actual y el de un
+     * camino nuevo; los desafios se repiten no mas deprisa que el PTO, doblando
+     * cada vez (8.2.1, 9.4).  Cada desafio lleva datos nuevos.
+     * \~ */
+    PathState &p = paths_[i];
+    const uint64_t pto = max64(pto_duration(), initial_pto());
+    p.challenging = true;
+    p.challenge_owed = true;
+    p.challenges = 0;
+    p.challenge_interval = pto;
+    p.next_challenge_at = kNever;
+    p.validation_deadline = now_us + 3 * pto;
+    return true;
+}
+
+void Connection::on_path_response(const uint8_t *data, uint64_t now_us) noexcept {
+    // \~english An answer on any path validates the path its challenge went on (8.2.3).
+    // \~spanish Una respuesta por cualquier camino valida el camino por el que fue su desafio (8.2.3).  \~
+    for (size_t i = 0; i < kMaxPaths; ++i) {
+        PathState &p = paths_[i];
+        if (!p.used || !p.challenging) continue;
+        const size_t kept = p.challenges < kChallengesKept ? p.challenges : kChallengesKept;
+        for (size_t k = 0; k < kept; ++k)
+            if (bytes_equal(p.challenge[k], data, kPathDataSize)) {
+                path_validated(i, p.challenge_full[k], now_us);
+                return;
+            }
+    }
+    // \~english 19.18 allows PROTOCOL_VIOLATION; a late answer to an abandoned check is not worth it.
+    // \~spanish 19.18 permite PROTOCOL_VIOLATION; una respuesta tardia a una comprobacion abandonada no lo merece.  \~
+    ++path_counts_.stray_responses;
+}
+
+void Connection::path_validated(size_t i, bool full, uint64_t now_us) noexcept {
+    PathState &p = paths_[i];
+    p.validated = true;
+    p.challenging = false;
+    p.challenge_owed = false;
+    p.challenges = 0;
+    p.next_challenge_at = kNever;
+    p.validation_deadline = kNever;
+    ++path_counts_.validated;
+
+    // \~english An answer to a challenge under 1200 bytes proves the address, not the MTU: once more, full size (8.2.3).
+    // \~spanish La respuesta a un desafio de menos de 1200 bytes prueba la direccion, no la MTU: otra vez, a tamano completo (8.2.3).  \~
+    if (!full) {
+        ++path_counts_.revalidated_mtu;
+        start_validation(i, now_us);
+    }
+
+    if (i != active_) return;
+    recovery_.set_amplification_blocked(false, now_us);
+    // \~english The peer's new address is proven: congestion control and RTT start over on it (9.4).
+    // \~spanish La direccion nueva del otro esta probada: control de congestion y RTT empiezan de cero en ella (9.4).  \~
+    if (cc_path_ != i) {
+        recovery_.on_new_path(now_us);
+        cc_path_ = i;
+        ++path_counts_.congestion_resets;
+    }
+}
+
+void Connection::switch_to(size_t i, uint64_t now_us) noexcept {
+    const size_t old = active_;
+    if (i == old) return;
+    // \~english The last proven path is where to go back if this one is not proven (9.3.2).
+    // \~spanish El ultimo camino probado es a donde volver si este no se prueba (9.3.2).  \~
+    if (paths_[old].validated) fallback_ = old;
+    active_ = i;
+    PathState &p = paths_[i];
+
+    if (p.peer_seq == kNever && !assign_peer_cid(i, cfg_.is_server)) ++path_counts_.no_connection_id;
+    if (p.peer_seq != kNever)
+        if (PeerCid *c = peer_cid_by_seq(p.peer_seq)) use_peer_cid(*c);
+
+    if (!p.validated && !p.challenging) start_validation(i, now_us);
+    if (p.validated && cc_path_ != i) {
+        recovery_.on_new_path(now_us);
+        cc_path_ = i;
+        ++path_counts_.congestion_resets;
+    }
+    const size_t budget = amplification_budget(i);
+    recovery_.set_amplification_blocked(budget != static_cast<size_t>(-1) && budget < 64, now_us);
+}
+
+void Connection::run_path_timers(uint64_t now_us) noexcept {
+    for (size_t i = 0; i < kMaxPaths; ++i) {
+        PathState &p = paths_[i];
+        if (!p.used || !p.challenging) continue;
+        if (now_us < p.validation_deadline) {
+            if (!p.challenge_owed && p.next_challenge_at <= now_us) {
+                p.challenge_owed = true;
+                p.next_challenge_at = kNever;
+            }
+            continue;
+        }
+
+        // \~english Time is up: the path is unusable (8.2.4).
+        // \~spanish Se acabo el tiempo: el camino no sirve (8.2.4).  \~
+        p.challenging = false;
+        p.challenge_owed = false;
+        p.challenges = 0;
+        p.next_challenge_at = kNever;
+        p.validation_deadline = kNever;
+        ++path_counts_.abandoned;
+
+        /* \~english
+         * An address proven before and only checked again -- its MTU, or the
+         * old path after a migration (9.3.3) -- stays proven: it is still
+         * "the last validated peer address" 9.3.2 falls back to.
+         * \~spanish
+         * Una direccion probada antes y solo comprobada otra vez -- su MTU, o el
+         * camino viejo tras una migracion (9.3.3) -- sigue probada: sigue siendo
+         * "la ultima direccion validada del otro" a la que vuelve 9.3.2.
+         * \~ */
+        if (p.validated) continue;
+        if (i == active_) {
+            /* \~english
+             * 9.3.2: back to the last validated peer address -- or, with none,
+             * close silently, discarding all state.
+             * \~spanish
+             * 9.3.2: de vuelta a la ultima direccion validada del otro -- o, si no
+             * hay ninguna, cerrar en silencio, tirando todo el estado.
+             * \~ */
+            if (fallback_ == kNoPath || !paths_[fallback_].validated) {
+                state_ = ConnState::Closed;
+                return;
+            }
+            ++path_counts_.reverted;
+            const size_t back = fallback_;
+            fallback_ = kNoPath;
+            switch_to(back, now_us);
+        }
+        free_path(i);
+    }
+}
+
+uint64_t Connection::path_timer() const noexcept {
+    uint64_t t = kNever;
+    for (const PathState &p : paths_) {
+        if (!p.used || !p.challenging) continue;
+        t = min64(t, p.validation_deadline);
+        if (!p.challenge_owed) t = min64(t, p.next_challenge_at);
+    }
+    return t;
+}
+
+Migration Connection::check_migration(const Path &p) const noexcept {
+    if (cfg_.is_server) return Migration::NotClient;
+    if (!confirmed_) return Migration::NotConfirmed;
+    if (cfg_.peer_disable_active_migration) return Migration::Disabled;
+    if (cfg_.peer_cid_len == 0) return Migration::ZeroLengthId;
+    if (!same_address(p.peer, paths_[active_].addr.peer)) return Migration::UnknownServer;
+    if (same_path(p, paths_[active_].addr)) return Migration::SamePath;
+    return Migration::Started;
+}
+
+Migration Connection::probe_path(const Path &path, uint64_t now_us) noexcept {
+    const Migration m = check_migration(path);
+    if (m != Migration::Started) return m;
+    size_t i = find_path(path);
+    if (i == kNoPath) {
+        // \~english A new local address needs an ID of the peer's never used before (9.5).
+        // \~spanish Una direccion local nueva necesita un identificador del otro nunca usado antes (9.5).  \~
+        if (unused_peer_cid() == nullptr) return Migration::NoConnectionId;
+        i = claim_path(path, now_us);
+        assign_peer_cid(i, false);
+    }
+    if (!paths_[i].challenging) start_validation(i, now_us);
+    return Migration::Started;
+}
+
+Migration Connection::migrate(const Path &path, uint64_t now_us) noexcept {
+    const Migration m = check_migration(path);
+    if (m != Migration::Started) return m;
+    size_t i = find_path(path);
+    if (i == kNoPath) {
+        if (unused_peer_cid() == nullptr) return Migration::NoConnectionId;
+        i = claim_path(path, now_us);
+    }
+    if (paths_[i].peer_seq == kNever && !assign_peer_cid(i, false)) return Migration::NoConnectionId;
+    ++path_counts_.migrations;
+    switch_to(i, now_us);
+    return Migration::Started;
 }
 
 void Connection::close(uint64_t code, bool application, uint64_t trigger_frame,
@@ -1052,12 +1410,52 @@ void Connection::on_lost(Space space, const SentPacket &p) noexcept {
     rec->tag = 0;
 }
 
-void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) noexcept {
+void Connection::on_datagram(const Path &path, uint8_t *data, size_t n, Ecn ecn,
+                             uint64_t now_us) noexcept {
     if (state_ == ConnState::Closed) return;
-
-    // \~english Every byte counts toward what a server may send back, processed or not (8.1).
-    // \~spanish Cada byte cuenta para lo que un servidor puede devolver, se procese o no (8.1).  \~
     bytes_in_ += n;
+    rx_addr_ = path;
+    rx_path_ = find_path(path);
+
+    if (rx_path_ == kNoPath) {
+        /* \~english
+         * An address never seen.  A client MUST discard it: the server does
+         * not move (9, 9.6).  A server lets the peer move once the handshake
+         * is confirmed -- the addresses are stable until then (9) -- and not
+         * at all if it said so (disable_active_migration), dropping without a
+         * stateless reset in both cases (9).  The datagram only gets a path if
+         * one of its packets opens: bytes nobody can authenticate take no
+         * place in the table.
+         * \~spanish
+         * Una direccion nunca vista.  Un cliente DEBE descartarla: el servidor no
+         * se mueve (9, 9.6).  Un servidor deja moverse al otro en cuanto se
+         * confirma el saludo -- hasta entonces las direcciones son estables (9) --,
+         * y nunca si dijo que no (disable_active_migration), tirando sin reinicio
+         * sin estado en los dos casos (9).  El datagrama solo recibe un camino si
+         * se abre alguno de sus paquetes: bytes que nadie puede autenticar no
+         * ocupan sitio en la tabla.
+         * \~ */
+        if (!cfg_.is_server) {
+            ++path_counts_.unknown_address;
+            return;
+        }
+        if (!confirmed_) {
+            ++path_counts_.before_confirmed;
+            return;
+        }
+        if (cfg_.disable_active_migration) {
+            ++path_counts_.migration_disabled;
+            return;
+        }
+        if (state_ != ConnState::Active) {
+            ++drops_.after_close;
+            return;
+        }
+    } else {
+        // \~english Every byte counts toward what may be sent back to that address, processed or not (8).
+        // \~spanish Cada byte cuenta para lo que se puede devolver a esa direccion, se procese o no (8).  \~
+        paths_[rx_path_].bytes_in += n;
+    }
     if (state_ == ConnState::Draining) {
         ++drops_.after_close;
         return;
@@ -1123,14 +1521,15 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
     // \~english The peer has no such connection: drain, and send nothing more (10.3.1).
     // \~spanish El otro no tiene esta conexion: drenar, y no mandar nada mas (10.3.1).  \~
     if (maybe_reset && drops_.bad_header + drops_.wrong_cid + drops_.forged != failed_before &&
-        check_stateless_reset(tail)) {
+        check_stateless_reset(tail, path.peer)) {
         closed_by_reset_ = true;
         state_ = ConnState::Draining;
         close_deadline_ = now_us + 3 * pto_duration();
         return;
     }
 
-    if (!validated_) recovery_.set_amplification_blocked(amplification_budget() == 0, now_us);
+    const size_t budget = amplification_budget(active_);
+    if (budget != static_cast<size_t>(-1)) recovery_.set_amplification_blocked(budget == 0, now_us);
 
     /* \~english
      * RFC 9002, 6.2.2.1: when what arrived unblocks a server at its
@@ -1317,9 +1716,18 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     packet_dcid_ = dcid;
     packet_dcid_len_ = h.dcid.len;
 
+    // \~english An authenticated packet from a new address: now it gets a path, with what came on it (8).
+    // \~spanish Un paquete autenticado desde una direccion nueva: ahora recibe un camino, con lo que llego por el (8).  \~
+    if (rx_path_ == kNoPath) {
+        rx_path_ = claim_path(rx_addr_, now_us);
+        if (datagram_len_ != static_cast<size_t>(-1)) paths_[rx_path_].bytes_in += datagram_len_;
+    }
+
     bool eliciting = false;
-    if (!process_frames(s, p + u.payload.off, u.payload.len, h.type, eliciting, now_us))
+    bool probing = true;
+    if (!process_frames(s, p + u.payload.off, u.payload.len, h.type, eliciting, probing, now_us))
         return false;
+    if (!on_packet_path(s, u.pn, probing, dcid, h.dcid.len, now_us)) return false;
 
     acks_[idx(s)].on_received(u.pn, eliciting, ecn, arrival_us_);
     restart_idle(now_us);
@@ -1335,12 +1743,55 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
      * las claves Initial en cuanto tiene uno (RFC 9001, 4.9.1).
      * \~ */
     if (cfg_.is_server && s == Space::Handshake) {
-        if (!validated_) {
-            validated_ = true;
+        if (!paths_[rx_path_].validated) {
+            paths_[rx_path_].validated = true;
             recovery_.set_amplification_blocked(false, now_us);
         }
         discard_keys(Space::Initial, now_us);
     }
+    return true;
+}
+
+bool Connection::on_packet_path(Space s, uint64_t pn, bool probing, const uint8_t *dcid,
+                                size_t dcid_len, uint64_t now_us) noexcept {
+    PathState &p = paths_[rx_path_];
+    p.last_used = now_us;
+    // \~english Paths change only in 1-RTT: the handshake's addresses are fixed (9).
+    // \~spanish Los caminos solo cambian en 1-RTT: las direcciones del saludo son fijas (9).  \~
+    if (s != Space::Application) return true;
+    const uint64_t seq = local_seq_of(dcid, dcid_len);
+    if (seq != kNever) p.local_seq_seen = seq;
+
+    if (probing) {
+        // \~english 9.6.3: a server SHOULD validate a client address a probe came from.
+        // \~spanish 9.6.3: un servidor DEBERIA validar la direccion de cliente de la que llego un sondeo.  \~
+        if (cfg_.is_server && rx_path_ != active_ && !p.validated && !p.challenging)
+            start_validation(rx_path_, now_us);
+        return true;
+    }
+
+    // \~english Only the highest-numbered non-probing packet counts: a reordered one moves nothing (9.3).
+    // \~spanish Solo cuenta el paquete no de sondeo de numero mas alto: uno reordenado no mueve nada (9.3).  \~
+    if (largest_nonprobing_pn_ != kNever && pn <= largest_nonprobing_pn_) return true;
+    largest_nonprobing_pn_ = pn;
+    if (rx_path_ == active_ || !cfg_.is_server) return true;
+
+    /* \~english
+     * The client moved (9.3): everything goes to the new address from now
+     * on, which is validated unless it already was -- and so is the one it
+     * left, because an attacker forwarding copies looks exactly like this
+     * and a challenge on the old path is what brings the real peer back
+     * (9.3.3).
+     * \~spanish
+     * El cliente se movio (9.3): todo va a la direccion nueva desde ahora, que se
+     * valida salvo que ya lo estuviera -- y tambien la que dejo, porque un
+     * atacante que reenvia copias se ve exactamente asi y un desafio en el camino
+     * viejo es lo que trae de vuelta al otro de verdad (9.3.3).
+     * \~ */
+    const size_t old = active_;
+    ++path_counts_.peer_migrations;
+    switch_to(rx_path_, now_us);
+    if (paths_[old].used && !paths_[old].challenging) start_validation(old, now_us);
     return true;
 }
 
@@ -1469,7 +1920,7 @@ void Connection::process_retry(const uint8_t *p, const PacketHeader &h, uint64_t
 }
 
 bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, PacketType type,
-                                bool &eliciting, uint64_t now_us) noexcept {
+                                bool &eliciting, bool &probing, uint64_t now_us) noexcept {
     FrameContext ctx;
     ctx.packet = type;
     ctx.is_server = cfg_.is_server;
@@ -1487,6 +1938,11 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
         if (f.type != FrameType::Ack && f.type != FrameType::Padding &&
             f.type != FrameType::ConnectionClose)
             eliciting = true;
+        // \~english 9.1: these four are probing frames; a packet with any other is non-probing.
+        // \~spanish 9.1: estas cuatro son tramas de sondeo; un paquete con cualquier otra no es de sondeo.  \~
+        if (f.type != FrameType::PathChallenge && f.type != FrameType::PathResponse &&
+            f.type != FrameType::NewConnectionId && f.type != FrameType::Padding)
+            probing = false;
 
         switch (f.type) {
         case FrameType::Padding:
@@ -1494,7 +1950,10 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
         case FrameType::DataBlocked:
         case FrameType::StreamsBlocked:
         case FrameType::NewToken:
+            break;
+
         case FrameType::PathResponse:
+            on_path_response(payload + f.data.off, now_us);
             break;
 
         case FrameType::NewConnectionId:
@@ -1586,12 +2045,28 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
             if (!on_retire_connection_id(f, now_us)) return false;
             break;
 
-        case FrameType::PathChallenge:
-            // \~english MUST be answered with the same data (19.17); the latest wins.
-            // \~spanish DEBE contestarse con los mismos datos (19.17); gana el ultimo.  \~
-            util::vesta_memcpy(path_response_, payload + f.data.off, kPathDataSize);
-            path_response_owed_ = true;
+        case FrameType::PathChallenge: {
+            /* \~english
+             * MUST be answered with the same data (19.17), on the path it came
+             * on (8.2.2).  A peer sending more than fit before the next
+             * datagram gets its latest answered; it sends more as needed.
+             * \~spanish
+             * DEBE contestarse con los mismos datos (19.17), por el camino por el
+             * que llego (8.2.2).  A un otro que manda mas de los que caben antes
+             * del siguiente datagrama se le contesta el ultimo; manda mas si hace
+             * falta.
+             * \~ */
+            PathState &path = paths_[rx_path_];
+            if (path.responses == kResponsesOwed) {
+                --path.responses;
+                ++path_counts_.responses_dropped;
+            }
+            util::vesta_memcpy(path.response[path.responses++], payload + f.data.off, kPathDataSize);
+            // \~english On the path in use it also gets a non-probing packet back (9.3.3).
+            // \~spanish Por el camino en uso recibe ademas un paquete no de sondeo (9.3.3).  \~
+            if (rx_path_ == active_) nonprobing_owed_ = true;
             break;
+        }
 
         case FrameType::ConnectionClose:
             // \~english The peer closed: drain, send nothing (10.2.2).
@@ -1693,14 +2168,6 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
             --retire_owed_count_;
             ++sent_.retire_connection_id;
             add_record(rec, kRecRetireCid, seq, 0, 0, false);
-        }
-        if (path_response_owed_ && (n = write_path_response(p + used, room - used, path_response_)) != 0) {
-            // \~english Never retransmitted: a new challenge brings a new response (8.2.2).
-            // \~spanish No se retransmite nunca: un desafio nuevo trae una respuesta nueva (8.2.2).  \~
-            used += n;
-            eliciting = true;
-            path_response_owed_ = false;
-            ++sent_.path_response;
         }
         /* \~english
          * New limits are computed first and COMMITTED only once their frame is
@@ -1840,7 +2307,88 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
         }
         if (eliciting) probe_owed_[idx(s)] = false;
     }
+
+    // \~english Any 1-RTT packet on the path in use is non-probing; a PING if there is nothing else (9.3.3).
+    // \~spanish Cualquier paquete 1-RTT por el camino en uso es no de sondeo; un PING si no hay nada mas (9.3.3).  \~
+    if (s == Space::Application && nonprobing_owed_) {
+        if (used == 0 && (n = write_ping(p, room)) != 0) {
+            used += n;
+            eliciting = true;
+            ++sent_.ping;
+        }
+        if (used != 0) nonprobing_owed_ = false;
+    }
     return used;
+}
+
+size_t Connection::write_probe_frames(PathState &path, uint8_t *p, size_t room, bool full) noexcept {
+    size_t used = 0;
+    size_t n;
+    // \~english Each response exactly once, never retransmitted: a new challenge brings a new one (8.2.2, 13.3).
+    // \~spanish Cada respuesta exactamente una vez, nunca retransmitida: un desafio nuevo trae otra (8.2.2, 13.3).  \~
+    while (path.responses != 0 && (n = write_path_response(p + used, room - used, path.response[0])) != 0) {
+        used += n;
+        --path.responses;
+        if (path.responses != 0) util::vesta_memcpy(path.response[0], path.response[1], kPathDataSize);
+        ++path_counts_.responses_sent;
+    }
+    // \~english At most one challenge per packet (8.2.1), with data nobody can predict.
+    // \~spanish Como mucho un desafio por paquete (8.2.1), con datos que nadie pueda predecir.  \~
+    if (path.challenge_owed) {
+        const size_t k = path.challenges % kChallengesKept;
+        uint8_t data[kPathDataSize];
+        if (crypto_.random(data, sizeof data) &&
+            (n = write_path_challenge(p + used, room - used, data)) != 0) {
+            util::vesta_memcpy(path.challenge[k], data, kPathDataSize);
+            path.challenge_full[k] = full;
+            if (path.challenges < 0xff) ++path.challenges;
+            used += n;
+            path.challenge_owed = false;
+            ++path_counts_.challenges_sent;
+        }
+    }
+    return used;
+}
+
+size_t Connection::build_probe(size_t i, uint8_t *out, size_t room, uint64_t now_us) noexcept {
+    PathState &p = paths_[i];
+    // \~english The path's own ID of the peer's (9.5); without one nothing can go there.
+    // \~spanish El identificador del otro propio del camino (9.5); sin el no puede ir nada alli.  \~
+    if (p.peer_seq == kNever && !assign_peer_cid(i, cfg_.is_server)) {
+        ++path_counts_.no_connection_id;
+        path_counts_.responses_dropped += p.responses;
+        p.responses = 0;
+        p.challenge_owed = false;
+        return 0;
+    }
+    const PeerCid *dest = peer_cid_by_seq(p.peer_seq);
+    if (dest == nullptr) return 0;
+
+    /* \~english
+     * Expanded to 1200 bytes (8.2.1, 8.2.2) -- unless the address is not
+     * proven and that would pass three times what came from it: then a
+     * response goes as it is, and a challenge too, whose path's MTU is then
+     * checked again once the address is proven.  Not even that: a response
+     * is dropped, and said.
+     * \~spanish
+     * Ampliado a 1200 bytes (8.2.1, 8.2.2) -- salvo que la direccion no este
+     * probada y eso pase de tres veces lo que llego de ella: entonces una
+     * respuesta va tal cual, y un desafio tambien, y la MTU de su camino se
+     * comprueba otra vez cuando la direccion este probada.  Ni siquiera eso:
+     * la respuesta se tira, y se dice.
+     * \~ */
+    size_t r = static_cast<size_t>(min64(room, cfg_.max_datagram));
+    const size_t budget = amplification_budget(i);
+    if (budget < r) r = budget;
+    if (r < 64) {
+        path_counts_.responses_dropped += p.responses;
+        p.responses = 0;
+        return 0;
+    }
+    const bool full = r >= kMinInitial;
+    bool padded = false;
+    return build_packet(Space::Application, out, r, full ? Pad::Always : Pad::Never, padded, now_us, &p,
+                        dest);
 }
 
 void Connection::write_blocked(uint8_t *p, size_t room, size_t &used, PacketRecord &rec,
@@ -1913,7 +2461,7 @@ void Connection::write_blocked(uint8_t *p, size_t room, size_t &used, PacketReco
 }
 
 size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, bool &padded,
-                                uint64_t now_us) noexcept {
+                                uint64_t now_us, PathState *probe, const PeerCid *dest) noexcept {
     padded = false;
     if (!recovery_.can_record(s) && state_ != ConnState::Closing) return 0;
 
@@ -2016,10 +2564,19 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
          * valor aleatorio: uno por identificador de conexion, sorteado otra vez
          * cada vez que cambia el identificador, asi que no enlaza nada.
          * \~ */
-        out[h++] = static_cast<uint8_t>(0x40 | (spin_bit_ ? 0x20 : 0x00) |
+        // \~english A probe goes with its path's ID, and a spin bit drawn for it alone.
+        // \~spanish Un sondeo va con el identificador de su camino, y un bit de espin sorteado solo para el.  \~
+        bool spin = spin_bit_;
+        if (probe != nullptr) {
+            uint8_t r = 0;
+            spin = crypto_.random(&r, 1) && (r & 1) != 0;
+        }
+        out[h++] = static_cast<uint8_t>(0x40 | (spin ? 0x20 : 0x00) |
                                         (one_rtt_.write_phase ? 0x04 : 0x00));
-        util::vesta_memcpy(out + h, cfg_.peer_cid, cfg_.peer_cid_len);
-        h += cfg_.peer_cid_len;
+        const uint8_t *dcid = dest != nullptr ? dest->cid : cfg_.peer_cid;
+        const size_t dcid_len = dest != nullptr ? dest->len : cfg_.peer_cid_len;
+        util::vesta_memcpy(out + h, dcid, dcid_len);
+        h += dcid_len;
     }
     const size_t pn_offset = h;
     const size_t overhead = pn_offset + pn_len + kTagSize;
@@ -2033,7 +2590,19 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     uint8_t *payload = out + pn_offset + pn_len;
     const size_t payload_room = room - overhead;
 
-    size_t len = write_frames(s, payload, payload_room, rec, eliciting, ack_largest, now_us);
+    size_t len = 0;
+    if (probe != nullptr) {
+        len = write_probe_frames(*probe, payload, payload_room, pad == Pad::Always);
+        eliciting = len != 0;
+        // \~english The next challenge no sooner than the interval, which doubles (8.2.1, 9.4).
+        // \~spanish El siguiente desafio no antes del intervalo, que se dobla (8.2.1, 9.4).  \~
+        if (len != 0 && probe->challenging && !probe->challenge_owed && probe->next_challenge_at == kNever) {
+            probe->next_challenge_at = now_us + probe->challenge_interval;
+            probe->challenge_interval *= 2;
+        }
+    } else {
+        len = write_frames(s, payload, payload_room, rec, eliciting, ack_largest, now_us);
+    }
     if (len == 0) return 0;
 
     // \~english Padding to a full datagram where 14.1 requires it.
@@ -2085,6 +2654,7 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     const size_t size = overhead + len;
     ++next_pn_[i];
     bytes_out_ += size;
+    (probe != nullptr ? *probe : paths_[active_]).bytes_out += size;
 
     if (s == Space::Application) {
         OneRtt &o = one_rtt_;
@@ -2103,12 +2673,21 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     }
 
     if (state_ != ConnState::Closing) {
-        // \~english PADDING keeps a packet in flight even without an ack-eliciting frame.
-        // \~spanish PADDING mantiene un paquete en vuelo aunque no lleve tramas que pidan confirmacion.  \~
+        /* \~english
+         * PADDING keeps a packet in flight even without an ack-eliciting
+         * frame.  Path probes do not count at all: 9.4 lets their loss be
+         * detected on its own -- by the path's challenge timer -- rather than
+         * shrink the window of the path in use.
+         * \~spanish
+         * PADDING mantiene un paquete en vuelo aunque no lleve tramas que pidan
+         * confirmacion.  Los sondeos de camino no cuentan en absoluto: 9.4 deja
+         * que su perdida se detecte aparte -- con el temporizador de desafios del
+         * camino -- en vez de encoger la ventana del camino en uso.
+         * \~ */
         const bool in_flight = eliciting || padded;
         records_[rec.tag % record_cap_] = rec;
         ++next_tag_;
-        recovery_.on_packet_sent(s, pn, static_cast<uint32_t>(size), eliciting, in_flight,
+        recovery_.on_packet_sent(s, pn, static_cast<uint32_t>(size), eliciting, in_flight, probe != nullptr,
                                  rec.tag, ack_largest, now_us);
         /* \~english
          * Sending restarts the idle timer only for the first ack-eliciting
@@ -2132,15 +2711,44 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     return size;
 }
 
-size_t Connection::build_datagram(uint8_t *out, size_t room, uint64_t now_us) noexcept {
+size_t Connection::build_datagram(Path &path, uint8_t *out, size_t room, uint64_t now_us) noexcept {
     if (state_ == ConnState::Closed || state_ == ConnState::Draining) return 0;
     streams_.collect();
 
+    /* \~english
+     * Path validation first, each path its own datagram: a PATH_RESPONSE
+     * MUST NOT wait (8.2.2), and a challenge that is due has already waited
+     * its interval.  Only probing frames go there: a path that is not the
+     * one in use gets no non-probing packet until the peer sends one on it
+     * (9).
+     * \~spanish
+     * Primero la validacion de caminos, cada camino con su propio datagrama: un
+     * PATH_RESPONSE NO DEBE esperar (8.2.2), y un desafio que toca ya espero su
+     * intervalo.  Alli solo van tramas de sondeo: un camino que no es el que esta
+     * en uso no recibe ningun paquete no de sondeo hasta que el otro mande uno
+     * por el (9).
+     * \~ */
+    if (state_ == ConnState::Active && keys_[idx(Space::Application)].have) {
+        for (size_t i = 0; i < kMaxPaths; ++i) {
+            PathState &p = paths_[i];
+            if (!p.used || (p.responses == 0 && !p.challenge_owed)) continue;
+            const size_t n = build_probe(i, out, room, now_us);
+            if (n != 0) {
+                path = p.addr;
+                return n;
+            }
+        }
+    }
+
+    // \~english Everything else, on the path in use -- with its own ID of the peer's, or not at all (9.5).
+    // \~spanish Todo lo demas, por el camino en uso -- con su propio identificador del otro, o nada (9.5).  \~
+    if (paths_[active_].peer_seq == kNever) return 0;
+    path = paths_[active_].addr;
     room = static_cast<size_t>(min64(room, cfg_.max_datagram));
-    const size_t budget = amplification_budget();
+    const size_t budget = amplification_budget(active_);
     if (budget < room) room = budget;
     if (room < 64) {
-        if (!validated_) recovery_.set_amplification_blocked(true, now_us);
+        if (budget != static_cast<size_t>(-1)) recovery_.set_amplification_blocked(true, now_us);
         return 0;
     }
 
@@ -2215,6 +2823,7 @@ uint64_t Connection::timer() const noexcept {
     if (state_ != ConnState::Active) return close_deadline_;
 
     uint64_t t = min64(min64(idle_deadline_, recovery_.timer()), one_rtt_.prev_until);
+    t = min64(t, path_timer());
 
     /* \~english
      * An ACK that cannot be sent is no reason to wake: a server at its
@@ -2225,7 +2834,7 @@ uint64_t Connection::timer() const noexcept {
      * su limite de amplificacion no puede mandar nada hasta que llegue mas, y un
      * temporizador clavado en "ahora" daria vueltas sin fin.
      * \~ */
-    if (amplification_budget() < 64) return t;
+    if (amplification_budget(active_) < 64) return t;
     for (size_t s = 0; s < kSpaces; ++s)
         if (keys_[s].have) t = min64(t, acks_[s].ack_deadline());
     return t;
@@ -2254,6 +2863,8 @@ void Connection::on_timer(uint64_t now_us) noexcept {
         ++key_counts_.old_discarded;
     }
 
+    run_path_timers(now_us);
+    if (state_ != ConnState::Active) return;
     run_loss_timer(now_us);
 }
 

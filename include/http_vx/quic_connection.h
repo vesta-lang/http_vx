@@ -44,9 +44,17 @@
  * ends in the token of an ID in use tells this end that the peer lost the
  * connection (10.3).
  *
+ * **Every datagram carries its path** (8.2, 9): the addresses at both ends,
+ * as the host gives them.  A peer address is validated with PATH_CHALLENGE
+ * before more than three times what came from it is sent there; a client
+ * that moves is followed on its highest-numbered non-probing packet, with an
+ * ID never used on another path, and congestion control starts over once
+ * its address is proven.  A move that is not proven falls back to the last
+ * validated address.  A client moves or probes a new local address itself.
+ *
  * This is the core the rest stands on, and it is not the whole of QUIC.  What
- * follows, in this order, each with its own tests: paths and migration; and
- * the TLS handshake with 0-RTT.  Until the handshake is here, the connection
+ * follows, each with its own tests, is the TLS handshake with 0-RTT, which
+ * brings the transport parameters.  Until the handshake is here, the connection
  * takes secrets through `install_secrets` and learns that the handshake is
  * done through `handshake_confirmed` -- which is exactly what the handshake
  * will call.
@@ -83,9 +91,18 @@
  * el que usa.  Un datagrama que acaba en el testigo de un identificador en uso le
  * dice a este extremo que el otro perdio la conexion (10.3).
  *
+ * **Cada datagrama lleva su camino** (8.2, 9): las direcciones de los dos
+ * extremos, como las da el anfitrion.  La direccion del otro se valida con
+ * PATH_CHALLENGE antes de mandarle mas de tres veces lo que llego de ella; a un
+ * cliente que se mueve se le sigue con su paquete no de sondeo de numero mas
+ * alto, con un identificador nunca usado en otro camino, y el control de
+ * congestion empieza de cero cuando su direccion queda probada.  Una mudanza
+ * que no se prueba vuelve a la ultima direccion validada.  Un cliente se mueve
+ * o sondea una direccion local nueva por si mismo.
+ *
  * Este es el nucleo sobre el que se apoya el resto, y no es todo QUIC.  Lo que
- * sigue, en este orden, cada cosa con sus pruebas: los caminos y la migracion; y
- * el saludo de TLS con 0-RTT.  Hasta que el saludo este aqui, la conexion recibe
+ * sigue, con sus pruebas, es el saludo de TLS con 0-RTT, que trae los
+ * parametros de transporte.  Hasta que el saludo este aqui, la conexion recibe
  * los secretos por `install_secrets` y se entera de que el saludo acabo por
  * `handshake_confirmed` -- que es justo lo que llamara el saludo.
  * \~
@@ -97,6 +114,7 @@
 #include "http_vx/quic_crypto.h"
 #include "http_vx/quic_frame.h"
 #include "http_vx/quic_packet.h"
+#include "http_vx/quic_path.h"
 #include "http_vx/quic_protection.h"
 #include "http_vx/quic_recovery.h"
 #include "http_vx/quic_reset.h"
@@ -213,7 +231,116 @@ struct ConnectionConfig {
     /// \~spanish El testigo de reinicio del primer identificador del otro, si se sabe (el de un servidor, de sus parametros de transporte).  \~
     uint8_t peer_reset_token[kResetTokenSize] = {};
     bool peer_reset_token_known = false;
+
+    /**
+     * \~english
+     * The path the handshake runs on: a client's own address and the
+     * server's; a server's own address and the client's, as the acceptor saw
+     * them.  The addresses are the host's, opaque; see quic_path.h.
+     * \~spanish
+     * El camino por el que va el saludo: la direccion propia de un cliente y la
+     * del servidor; la propia de un servidor y la del cliente, como las vio el
+     * acceptor.  Las direcciones son las del anfitrion, opacas; ver
+     * quic_path.h.
+     * \~
+     */
+    Path path;
+
+    /**
+     * \~english
+     * disable_active_migration (18.2): a server that announces it drops the
+     * packets of a client that moves anyway -- without a stateless reset, so
+     * that no third party can end the connection by forging an address (9).
+     * On a client, the peer's: it may not move.  Both come with the transport
+     * parameters; until then they are set here.
+     * \~spanish
+     * disable_active_migration (18.2): un servidor que lo anuncia tira los
+     * paquetes de un cliente que se mueva igualmente -- sin reinicio sin estado,
+     * para que nadie ajeno pueda acabar la conexion falsificando una direccion
+     * (9).  En un cliente, el del otro: no puede moverse.  Los dos llegan con los
+     * parametros de transporte; hasta entonces se ponen aqui.
+     * \~
+     */
+    bool disable_active_migration = false;
+    bool peer_disable_active_migration = false;
 };
+
+/**
+ * @brief
+ * \~english What happened on paths, counted.
+ * \~spanish Lo que paso en los caminos, contado.
+ * \~
+ */
+struct PathCounts {
+    /// \~english PATH_CHALLENGE and PATH_RESPONSE frames sent.  \~spanish Tramas PATH_CHALLENGE y PATH_RESPONSE mandadas.  \~
+    uint64_t challenges_sent = 0;
+    uint64_t responses_sent = 0;
+    /// \~english Validations that succeeded, and those abandoned when their time ran out (8.2.4).
+    /// \~spanish Validaciones que salieron bien, y las abandonadas al acabarse su tiempo (8.2.4).  \~
+    uint64_t validated = 0;
+    uint64_t abandoned = 0;
+    /// \~english Validations repeated in a full-size datagram because the first could not be (8.2.1).
+    /// \~spanish Validaciones repetidas en un datagrama de tamano completo porque la primera no pudo serlo (8.2.1).  \~
+    uint64_t revalidated_mtu = 0;
+    /// \~english The peer moved (9.3), and this end moved (9.2).  \~spanish El otro se movio (9.3), y este extremo se movio (9.2).  \~
+    uint64_t peer_migrations = 0;
+    uint64_t migrations = 0;
+    /// \~english Back to the last validated path when a new one failed (9.3.2).
+    /// \~spanish Vuelta al ultimo camino validado cuando fallo uno nuevo (9.3.2).  \~
+    uint64_t reverted = 0;
+    /// \~english Congestion control and RTT started over on a new path (9.4).
+    /// \~spanish Control de congestion y RTT empezados de cero en un camino nuevo (9.4).  \~
+    uint64_t congestion_resets = 0;
+    /// \~english Datagrams from a server address a client did not know (9).
+    /// \~spanish Datagramas de una direccion del servidor que el cliente no conocia (9).  \~
+    uint64_t unknown_address = 0;
+    /// \~english Datagrams from a new address before the handshake was confirmed (9).
+    /// \~spanish Datagramas de una direccion nueva antes de confirmar el saludo (9).  \~
+    uint64_t before_confirmed = 0;
+    /// \~english Datagrams from a new address when migration is disabled (9).
+    /// \~spanish Datagramas de una direccion nueva con la migracion desactivada (9).  \~
+    uint64_t migration_disabled = 0;
+    /// \~english Times a path had no unused connection ID of the peer to send with (9.5).
+    /// \~spanish Veces que un camino no tenia un identificador sin usar del otro con el que mandar (9.5).  \~
+    uint64_t no_connection_id = 0;
+    /// \~english A PATH_RESPONSE matching no challenge sent (19.18).  \~spanish Un PATH_RESPONSE que no casa con ningun desafio mandado (19.18).  \~
+    uint64_t stray_responses = 0;
+    /// \~english A PATH_RESPONSE that could not be sent at all within the anti-amplification limit (8.2.2).
+    /// \~spanish Un PATH_RESPONSE que no se pudo mandar ni siquiera dentro del limite antiamplificacion (8.2.2).  \~
+    uint64_t responses_dropped = 0;
+};
+
+/**
+ * @brief
+ * \~english What asking a client to probe or move to a path got (RFC 9000, 9.1, 9.2).
+ * \~spanish Lo que consiguio pedir a un cliente que sondee o se mueva a un camino (RFC 9000, 9.1, 9.2).
+ * \~
+ */
+enum class Migration : uint8_t {
+    Started,
+    /// \~english Clients start every migration (9).  \~spanish Los clientes empiezan todas las migraciones (9).  \~
+    NotClient,
+    /// \~english Not before the handshake is confirmed (9).  \~spanish No antes de confirmar el saludo (9).  \~
+    NotConfirmed,
+    /// \~english The peer sent disable_active_migration (9).  \~spanish El otro mando disable_active_migration (9).  \~
+    Disabled,
+    /// \~english The peer uses a zero-length ID: the paths would be linkable (9.5).
+    /// \~spanish El otro usa un identificador de longitud cero: los caminos serian enlazables (9.5).  \~
+    ZeroLengthId,
+    /// \~english Only the server's address in use: there is no preferred address yet (9.6).
+    /// \~spanish Solo la direccion del servidor en uso: aun no hay direccion preferida (9.6).  \~
+    UnknownServer,
+    /// \~english That is already the path in use.  \~spanish Ese ya es el camino en uso.  \~
+    SamePath,
+    /// \~english No unused ID of the peer for the new local address (9.5).
+    /// \~spanish Ningun identificador sin usar del otro para la direccion local nueva (9.5).  \~
+    NoConnectionId,
+    /// \~english The provider could not draw the challenge's data.  \~spanish El proveedor no pudo sortear los datos del desafio.  \~
+    Failed,
+};
+
+/// \~english A short name for @p m.  \~spanish Un nombre corto para @p m.  \~
+const char *migration_name(Migration m) noexcept;
 
 /**
  * @brief
@@ -348,7 +475,6 @@ struct SendCounts {
     uint64_t max_stream_data = 0;
     uint64_t max_streams = 0;
     uint64_t reset_stream = 0;
-    uint64_t path_response = 0;
     uint64_t ping = 0;
     uint64_t connection_close = 0;
     uint64_t new_connection_id = 0;
@@ -536,19 +662,70 @@ public:
 
     /**
      * @brief
-     * \~english A datagram arrived; it is unprotected in place.
-     * \~spanish Llego un datagrama; se desprotege en su sitio.
+     * \~english A datagram arrived on @p path; it is unprotected in place.
+     * \~spanish Llego un datagrama por @p path; se desprotege en su sitio.
      * \~
      */
-    void on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) noexcept;
+    void on_datagram(const Path &path, uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) noexcept;
 
     /**
      * @brief
-     * \~english Composes the next datagram to send, or returns zero if there is nothing now.
-     * \~spanish Compone el siguiente datagrama a mandar, o devuelve cero si ahora no hay nada.
+     * \~english Composes the next datagram to send, and the path it goes on; zero if there is nothing now.
+     * \~spanish Compone el siguiente datagrama a mandar, y el camino por el que va; cero si ahora no hay nada.
+     * \~
+     *
+     * \~english
+     * Most go on the path in use; a path being validated gets its own
+     * datagrams, carrying only PATH_CHALLENGE and PATH_RESPONSE (8.2).
+     * \~spanish
+     * La mayoria van por el camino en uso; un camino que se esta validando recibe
+     * sus propios datagramas, que solo llevan PATH_CHALLENGE y PATH_RESPONSE
+     * (8.2).
      * \~
      */
-    size_t build_datagram(uint8_t *out, size_t room, uint64_t now_us) noexcept;
+    size_t build_datagram(Path &path, uint8_t *out, size_t room, uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english A client checks it can reach the server from a new local address, without moving (9.1).
+     * \~spanish Un cliente comprueba que llega al servidor desde una direccion local nueva, sin moverse (9.1).
+     * \~
+     *
+     * \~english
+     * @p path is the new local address and the server's address in use.  The
+     * probes go out with an ID of the server's not used on any other path
+     * (9.5); failing only means that path is not usable.
+     * \~spanish
+     * @p path es la direccion local nueva y la del servidor en uso.  Los sondeos
+     * salen con un identificador del servidor que no se uso en ningun otro camino
+     * (9.5); que falle solo significa que ese camino no sirve.
+     * \~
+     */
+    Migration probe_path(const Path &path, uint64_t now_us) noexcept;
+
+    /**
+     * @brief
+     * \~english A client moves to a new local address: everything from now on goes from it (9.2).
+     * \~spanish Un cliente se mueve a una direccion local nueva: todo lo de ahora en adelante sale de ella (9.2).
+     * \~
+     *
+     * \~english
+     * The server's address was proven during the handshake, so it does not
+     * wait: the path is validated alongside, and once it is, congestion
+     * control and RTT start over on it (9.4).
+     * \~spanish
+     * La direccion del servidor quedo probada en el saludo, asi que no espera: el
+     * camino se valida a la vez, y cuando lo esta, el control de congestion y el
+     * RTT empiezan de cero en el (9.4).
+     * \~
+     */
+    Migration migrate(const Path &path, uint64_t now_us) noexcept;
+
+    /// \~english The path in use, and whether its peer address is proven.
+    /// \~spanish El camino en uso, y si la direccion del otro esta probada.  \~
+    const Path &path() const noexcept { return paths_[active_].addr; }
+    bool address_validated() const noexcept { return paths_[active_].validated; }
+    const PathCounts &paths() const noexcept { return path_counts_; }
 
     /// \~english The earliest moment something has to happen; kNever if nothing will.
     /// \~spanish El primer momento en que algo tiene que pasar; kNever si nada.  \~
@@ -596,7 +773,7 @@ public:
     Recovery &recovery() noexcept { return recovery_; }
     const DropCounts &drops() const noexcept { return drops_; }
     const SendCounts &sent() const noexcept { return sent_; }
-    bool address_validated() const noexcept { return validated_; }
+    /// \~english Every byte in and out, on every path.  \~spanish Todos los bytes de entrada y salida, por todos los caminos.  \~
     uint64_t bytes_received() const noexcept { return bytes_in_; }
     uint64_t bytes_sent() const noexcept { return bytes_out_; }
 
@@ -628,6 +805,8 @@ private:
 
     void fail(TransportError e, uint64_t frame_type, uint64_t now_us) noexcept;
     bool process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn, uint64_t now_us) noexcept;
+    bool on_packet_path(Space s, uint64_t pn, bool probing, const uint8_t *dcid, size_t dcid_len,
+                        uint64_t now_us) noexcept;
     /// \~english How a 1-RTT packet opened.  \~spanish Como se abrio un paquete 1-RTT.  \~
     enum class Opened : uint8_t { Ok, Forged, Failed, ReservedBits, KeyUpdateViolation };
     Opened open_one_rtt(uint8_t *p, const PacketHeader &h, Unprotected &u,
@@ -643,15 +822,30 @@ private:
     void process_retry(const uint8_t *p, const PacketHeader &h, uint64_t now_us) noexcept;
     bool derive_initial_keys(const uint8_t *dcid, size_t len) noexcept;
     bool process_frames(Space s, const uint8_t *payload, size_t n, PacketType type,
-                        bool &eliciting, uint64_t now_us) noexcept;
+                        bool &eliciting, bool &probing, uint64_t now_us) noexcept;
     /// \~english When a packet is padded to a full datagram (14.1).  \~spanish Cuando un paquete se rellena a un datagrama entero (14.1).  \~
     enum class Pad : uint8_t { Never, Always, IfEliciting };
 
+    struct PathState;
+    struct PeerCid;
+    /**
+     * \~english
+     * @p probe: a path-validation packet for that path, sealed with its ID
+     * @p dest and carrying only its PATH_RESPONSE and PATH_CHALLENGE frames.
+     * Null: an ordinary packet on the path in use.
+     * \~spanish
+     * @p probe: un paquete de validacion para ese camino, sellado con su
+     * identificador @p dest y que solo lleva sus PATH_RESPONSE y PATH_CHALLENGE.
+     * Nulo: un paquete normal por el camino en uso.
+     * \~
+     */
     size_t build_packet(Space s, uint8_t *out, size_t room, Pad pad, bool &padded,
-                        uint64_t now_us) noexcept;
+                        uint64_t now_us, PathState *probe = nullptr,
+                        const PeerCid *dest = nullptr) noexcept;
     size_t write_frames(Space s, uint8_t *p, size_t room, PacketRecord &rec,
                         bool &eliciting, uint64_t &ack_largest, uint64_t now_us) noexcept;
-    size_t amplification_budget() const noexcept;
+    size_t write_probe_frames(PathState &path, uint8_t *p, size_t room, bool padded) noexcept;
+    size_t amplification_budget(size_t path) const noexcept;
     void restart_idle(uint64_t now_us) noexcept;
     bool can_open(Space s) const noexcept;
     bool keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) noexcept;
@@ -672,6 +866,9 @@ private:
      */
     struct Pending {
         uint8_t bytes[1500];
+        /// \~english The path it came on: opened later, it is still that path's packet.
+        /// \~spanish El camino por el que llego: abierto despues, sigue siendo un paquete de ese camino.  \~
+        Path path;
         uint64_t arrived_us;
         uint16_t len;
         uint8_t space;
@@ -841,7 +1038,7 @@ private:
     void learn_peer_cid(const uint8_t *cid, size_t len) noexcept;
     bool on_new_connection_id(const Frame &f, const uint8_t *payload, uint64_t now_us) noexcept;
     bool on_retire_connection_id(const Frame &f, uint64_t now_us) noexcept;
-    bool check_stateless_reset(const uint8_t *tail) const noexcept;
+    bool check_stateless_reset(const uint8_t *tail, const Address &from) const noexcept;
     AckTracker acks_[kSpaces];
     uint64_t next_pn_[kSpaces] = {0, 0, 0};
     Recovery recovery_;
@@ -883,25 +1080,121 @@ private:
     size_t token_len_ = 0;
 
     bool confirmed_ = false;
-    bool validated_ = false;
     uint64_t bytes_in_ = 0;
     uint64_t bytes_out_ = 0;
+
+    /**
+     * \~english
+     * Paths (RFC 9000, 8.2 and 9).  A fixed table: the one in use, the last
+     * validated one to fall back to while a new one is being proven (9.3.2),
+     * and a few being probed.  Each keeps what is said per path: whether its
+     * peer address is proven, the challenges in flight and the responses
+     * owed, what went in and out of it -- the anti-amplification limit is per
+     * address (8) -- and the peer's ID used on it, since one ID MUST NOT go
+     * to two addresses (9.5).  A peer cannot make the table grow: a new
+     * address takes the place of the least useful one.
+     * \~spanish
+     * Caminos (RFC 9000, 8.2 y 9).  Una tabla fija: el que esta en uso, el ultimo
+     * validado al que volver mientras se prueba uno nuevo (9.3.2), y unos pocos
+     * que se sondean.  Cada uno guarda lo que se dice por camino: si la direccion
+     * del otro esta probada, los desafios en vuelo y las respuestas debidas, lo
+     * que entro y salio por el -- el limite antiamplificacion es por direccion
+     * (8) -- y el identificador del otro que se usa en el, porque un mismo
+     * identificador NO DEBE ir a dos direcciones (9.5).  El otro no puede hacer
+     * crecer la tabla: una direccion nueva ocupa el sitio de la menos util.
+     * \~
+     */
+    static constexpr size_t kMaxPaths = 4;
+    static constexpr size_t kNoPath = kMaxPaths;
+    static constexpr size_t kChallengesKept = 3;
+    static constexpr size_t kResponsesOwed = 2;
+    struct PathState {
+        Path addr;
+        bool used = false;
+        /// \~english The peer address is proven (8.1, 8.2.3).  \~spanish La direccion del otro esta probada (8.1, 8.2.3).  \~
+        bool validated = false;
+        /// \~english A validation is under way.  \~spanish Hay una validacion en marcha.  \~
+        bool challenging = false;
+        /// \~english A challenge is owed now.  \~spanish Se debe un desafio ahora.  \~
+        bool challenge_owed = false;
+        /**
+         * \~english
+         * The data of the latest challenges, and whether each went in a full
+         * datagram: an answer to any of them proves the path, and only one
+         * sent in 1200 bytes proves its MTU too (8.2.1).
+         * \~spanish
+         * Los datos de los ultimos desafios, y si cada uno fue en un datagrama
+         * completo: la respuesta a cualquiera prueba el camino, y solo uno mandado
+         * en 1200 bytes prueba ademas su MTU (8.2.1).
+         * \~
+         */
+        uint8_t challenge[kChallengesKept][kPathDataSize] = {};
+        bool challenge_full[kChallengesKept] = {};
+        uint8_t challenges = 0;
+        uint64_t next_challenge_at = kNever;
+        uint64_t challenge_interval = 0;
+        uint64_t validation_deadline = kNever;
+        /// \~english PATH_RESPONSE data owed, each sent exactly once (8.2.2).
+        /// \~spanish Datos de PATH_RESPONSE debidos, cada uno mandado exactamente una vez (8.2.2).  \~
+        uint8_t response[kResponsesOwed][kPathDataSize] = {};
+        uint8_t responses = 0;
+        uint64_t bytes_in = 0;
+        uint64_t bytes_out = 0;
+        /// \~english The peer's ID this end sends with on this path; kNever: none yet.
+        /// \~spanish El identificador del otro con el que manda este extremo por este camino; kNever: aun ninguno.  \~
+        uint64_t peer_seq = kNever;
+        /// \~english Which of this end's IDs the peer sent to on this path (9.5).
+        /// \~spanish A cual de los identificadores de este extremo mando el otro por este camino (9.5).  \~
+        uint64_t local_seq_seen = kNever;
+        uint64_t last_used = 0;
+    };
+    PathState paths_[kMaxPaths];
+    size_t active_ = 0;
+    size_t fallback_ = kNoPath;
+    /// \~english The path the congestion control and RTT estimate belong to (9.4).
+    /// \~spanish El camino al que pertenecen el control de congestion y la estimacion de RTT (9.4).  \~
+    size_t cc_path_ = 0;
+    /// \~english The path of the datagram being processed; kNoPath until one of its packets opens.
+    /// \~spanish El camino del datagrama que se procesa; kNoPath hasta que se abre uno de sus paquetes.  \~
+    size_t rx_path_ = 0;
+    Path rx_addr_;
+    /// \~english Only the highest-numbered non-probing packet moves the connection (9.3).
+    /// \~spanish Solo el paquete no de sondeo de numero mas alto mueve la conexion (9.3).  \~
+    uint64_t largest_nonprobing_pn_ = kNever;
+    /// \~english A non-probing packet owed on the path in use, after a challenge on it (9.3.3).
+    /// \~spanish Un paquete no de sondeo debido por el camino en uso, tras un desafio en el (9.3.3).  \~
+    bool nonprobing_owed_ = false;
+    PathCounts path_counts_;
+
+    size_t find_path(const Path &p) const noexcept;
+    size_t claim_path(const Path &p, uint64_t now_us) noexcept;
+    void free_path(size_t i) noexcept;
+    bool assign_peer_cid(size_t i, bool may_share) noexcept;
+    PeerCid *unused_peer_cid() noexcept;
+    uint64_t local_seq_of(const uint8_t *cid, size_t len) const noexcept;
+    bool start_validation(size_t i, uint64_t now_us) noexcept;
+    void on_path_response(const uint8_t *data, uint64_t now_us) noexcept;
+    void path_validated(size_t i, bool full, uint64_t now_us) noexcept;
+    void switch_to(size_t i, uint64_t now_us) noexcept;
+    void run_path_timers(uint64_t now_us) noexcept;
+    uint64_t path_timer() const noexcept;
+    size_t build_probe(size_t i, uint8_t *out, size_t room, uint64_t now_us) noexcept;
+    uint64_t initial_pto() const noexcept;
+    Migration check_migration(const Path &p) const noexcept;
 
     /// \~english Control frames owed.  \~spanish Tramas de control que se deben.  \~
     bool max_data_owed_ = false;
     bool max_streams_owed_[2] = {false, false};
     bool handshake_done_owed_ = false;
-    bool path_response_owed_ = false;
-    uint8_t path_response_[kPathDataSize] = {};
     bool probe_owed_[kSpaces] = {false, false, false};
-    /// \~english The limits *_BLOCKED frames were last sent at (kNever: none since), and when.
-    /// \~spanish Los limites en los que se mandaron los ultimos *_BLOCKED (kNever: ninguno desde entonces), y cuando.  \~
     /// \~english Packets received while closing: the answers are spaced out by it (10.2.1).
     /// \~spanish Paquetes recibidos mientras se cierra: las respuestas se espacian con esto (10.2.1).  \~
     uint64_t close_rx_ = 0;
     /// \~english The random spin bit of the ID in use (17.4).  \~spanish El bit de espin aleatorio del identificador en uso (17.4).  \~
     bool spin_bit_ = false;
     void draw_spin_bit() noexcept;
+    /// \~english The limits *_BLOCKED frames were last sent at (kNever: none since), and when.
+    /// \~spanish Los limites en los que se mandaron los ultimos *_BLOCKED (kNever: ninguno desde entonces), y cuando.  \~
     uint64_t data_blocked_at_ = kNever;
     uint64_t data_blocked_time_ = 0;
     uint64_t streams_blocked_at_[2] = {kNever, kNever};

@@ -126,8 +126,11 @@ void Recovery::pop_front(Ring &r) noexcept {
 }
 
 bool Recovery::on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eliciting,
-                              bool in_flight, uint64_t tag, uint64_t ack_largest,
+                              bool in_flight, bool path_probe, uint64_t tag, uint64_t ack_largest,
                               uint64_t now_us) noexcept {
+    // \~english A probe is never in flight: its loss is the probed path's business (RFC 9000, 9.4).
+    // \~spanish Un sondeo nunca esta en vuelo: su perdida es cosa del camino sondeado (RFC 9000, 9.4).  \~
+    if (path_probe) in_flight = false;
     const size_t i = idx(s);
     Ring &r = ring_[i];
     if (!can_record(s)) return false;
@@ -144,6 +147,8 @@ bool Recovery::on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eli
     p.bytes = bytes;
     p.ack_eliciting = ack_eliciting;
     p.in_flight = in_flight;
+    p.counted = in_flight;
+    p.other_path = path_probe;
     p.state = kOutstanding;
     ++r.size;
 
@@ -211,7 +216,7 @@ void Recovery::congestion_event(uint64_t sent_time, uint64_t now_us) noexcept {
 }
 
 void Recovery::on_acked_cc(const SentPacket &p) noexcept {
-    if (!p.in_flight) return;
+    if (!p.counted) return;
     if (app_limited_) return;
     if (in_recovery(p.time_sent)) return;
 
@@ -296,13 +301,15 @@ void Recovery::detect_lost(Space s, uint64_t now_us, RecoveryListener &l) noexce
 
         p.state = kLost;
         ++lost_;
-        if (p.in_flight) {
+        if (p.in_flight && p.ack_eliciting) --eliciting_in_flight_[i];
+        // \~english A loss on an earlier path says nothing about this one (RFC 9000, 9.4).
+        // \~spanish Una perdida en un camino anterior no dice nada de este (RFC 9000, 9.4).  \~
+        if (p.counted) {
             bytes_in_flight_ -= p.bytes;
-            if (p.ack_eliciting) --eliciting_in_flight_[i];
             last_loss_sent = max64(last_loss_sent, p.time_sent);
             any_in_flight_lost = true;
         }
-        if (p.ack_eliciting && has_rtt_sample_ && p.time_sent > first_rtt_sample_) {
+        if (p.counted && p.ack_eliciting && has_rtt_sample_ && p.time_sent > first_rtt_sample_) {
             if (!run) {
                 run = true;
                 run_start = p.time_sent;
@@ -370,6 +377,7 @@ AckResult Recovery::on_ack_received(Space s, const Frame &ack, const uint8_t *pa
     bool newly_any = false;
     bool newly_eliciting = false;
     bool largest_newly = false;
+    bool largest_this_path = false;
     uint64_t largest_time = 0;
 
     for (uint32_t k = r.size; k-- > 0 && have;) {
@@ -384,18 +392,25 @@ AckResult Recovery::on_ack_received(Space s, const Frame &ack, const uint8_t *pa
         if (p.pn == ack.largest) {
             largest_newly = true;
             largest_time = p.time_sent;
+            largest_this_path = !p.other_path;
         }
-        if (p.in_flight) {
-            bytes_in_flight_ -= p.bytes;
-            if (p.ack_eliciting) --eliciting_in_flight_[i];
-        }
+        if (p.in_flight && p.ack_eliciting) --eliciting_in_flight_[i];
+        if (p.counted) bytes_in_flight_ -= p.bytes;
     }
 
     if (!newly_any) return AckResult::Ok;
 
-    // \~english An RTT sample only from the largest, and only if something asked for this ACK.
-    // \~spanish Una muestra de RTT solo del mayor, y solo si algo pidio este ACK.  \~
-    if (largest_newly && newly_eliciting) {
+    /* \~english
+     * An RTT sample only from the largest, only if something asked for this
+     * ACK, and only if that largest belongs to this path: a round trip over
+     * another path, or a path probe, is not this path's RTT (RFC 9000, 9.4;
+     * RFC 9002, 6.2.2).
+     * \~spanish
+     * Una muestra de RTT solo del mayor, solo si algo pidio este ACK, y solo si
+     * ese mayor es de este camino: un viaje por otro camino, o un sondeo de
+     * camino, no es el RTT de este (RFC 9000, 9.4; RFC 9002, 6.2.2).
+     * \~ */
+    if (largest_newly && newly_eliciting && largest_this_path) {
         latest_rtt_ = now_us > largest_time ? now_us - largest_time : 0;
 
         // \~english Initial ACKs are not delayed on purpose: their delay is ignored (5.3).
@@ -409,7 +424,7 @@ AckResult Recovery::on_ack_received(Space s, const Frame &ack, const uint8_t *pa
     // \~spanish Una cuenta CE que sube es un evento de congestion, como una perdida (B.7).  \~
     if (ack.has_ecn && ack.ecn[2] > ecn_ce_[i]) {
         ecn_ce_[i] = ack.ecn[2];
-        if (largest_newly) congestion_event(largest_time, now_us);
+        if (largest_newly && largest_this_path) congestion_event(largest_time, now_us);
     }
 
     detect_lost(s, now_us, l);
@@ -537,7 +552,7 @@ void Recovery::discard_space(Space s, uint64_t now_us) noexcept {
     // \~spanish Sus paquetes salen del vuelo; no se van a confirmar ni perder nunca.  \~
     for (uint32_t k = 0; k < r.size; ++k) {
         const SentPacket &p = r.at(k);
-        if (p.state == kOutstanding && p.in_flight) bytes_in_flight_ -= p.bytes;
+        if (p.state == kOutstanding && p.counted) bytes_in_flight_ -= p.bytes;
     }
     r.head = 0;
     r.size = 0;
@@ -566,6 +581,39 @@ void Recovery::on_retry(uint64_t now_us, RecoveryListener &l) noexcept {
     in_recovery_period_ = false;
     probes_ = 0;
     pto_count_ = 0;
+    set_timer(now_us);
+}
+
+void Recovery::on_new_path(uint64_t now_us) noexcept {
+    // \~english What is in flight belongs to the old path: out of the flight, and no longer counted.
+    // \~spanish Lo que esta en vuelo es del camino viejo: fuera del vuelo, y deja de contar.  \~
+    for (Ring &r : ring_)
+        for (uint32_t k = 0; k < r.size; ++k) {
+            SentPacket &p = r.at(k);
+            if (p.state != kOutstanding) continue;
+            if (p.counted) bytes_in_flight_ -= p.bytes;
+            p.counted = false;
+            p.other_path = true;
+        }
+
+    // \~english The congestion controller as at the start (RFC 9002, B.3).
+    // \~spanish El controlador de congestion como al principio (RFC 9002, B.3).  \~
+    cwnd_ = initial_window();
+    ssthresh_ = kNever;
+    bytes_acked_ca_ = 0;
+    recovery_start_ = 0;
+    in_recovery_period_ = false;
+
+    // \~english And the RTT estimator: the next sample starts it again (RFC 9002, 5.3).
+    // \~spanish Y el estimador de RTT: la siguiente muestra lo arranca otra vez (RFC 9002, 5.3).  \~
+    latest_rtt_ = 0;
+    smoothed_rtt_ = kInitialRttUs;
+    rttvar_ = kInitialRttUs / 2;
+    min_rtt_ = 0;
+    first_rtt_sample_ = 0;
+    has_rtt_sample_ = false;
+
+    ++path_resets_;
     set_timer(now_us);
 }
 

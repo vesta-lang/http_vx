@@ -91,7 +91,7 @@ AckResult ack_one(Recovery &r, Space s, uint64_t pn, uint64_t now, Log &log,
 
 bool send(Recovery &r, Space s, uint64_t pn, uint64_t now, uint32_t bytes = 1200,
           bool eliciting = true) {
-    return r.on_packet_sent(s, pn, bytes, eliciting, true, pn, kNever, now);
+    return r.on_packet_sent(s, pn, bytes, eliciting, true, false, pn, kNever, now);
 }
 
 /// \~english 5.3, worked by hand.  \~spanish 5.3, hecho a mano.  \~
@@ -336,6 +336,72 @@ void test_peer_ack_params() {
           "the peer's max_ack_delay did not move the PTO by exactly the difference");
 }
 
+/// \~english RFC 9000, 9.4: a new path starts over, and the old path's packets stop counting.
+/// \~spanish RFC 9000, 9.4: un camino nuevo empieza de cero, y los paquetes del viejo dejan de contar.  \~
+void test_new_path() {
+    Recovery r;
+    Log log;
+    const Space app = Space::Application;
+    r.set_handshake_confirmed(0);
+
+    // \~english A history on the old path: one 100 ms sample, and a window that grew.
+    // \~spanish Una historia en el camino viejo: una muestra de 100 ms, y una ventana que crecio.  \~
+    for (uint64_t pn = 0; pn < 4; ++pn) send(r, app, pn, 0);
+    ack_one(r, app, 0, 100000, log);
+    check(r.smoothed_rtt() == 100000 && r.congestion_window() == r.initial_window() + 1200,
+          "the old path's history was not set up");
+    for (uint64_t pn = 4; pn < 7; ++pn) send(r, app, pn, 100000);
+
+    r.on_new_path(200000);
+    check(r.congestion_window() == r.initial_window() && r.ssthresh() == kNever &&
+              r.path_resets() == 1,
+          "a new path did not start the congestion controller over");
+    check(r.smoothed_rtt() == kInitialRttUs && r.rttvar() == kInitialRttUs / 2 && r.min_rtt() == 0 &&
+              r.latest_rtt() == 0,
+          "a new path did not start the RTT estimator over");
+    check(r.bytes_in_flight() == 0, "the old path's packets stayed in flight");
+
+    // \~english The old path's acknowledgement: no sample, no growth, nothing taken twice from the flight.
+    // \~spanish La confirmacion del camino viejo: ni muestra, ni crecimiento, ni nada quitado dos veces del vuelo.  \~
+    ack_one(r, app, 6, 250000, log);
+    check(r.smoothed_rtt() == kInitialRttUs && r.latest_rtt() == 0,
+          "a packet of the old path gave the new path an RTT sample");
+    check(r.congestion_window() == r.initial_window() && r.bytes_in_flight() == 0,
+          "a packet of the old path grew the new path's window");
+
+    // \~english A packet of the new path: its sample counts, and the old one it overtakes is lost quietly.
+    // \~spanish Un paquete del camino nuevo: su muestra cuenta, y el viejo al que adelanta se pierde sin ruido.  \~
+    const uint64_t events = r.congestion_events();
+    send(r, app, 7, 300000);
+    check(r.bytes_in_flight() == 1200, "a packet of the new path is not in flight");
+    ack_one(r, app, 7, 340000, log);
+    check(r.latest_rtt() == 40000 && r.smoothed_rtt() == 40000,
+          "the new path's first sample did not start its estimator");
+    check(log.was_lost(4) && r.congestion_events() == events,
+          "a loss on the old path was a congestion event on the new one");
+    check(r.congestion_window() == r.initial_window() + 1200 && r.bytes_in_flight() == 0,
+          "the new path's window did not grow for its own packet");
+
+    // \~english 5.1: the largest may be ACK-only; any newly acknowledged packet asking for it gives a sample.
+    // \~spanish 5.1: el mayor puede ser solo ACK; basta un paquete recien confirmado que la pidiera para la muestra.  \~
+    Recovery q;
+    Log l2;
+    q.on_packet_sent(app, 0, 1200, true, true, false, 0, kNever, 0);
+    q.on_packet_sent(app, 1, 50, false, false, false, 1, kNever, 0);
+    const AckRange both[] = {{0, 1}};
+    ack(q, app, both, 1, 0, 70000, l2);
+    check(q.latest_rtt() == 70000, "an ACK-only largest packet took away the RTT sample");
+
+    // \~english A path probe: not in flight, and its round trip is not this path's (RFC 9002, 6.2.2).
+    // \~spanish Un sondeo de camino: no esta en vuelo, y su viaje no es el de este camino (RFC 9002, 6.2.2).  \~
+    Recovery pr;
+    pr.on_packet_sent(app, 0, 1200, true, true, true, 0, kNever, 0);
+    check(pr.bytes_in_flight() == 0 && pr.timer() == kNever, "a path probe counted as in flight");
+    ack_one(pr, app, 0, 90000, l2);
+    check(pr.latest_rtt() == 0 && pr.smoothed_rtt() == kInitialRttUs,
+          "a path probe gave an RTT sample");
+}
+
 void test_bad_acks_and_full_rings() {
     RecoveryConfig cfg;
     cfg.capacity[2] = 4;
@@ -358,7 +424,7 @@ void test_bad_acks_and_full_rings() {
     // \~spanish Lo que oye el oyente: la etiqueta, y el ACK que llevaba el paquete.  \~
     Recovery t;
     Log l2;
-    t.on_packet_sent(app, 0, 100, true, true, 777, 41, 0);
+    t.on_packet_sent(app, 0, 100, true, true, false, 777, 41, 0);
     ack_one(t, app, 0, 1000, l2);
     check(l2.n_acked == 1 && l2.acked[0] == 777 && l2.ack_largest[0] == 41,
           "the listener did not hear the tag and the ACK the packet carried");
@@ -460,6 +526,7 @@ int main() {
     test_pto();
     test_discard_ecn();
     test_peer_ack_params();
+    test_new_path();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

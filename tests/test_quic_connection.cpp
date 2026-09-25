@@ -136,6 +136,19 @@ struct NetShape {
 
 const uint8_t kClientAddr[6] = {198, 51, 100, 7, 0x1f, 0x90};
 
+/* \~english
+ * The path of every test that does not move: both ends leave their address
+ * empty, which is still one address, the same on both sides.  Where a
+ * datagram said it goes is kept in g_sent, for tests that do not care.
+ * \~spanish
+ * El camino de todas las pruebas que no se mueven: los dos extremos dejan su
+ * direccion vacia, que sigue siendo una direccion, la misma a los dos lados.
+ * A donde dijo un datagrama que va se guarda en g_sent, para las pruebas a las
+ * que no les importa.
+ * \~ */
+const Path kPath{};
+Path g_sent;
+
 /// \~english The server's acceptor, as every run configures it.
 /// \~spanish El acceptor del servidor, como lo configura cada corrida.  \~
 AcceptorConfig acceptor_config(bool retry) {
@@ -438,7 +451,7 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
             for (int k = 0; k < 64; ++k) {
                 const uint64_t in_before = srv ? srv->bytes_received() : 0;
                 const bool valid_before = srv && srv->address_validated();
-                const size_t n = c.build_datagram(buf, sizeof buf, now);
+                const size_t n = c.build_datagram(g_sent,buf, sizeof buf, now);
                 if (n == 0) break;
                 if (who == 1 && !valid_before && srv->bytes_sent() > 3 * in_before) {
                     check(false, "the server sent more than three times what it received before validation");
@@ -481,9 +494,9 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                 air[i] = air.back();
                 air.pop_back();
                 if (!d.to_server) {
-                    client.on_datagram(d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
+                    client.on_datagram(kPath,d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
                 } else if (srv) {
-                    srv->on_datagram(d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
+                    srv->on_datagram(kPath,d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
                 } else {
                     /* \~english
                      * No connection yet: the acceptor decides.  Its reply
@@ -519,7 +532,7 @@ void run(Crypto &cr, const NetShape &net, uint64_t seed, int streams, size_t siz
                         check(srv->address_validated() == ad.address_validated,
                               "the server's view of the address is not what the acceptor proved");
                         se.c = srv.get();
-                        srv->on_datagram(d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
+                        srv->on_datagram(kPath,d.bytes.data(), d.bytes.size(), Ecn::NotEct, now);
                     }
                 }
             } else {
@@ -779,10 +792,10 @@ void test_violation(Crypto &cr) {
         }
         uint8_t buf[1500];
         size_t n;
-        while ((n = client.build_datagram(buf, sizeof buf, now)) != 0)
-            server.on_datagram(buf, n, Ecn::NotEct, now + 1000);
-        while ((n = server.build_datagram(buf, sizeof buf, now)) != 0)
-            client.on_datagram(buf, n, Ecn::NotEct, now + 1000);
+        while ((n = client.build_datagram(g_sent,buf, sizeof buf, now)) != 0)
+            server.on_datagram(kPath,buf, n, Ecn::NotEct, now + 1000);
+        while ((n = server.build_datagram(g_sent,buf, sizeof buf, now)) != 0)
+            client.on_datagram(kPath,buf, n, Ecn::NotEct, now + 1000);
         now += 1000;
         if (client.state() == ConnState::Draining) break;
         if (client.timer() <= now) client.on_timer(now);
@@ -809,7 +822,7 @@ void test_idle(Crypto &cr) {
     client.set_initial_keys(cc.peer_cid, 8);
     write_crypto(client, Space::Initial, 300);
     uint8_t buf[1500];
-    check(client.build_datagram(buf, sizeof buf, 0) >= kMinInitialDatagram,
+    check(client.build_datagram(g_sent,buf, sizeof buf, 0) >= kMinInitialDatagram,
           "a client's first datagram was not padded to 1200 bytes");
 
     // \~english Nothing answers: probes go out, then the idle timeout ends it.
@@ -818,7 +831,7 @@ void test_idle(Crypto &cr) {
     for (int i = 0; i < 100 && client.state() != ConnState::Closed; ++i) {
         now = client.timer();
         client.on_timer(now);
-        while (client.build_datagram(buf, sizeof buf, now) != 0) {
+        while (client.build_datagram(g_sent,buf, sizeof buf, now) != 0) {
         }
     }
     check(client.state() == ConnState::Closed && now >= 5000000 && now <= 5000000 + 3000000,
@@ -859,10 +872,10 @@ void test_early_one_rtt(Crypto &cr) {
     size_t took = 0;
     st->send->write(early, sizeof early, took);
     uint8_t buf[1500];
-    const size_t n = client.build_datagram(buf, sizeof buf, 1000);
+    const size_t n = client.build_datagram(g_sent,buf, sizeof buf, 1000);
     check(n != 0, "the client sent no 1-RTT packet");
 
-    server.on_datagram(buf, n, Ecn::NotEct, 2000);
+    server.on_datagram(kPath,buf, n, Ecn::NotEct, 2000);
     check(server.streams().count() == 0 && server.drops().forged == 0,
           "the server opened a 1-RTT packet before its handshake completed");
 
@@ -909,7 +922,7 @@ ConnectionConfig small_server() {
 size_t start_client(Connection &client, const ConnectionConfig &cc, uint8_t *out) {
     client.set_initial_keys(cc.peer_cid, 8);
     write_crypto(client, Space::Initial, 300);
-    return client.build_datagram(out, 1500, 0);
+    return client.build_datagram(g_sent,out, 1500, 0);
 }
 
 /// \~english The server reads the ClientHello and answers: its first flight is ready to send.
@@ -934,7 +947,7 @@ std::unique_ptr<Connection> admit(Crypto &cr, Acceptor &a, uint8_t *dgram, size_
     std::unique_ptr<Connection> s(new Connection(cr, sc));
     s->set_initial_keys(ad.dcid, ad.dcid_len);
     if (ad.address_validated) s->set_address_validated(now);
-    s->on_datagram(dgram, n, Ecn::NotEct, now);
+    s->on_datagram(kPath,dgram, n, Ecn::NotEct, now);
     return s;
 }
 
@@ -997,14 +1010,14 @@ void test_version_negotiation(Crypto &cr) {
         Acceptor a(cr, ac);
         const Admission ad = a.on_datagram(first, n, kClientAddr, sizeof kClientAddr, 0, pkt, sizeof pkt);
         check(ad.reason == AdmitReason::SentVersionNegotiation, "the acceptor did not answer with VN");
-        client.on_datagram(pkt, ad.reply_len, Ecn::NotEct, 1000);
+        client.on_datagram(kPath,pkt, ad.reply_len, Ecn::NotEct, 1000);
         uint32_t offered[4] = {};
         const size_t count = client.offered_versions(offered, 4);
         check(client.state() == ConnState::Closed && client.ended_in_version_negotiation(),
               "a VN with no version in common did not end the attempt");
         check(count == 2 && offered[0] == kVersion1 && (offered[1] & 0x0f0f0f0fu) == 0x0a0a0a0au,
               "the offered versions are not what the server listed");
-        check(client.build_datagram(pkt, sizeof pkt, 2000) == 0 && client.timer() == kNever,
+        check(client.build_datagram(g_sent,pkt, sizeof pkt, 2000) == 0 && client.timer() == kNever,
               "an abandoned attempt still sends or waits");
     }
 
@@ -1018,7 +1031,7 @@ void test_version_negotiation(Crypto &cr) {
         Connection client(cr, cc);
         start_client(client, cc, first);
         const size_t n = craft_vn(cc.local_cid, 8, cc.peer_cid, 8, mine, 2, pkt);
-        client.on_datagram(pkt, n, Ecn::NotEct, 1000);
+        client.on_datagram(kPath,pkt, n, Ecn::NotEct, 1000);
         check(client.state() == ConnState::Active && client.drops().version_negotiation == 1 &&
                   !client.ended_in_version_negotiation(),
               "a VN listing the version in use was not ignored");
@@ -1033,9 +1046,9 @@ void test_version_negotiation(Crypto &cr) {
         std::memcpy(wrong, cc.peer_cid, 8);
         wrong[3] ^= 1;
         size_t n = craft_vn(cc.local_cid, 8, wrong, 8, other, 2, pkt);
-        client.on_datagram(pkt, n, Ecn::NotEct, 1000);
+        client.on_datagram(kPath,pkt, n, Ecn::NotEct, 1000);
         n = craft_vn(wrong, 8, cc.peer_cid, 8, other, 2, pkt);
-        client.on_datagram(pkt, n, Ecn::NotEct, 1000);
+        client.on_datagram(kPath,pkt, n, Ecn::NotEct, 1000);
         check(client.state() == ConnState::Active && client.drops().wrong_cid == 2,
               "a VN that does not echo the client's IDs was believed");
     }
@@ -1050,10 +1063,10 @@ void test_version_negotiation(Crypto &cr) {
         check(server != nullptr, "the acceptor did not admit the client");
         if (server == nullptr) return;
         drive_handshake_server_first(cr, *server);
-        const size_t m = server->build_datagram(pkt, sizeof pkt, 2000);
-        client.on_datagram(pkt, m, Ecn::NotEct, 3000);
+        const size_t m = server->build_datagram(g_sent,pkt, sizeof pkt, 2000);
+        client.on_datagram(kPath,pkt, m, Ecn::NotEct, 3000);
         const size_t v = craft_vn(cc.local_cid, 8, cc.peer_cid, 8, other, 2, pkt);
-        client.on_datagram(pkt, v, Ecn::NotEct, 4000);
+        client.on_datagram(kPath,pkt, v, Ecn::NotEct, 4000);
         check(client.state() == ConnState::Active && client.drops().version_negotiation == 1,
               "a VN after the server's first packet was believed");
     }
@@ -1079,11 +1092,11 @@ void test_retry_rules(Crypto &cr) {
     // \~spanish Un bit de la marca cambiado: falsificado, y el cliente se queda como estaba.  \~
     std::memcpy(pkt, retry, ad.reply_len);
     pkt[ad.reply_len - 1] ^= 1;
-    client.on_datagram(pkt, ad.reply_len, Ecn::NotEct, 1000);
+    client.on_datagram(kPath,pkt, ad.reply_len, Ecn::NotEct, 1000);
     check(!client.retried() && client.drops().forged == 1, "a Retry with a bad tag was taken");
 
     std::memcpy(pkt, retry, ad.reply_len);
-    client.on_datagram(pkt, ad.reply_len, Ecn::NotEct, 1000);
+    client.on_datagram(kPath,pkt, ad.reply_len, Ecn::NotEct, 1000);
     check(client.retried(), "a genuine Retry was not taken");
     size_t rlen = 0;
     const uint8_t *rscid = client.retry_source_cid(rlen);
@@ -1093,7 +1106,7 @@ void test_retry_rules(Crypto &cr) {
 
     // \~english The next Initial: to the Retry's ID, with the token, numbering on, CRYPTO again.
     // \~spanish El Initial siguiente: al identificador del Retry, con el testigo, numeracion seguida, CRYPTO otra vez.  \~
-    const size_t m = client.build_datagram(pkt, sizeof pkt, 2000);
+    const size_t m = client.build_datagram(g_sent,pkt, sizeof pkt, 2000);
     PacketHeader ih;
     check(m >= kMinInitialDatagram && parse_packet(pkt, m, hc, ih) == HeaderError::None &&
               ih.type == PacketType::Initial,
@@ -1134,7 +1147,7 @@ void test_retry_rules(Crypto &cr) {
     // \~english A second Retry, even genuine, is one too many.
     // \~spanish Un segundo Retry, aunque sea de verdad, es uno de mas.  \~
     const Admission again = a.on_datagram(first, n, kClientAddr, sizeof kClientAddr, 0, retry, sizeof retry);
-    client.on_datagram(retry, again.reply_len, Ecn::NotEct, 4000);
+    client.on_datagram(kPath,retry, again.reply_len, Ecn::NotEct, 4000);
     check(client.drops().retry == 1 && std::memcmp(client.retry_source_cid(rlen), rscid, rlen) == 0,
           "a second Retry was taken");
 
@@ -1147,7 +1160,7 @@ void test_retry_rules(Crypto &cr) {
         Connection c(cr, cc);
         start_client(c, cc, first);
         const size_t k = craft_retry(cr, cc.local_cid, fresh, 8, nullptr, 0, cc.peer_cid, pkt);
-        c.on_datagram(pkt, k, Ecn::NotEct, 1000);
+        c.on_datagram(kPath,pkt, k, Ecn::NotEct, 1000);
         check(!c.retried() && c.drops().retry == 1, "a Retry with an empty token was taken");
     }
 
@@ -1157,7 +1170,7 @@ void test_retry_rules(Crypto &cr) {
         Connection c(cr, cc);
         start_client(c, cc, first);
         const size_t k = craft_retry(cr, cc.local_cid, cc.peer_cid, 8, token, sizeof token, cc.peer_cid, pkt);
-        c.on_datagram(pkt, k, Ecn::NotEct, 1000);
+        c.on_datagram(kPath,pkt, k, Ecn::NotEct, 1000);
         check(!c.retried() && c.drops().retry == 1, "a Retry naming the ID it answers was taken");
     }
 
@@ -1170,7 +1183,7 @@ void test_retry_rules(Crypto &cr) {
         std::memcpy(other, cc.local_cid, 8);
         other[0] ^= 1;
         const size_t k = craft_retry(cr, other, fresh, 8, token, sizeof token, cc.peer_cid, pkt);
-        c.on_datagram(pkt, k, Ecn::NotEct, 1000);
+        c.on_datagram(kPath,pkt, k, Ecn::NotEct, 1000);
         check(!c.retried() && c.drops().wrong_cid == 1, "a Retry for another client was taken");
     }
 
@@ -1184,10 +1197,10 @@ void test_retry_rules(Crypto &cr) {
         check(server != nullptr, "the acceptor did not admit the client");
         if (server == nullptr) return;
         drive_handshake_server_first(cr, *server);
-        const size_t s = server->build_datagram(pkt, sizeof pkt, 2000);
-        c.on_datagram(pkt, s, Ecn::NotEct, 3000);
+        const size_t s = server->build_datagram(g_sent,pkt, sizeof pkt, 2000);
+        c.on_datagram(kPath,pkt, s, Ecn::NotEct, 3000);
         const size_t k = craft_retry(cr, cc.local_cid, fresh, 8, token, sizeof token, cc.peer_cid, pkt);
-        c.on_datagram(pkt, k, Ecn::NotEct, 4000);
+        c.on_datagram(kPath,pkt, k, Ecn::NotEct, 4000);
         check(!c.retried() && c.drops().retry == 1, "a Retry after the server spoke was taken");
     }
 }
@@ -1253,10 +1266,10 @@ void test_initial_rules(Crypto &cr) {
     // \~english 14.1: a server MUST discard an Initial in a datagram under 1200 bytes -- only then.
     // \~spanish 14.1: un servidor DEBE descartar un Initial en un datagrama de menos de 1200 bytes -- solo entonces.  \~
     size_t m = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 5, 1199, pkt);
-    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    server->on_datagram(kPath,pkt, m, Ecn::NotEct, 2000);
     check(server->drops().small_initial == 1, "an Initial in a 1199-byte datagram was not dropped");
     m = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 6, 1200, pkt);
-    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    server->on_datagram(kPath,pkt, m, Ecn::NotEct, 2000);
     check(server->drops().small_initial == 1 && server->drops().forged == 0 &&
               server->state() == ConnState::Active,
           "an Initial in a 1200-byte datagram was not taken");
@@ -1267,26 +1280,26 @@ void test_initial_rules(Crypto &cr) {
     std::memcpy(other, cc.local_cid, 8);
     other[2] ^= 0x10;
     m = craft_initial(cr, false, cc.peer_cid, server_cid, other, nullptr, 0, 7, 1200, pkt);
-    server->on_datagram(pkt, m, Ecn::NotEct, 2000);
+    server->on_datagram(kPath,pkt, m, Ecn::NotEct, 2000);
     check(server->drops().changed_source == 1, "a server took an Initial from another source ID");
 
     // \~english 17.2.2: a server's Initial carries no token; a client MUST discard one that does.
     // \~spanish 17.2.2: el Initial de un servidor no lleva testigo; un cliente DEBE descartar uno que lo lleve.  \~
     drive_handshake_server_first(cr, *server);
     uint8_t reply[1500];
-    const size_t r = server->build_datagram(reply, sizeof reply, 3000);
+    const size_t r = server->build_datagram(g_sent,reply, sizeof reply, 3000);
     uint8_t copy[1500];
     std::memcpy(copy, reply, r);
-    client.on_datagram(reply, r, Ecn::NotEct, 4000);
+    client.on_datagram(kPath,reply, r, Ecn::NotEct, 4000);
     const uint8_t token[] = {'t'};
     m = craft_initial(cr, true, cc.peer_cid, cc.local_cid, server_cid, token, 1, 40, 1200, pkt);
-    client.on_datagram(pkt, m, Ecn::NotEct, 5000);
+    client.on_datagram(kPath,pkt, m, Ecn::NotEct, 5000);
     check(client.drops().initial_with_token == 1, "a client took a server Initial carrying a token");
 
     // \~english 5.2.1: a client MUST discard a packet of another version than it selected.
     // \~spanish 5.2.1: un cliente DEBE descartar un paquete de otra version que la que eligio.  \~
     put_u32(copy + 1, kVersion2);
-    client.on_datagram(copy, r, Ecn::NotEct, 5000);
+    client.on_datagram(kPath,copy, r, Ecn::NotEct, 5000);
     check(client.drops().wrong_version >= 1, "a client took a packet of another version");
 
     // \~english 8.1 / 14.1: a client's datagram with an Initial is 1200 bytes, even when it only closes.
@@ -1294,7 +1307,7 @@ void test_initial_rules(Crypto &cr) {
     Connection early(cr, cc);
     start_client(early, cc, first);
     early.close(0x0100, true, 0, 1000);
-    m = early.build_datagram(pkt, sizeof pkt, 1000);
+    m = early.build_datagram(g_sent,pkt, sizeof pkt, 1000);
     check(m >= kMinInitialDatagram, "a client's closing Initial was not padded to 1200 bytes");
 }
 
@@ -1311,14 +1324,14 @@ void test_changed_source(Crypto &cr) {
     check(server != nullptr, "the acceptor did not admit the client");
     if (server == nullptr) return;
     drive_handshake_server_first(cr, *server);
-    const size_t m = server->build_datagram(pkt, sizeof pkt, 2000);
+    const size_t m = server->build_datagram(g_sent,pkt, sizeof pkt, 2000);
     std::memcpy(copy, pkt, m);
-    client.on_datagram(pkt, m, Ecn::NotEct, 3000);
+    client.on_datagram(kPath,pkt, m, Ecn::NotEct, 3000);
 
     // \~english The server's Initial: source ID after 1+4+1+8+1 bytes.
     // \~spanish El Initial del servidor: el identificador de origen tras 1+4+1+8+1 bytes.  \~
     copy[15] ^= 0x40;
-    client.on_datagram(copy, m, Ecn::NotEct, 4000);
+    client.on_datagram(kPath,copy, m, Ecn::NotEct, 4000);
     check(client.drops().changed_source == 1 && client.drops().forged == 0,
           "a packet with another source ID was not dropped for it");
 }
@@ -1365,10 +1378,10 @@ void pump(KeyPair &k, int rounds, uint64_t step = 5000) {
     uint8_t buf[1500];
     for (int r = 0; r < rounds; ++r) {
         size_t n;
-        while ((n = k.client.build_datagram(buf, sizeof buf, k.now)) != 0)
-            k.server.on_datagram(buf, n, Ecn::NotEct, k.now);
-        while ((n = k.server.build_datagram(buf, sizeof buf, k.now)) != 0)
-            k.client.on_datagram(buf, n, Ecn::NotEct, k.now);
+        while ((n = k.client.build_datagram(g_sent,buf, sizeof buf, k.now)) != 0)
+            k.server.on_datagram(kPath,buf, n, Ecn::NotEct, k.now);
+        while ((n = k.server.build_datagram(g_sent,buf, sizeof buf, k.now)) != 0)
+            k.client.on_datagram(kPath,buf, n, Ecn::NotEct, k.now);
         k.now += step;
         if (k.client.timer() <= k.now) k.client.on_timer(k.now);
         if (k.server.timer() <= k.now) k.server.on_timer(k.now);
@@ -1510,13 +1523,13 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     // \~spanish Un paquete sellado ahora con la fase 1, entregado solo despues de la actualizacion siguiente.  \~
     say(k, "late ");
     uint8_t late[1500];
-    const size_t late_n = k.client.build_datagram(late, sizeof late, k.now);
+    const size_t late_n = k.client.build_datagram(g_sent,late, sizeof late, k.now);
     check(late_n != 0, "the late packet was not built");
     expect_update(k.client.update_keys(k.now), KeyUpdate::Started, "the second update did not start");
     check(!k.client.key_phase(), "the client did not move back to phase 0");
     say(k, "three ");
     pump(k, 1);
-    k.server.on_datagram(late, late_n, Ecn::NotEct, k.now);
+    k.server.on_datagram(kPath,late, late_n, Ecn::NotEct, k.now);
     check(k.server.key_updates().opened_with_old == 1, "a late packet was not opened with the old keys");
     pump(k, 5);
     const std::string got = heard(k);
@@ -1528,7 +1541,7 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         const uint64_t forged = k.server.drops().forged;
         const bool phase = k.server.key_phase();
         const size_t n = craft_one_rtt(cr, a, 99, 0, !phase, 100000, pkt);
-        k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
+        k.server.on_datagram(kPath,pkt, n, Ecn::NotEct, k.now);
         check(k.server.drops().forged == forged + 1 && k.server.key_phase() == phase &&
                   k.server.state() == ConnState::Active,
               "a forged packet in the other phase was not just dropped");
@@ -1539,10 +1552,10 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     {
         KeyPair v(cr, a, cc, sc);
         const size_t n1 = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
-        v.server.on_datagram(pkt, n1, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n1, Ecn::NotEct, v.now);
         check(v.server.key_updates().read_rolled == 1, "a well made update was not taken");
         const size_t n0 = craft_one_rtt(cr, a, 3, 0, false, 11, pkt);
-        v.server.on_datagram(pkt, n0, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n0, Ecn::NotEct, v.now);
         check(v.server.state() == ConnState::Closing &&
                   v.server.close_code() == static_cast<uint64_t>(TransportError::KeyUpdateError) &&
                   v.server.key_updates().old_after_new == 1,
@@ -1553,9 +1566,9 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     {
         KeyPair v(cr, a, cc, sc);
         const size_t n1 = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
-        v.server.on_datagram(pkt, n1, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n1, Ecn::NotEct, v.now);
         const size_t n0 = craft_one_rtt(cr, a, 3, 0, false, 9, pkt);
-        v.server.on_datagram(pkt, n0, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n0, Ecn::NotEct, v.now);
         check(v.server.state() == ConnState::Active && v.server.key_updates().opened_with_old == 1,
               "an old packet numbered before the update was refused");
     }
@@ -1565,11 +1578,11 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     {
         KeyPair v(cr, a, cc, sc);
         size_t n = craft_one_rtt(cr, a, 3, 1, true, 20, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         n = craft_one_rtt(cr, a, 3, 1, true, 15, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         n = craft_one_rtt(cr, a, 3, 0, false, 17, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         check(v.server.state() == ConnState::Closing && v.server.key_updates().old_after_new == 1,
               "old keys above a late new packet were taken as late");
     }
@@ -1583,11 +1596,11 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         expect_update(v.client.update_keys(v.now), KeyUpdate::Started, "the first update did not start");
         say(v, "lost ");
         uint8_t out[1500];
-        check(v.client.build_datagram(out, sizeof out, v.now) != 0, "no packet under the new keys");
+        check(v.client.build_datagram(g_sent,out, sizeof out, v.now) != 0, "no packet under the new keys");
         // \~english The server's answer, carrying no ACK at all.
         // \~spanish La respuesta del servidor, sin ningun ACK.  \~
         const size_t n = craft_one_rtt(cr, a, 4, 1, true, 1000, pkt, true);
-        v.client.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.client.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         check(v.client.key_updates().read_rolled == 1, "the crafted answer was not taken");
         v.client.on_timer(v.now + 5000000);
         check(v.client.key_updates().old_discarded == 1, "the old keys were not dropped");
@@ -1621,9 +1634,9 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     {
         KeyPair v(cr, a, cc, sc);
         size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         n = craft_one_rtt(cr, a, 3, 2, false, 11, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         check(v.server.state() == ConnState::Closing &&
                   v.server.close_code() == static_cast<uint64_t>(TransportError::KeyUpdateError) &&
                   v.server.key_updates().updated_twice == 1,
@@ -1634,12 +1647,12 @@ void test_key_update_rules(Crypto &cr, Aead a) {
     {
         KeyPair v(cr, a, cc, sc);
         size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         uint8_t out[1500];
-        check(v.server.build_datagram(out, sizeof out, v.now + 30000) != 0,
+        check(v.server.build_datagram(g_sent,out, sizeof out, v.now + 30000) != 0,
               "the server did not acknowledge the update");
         n = craft_one_rtt(cr, a, 3, 2, false, 11, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now + 40000);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now + 40000);
         check(v.server.state() == ConnState::Active && v.server.key_updates().read_rolled == 2 &&
                   v.server.key_updates().answered == 2,
               "a second update after the first was acknowledged was refused");
@@ -1653,7 +1666,7 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         KeyPair v(cr, a, cc, tight);
         for (uint64_t i = 0; i < 4; ++i) {
             const size_t n = craft_one_rtt(cr, a, 99, 0, false, 20 + i, pkt);
-            v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+            v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
             check(v.server.state() == (i < 3 ? ConnState::Active : ConnState::Closing),
                   "the integrity limit was not applied at exactly its value");
         }
@@ -1671,7 +1684,7 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         say(v, big.c_str());
         uint8_t out[1500];
         int sent = 0;
-        while (v.client.build_datagram(out, sizeof out, v.now) != 0) ++sent;
+        while (v.client.build_datagram(g_sent,out, sizeof out, v.now) != 0) ++sent;
         check(sent == 6 && v.client.state() == ConnState::Closed &&
                   v.client.close_code() == static_cast<uint64_t>(TransportError::AeadLimitReached),
               "the confidentiality limit did not stop the connection at exactly its value");
@@ -1688,12 +1701,12 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         // \~english The client starts an update; the server answers it...
         // \~spanish El cliente empieza una actualizacion; el servidor la contesta...  \~
         size_t n = craft_one_rtt(cr, a, 3, 1, true, 10, pkt);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, v.now);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, v.now);
         check(v.server.key_updates().answered == 1, "the server did not answer the update");
         expect_update(v.server.update_keys(v.now), KeyUpdate::Unacknowledged,
                       "an update before the answer was acknowledged was not refused");
         uint8_t out[1500];
-        check(v.server.build_datagram(out, sizeof out, v.now) != 0, "the server sent no answer");
+        check(v.server.build_datagram(g_sent,out, sizeof out, v.now) != 0, "the server sent no answer");
         // \~english ...its old keys go, and only then does the ACK of its answer come.
         // \~spanish ...sus claves viejas se van, y solo entonces llega el ACK de su respuesta.  \~
         const uint64_t late = v.now + 20000000;
@@ -1701,7 +1714,7 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         check(v.server.key_updates().old_discarded == 1, "the old keys were not dropped");
         const uint8_t ack[] = {0x02, 0x00, 0x00, 0x00, 0x00};  // \~english ACK of packet 0  \~spanish ACK del paquete 0  \~
         n = craft_one_rtt(cr, a, 3, 1, true, 11, pkt, false, ack, sizeof ack);
-        v.server.on_datagram(pkt, n, Ecn::NotEct, late);
+        v.server.on_datagram(kPath,pkt, n, Ecn::NotEct, late);
         expect_update(v.server.update_keys(late), KeyUpdate::TooSoon,
                       "an update right after the confirming ACK was not refused");
         expect_update(v.server.update_keys(late + 600000000), KeyUpdate::Started,
@@ -1732,7 +1745,7 @@ size_t new_cid_frame(uint8_t *out, uint64_t seq, uint64_t rpt, uint8_t fill) {
 void to_server(Crypto &cr, KeyPair &k, uint64_t pn, const uint8_t *frames, size_t n) {
     uint8_t pkt[1500];
     const size_t len = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, pn, pkt, false, frames, n);
-    k.server.on_datagram(pkt, len, Ecn::NotEct, k.now);
+    k.server.on_datagram(kPath,pkt, len, Ecn::NotEct, k.now);
 }
 
 /// \~english Checks the server is still active; when not, says how it ended.
@@ -1823,7 +1836,7 @@ void test_cid_rules(Crypto &cr) {
               "a Retire Prior To did not make room before the limit");
         check(k.server.peer_cid_sequence() == 2, "retiring the ID in use did not move to the lowest left");
         uint8_t out[1500];
-        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.server.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         check(k.server.sent().retire_connection_id == 2, "the two retirements owed were not sent");
         // \~english A number under Retire Prior To arriving late is retired at once, never kept.
@@ -1832,7 +1845,7 @@ void test_cid_rules(Crypto &cr) {
         const uint64_t received = k.server.cids().received;
         to_server(cr, k, 5, f, n);
         check(k.server.cids().received == received, "an ID under Retire Prior To was kept");
-        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.server.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         check(k.server.sent().retire_connection_id == 3, "a late ID under Retire Prior To was not retired");
     }
@@ -1899,7 +1912,7 @@ void test_cid_rules(Crypto &cr) {
         // \~english Addressed with a zero-length ID: no destination bytes at all.
         // \~spanish Dirigido con identificador de longitud cero: ningun byte de destino.  \~
         const size_t len = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, 1, pkt, false, f, n, 0);
-        k.server.on_datagram(pkt, len, Ecn::NotEct, k.now);
+        k.server.on_datagram(kPath,pkt, len, Ecn::NotEct, k.now);
         check(server_closed_with(k, TransportError::ProtocolViolation),
               "a RETIRE to an end with a zero-length ID was not a PROTOCOL_VIOLATION");
     }
@@ -1972,7 +1985,7 @@ void test_cid_rules(Crypto &cr) {
         for (int i = 0; i < 20; ++i) {
             k.now += 30000;
             size_t m;
-            while ((m = k.server.build_datagram(out, sizeof out, k.now)) != 0)
+            while ((m = k.server.build_datagram(g_sent,out, sizeof out, k.now)) != 0)
                 if (m < smallest) smallest = m;
         }
         check(smallest != 1500 && smallest >= sc.local_cid_len + 22,
@@ -1981,10 +1994,10 @@ void test_cid_rules(Crypto &cr) {
         // \~english The smallest there is: a probe carrying only a PING (1 + 8 + 1 + 3 + 16 = 29 unpadded).
         // \~spanish El mas pequeno que hay: un sondeo que solo lleva un PING (1 + 8 + 1 + 3 + 16 = 29 sin relleno).  \~
         say(k, "x");
-        check(k.client.build_datagram(out, sizeof out, k.now) != 0, "the client sent nothing");
+        check(k.client.build_datagram(g_sent,out, sizeof out, k.now) != 0, "the client sent nothing");
         const uint64_t t = k.client.timer();
         k.client.on_timer(t);
-        const size_t probe = k.client.build_datagram(out, sizeof out, t);
+        const size_t probe = k.client.build_datagram(g_sent,out, sizeof out, t);
         check(probe == cc.local_cid_len + 22, "a PING-only probe was not padded to the ID plus 22 bytes");
     }
 
@@ -2018,7 +2031,7 @@ void test_cid_rules(Crypto &cr) {
         wrong[0] ^= 1;
         uint8_t pkt[64];
         size_t m = write_stateless_reset(cr, wrong, 60, pkt, sizeof pkt);
-        k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+        k.client.on_datagram(kPath,pkt, m, Ecn::NotEct, k.now);
         check(k.client.state() == ConnState::Active && !k.client.closed_by_reset(),
               "a reset with the wrong token ended the connection");
 
@@ -2029,14 +2042,14 @@ void test_cid_rules(Crypto &cr) {
         Acceptor gone(cr, ac);
         say(k, "anyone there?");
         uint8_t out[1500], reply[1500];
-        m = k.client.build_datagram(out, sizeof out, k.now);
+        m = k.client.build_datagram(g_sent,out, sizeof out, k.now);
         const Admission ad = gone.on_datagram(out, m, kClientAddr, sizeof kClientAddr, k.now, reply,
                                               sizeof reply);
         check(ad.reason == AdmitReason::SentStatelessReset, "the acceptor did not answer with a reset");
-        k.client.on_datagram(reply, ad.reply_len, Ecn::NotEct, k.now);
+        k.client.on_datagram(kPath,reply, ad.reply_len, Ecn::NotEct, k.now);
         check(k.client.closed_by_reset() && k.client.state() == ConnState::Draining,
               "the client did not recognise the reset for its server");
-        check(k.client.build_datagram(out, sizeof out, k.now) == 0, "a reset connection still sends");
+        check(k.client.build_datagram(g_sent,out, sizeof out, k.now) == 0, "a reset connection still sends");
     }
     // \~english The token of an ID the client holds but never sent to does not count (10.3.1)...
     // \~spanish El testigo de un identificador que el cliente tiene pero al que nunca mando no cuenta (10.3.1)...  \~
@@ -2051,7 +2064,7 @@ void test_cid_rules(Crypto &cr) {
         check(k.server.local_cid(1, seq, cid, token) && seq == 1, "the server's second ID is not listed");
         uint8_t pkt[64];
         size_t m = write_stateless_reset(cr, token, 60, pkt, sizeof pkt);
-        k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+        k.client.on_datagram(kPath,pkt, m, Ecn::NotEct, k.now);
         check(k.client.state() == ConnState::Active, "the token of an ID never sent to ended the connection");
 
         // \~english Once the client moves to that ID, its token does count -- in any header form (10.3).
@@ -2066,7 +2079,7 @@ void test_cid_rules(Crypto &cr) {
         if (used_token != nullptr) {
             m = write_stateless_reset(cr, used_token, 60, pkt, sizeof pkt);
             pkt[0] |= 0x80;
-            k.client.on_datagram(pkt, m, Ecn::NotEct, k.now);
+            k.client.on_datagram(kPath,pkt, m, Ecn::NotEct, k.now);
             check(k.client.closed_by_reset(), "the token of the ID in use did not end the connection");
         }
     }
@@ -2082,27 +2095,38 @@ void test_cid_rules(Crypto &cr) {
 
 /// \~english The frames of a server 1-RTT datagram (tag 4, generation 0), opened as the client would.
 /// \~spanish Las tramas de un datagrama 1-RTT del servidor (marca 4, generacion 0), abiertas como el cliente.  \~
-std::vector<Frame> server_frames(Crypto &cr, uint8_t *dgram, size_t n, std::vector<uint8_t> &payload) {
+std::vector<Frame> frames_of(Crypto &cr, uint8_t tag, uint8_t *dgram, size_t n, std::vector<uint8_t> &payload,
+                             uint64_t expected_pn = 0, uint64_t *pn = nullptr) {
     std::vector<Frame> frames;
     uint8_t s[kMaxSecret];
-    secret(s, 4, 32);
+    secret(s, tag, 32);
     KeyMaterial m;
     PacketKeys k;
     if (!derive_key_material(cr, kVersion1, Aead::Aes128Gcm, s, 32, m) || !prepare_keys(cr, m, k)) return frames;
     HeaderContext hc;
     PacketHeader h;
     Unprotected u;
-    if (parse_packet(dgram, n, hc, h) == HeaderError::None && unprotect_packet(cr, k, dgram, h, 0, u) == Unprotect::Ok) {
+    // \~english On a copy: opening works in place, and the caller may still want the bytes as sent.
+    // \~spanish Sobre una copia: abrir trabaja en su sitio, y quien llama puede querer aun los bytes tal como salieron.  \~
+    std::vector<uint8_t> copy(dgram, dgram + n);
+    dgram = copy.data();
+    if (parse_packet(dgram, n, hc, h) == HeaderError::None &&
+        unprotect_packet(cr, k, dgram, h, expected_pn, u) == Unprotect::Ok) {
+        if (pn != nullptr) *pn = u.pn;
         payload.assign(dgram + u.payload.off, dgram + u.payload.off + u.payload.len);
         FrameContext fc;
         fc.packet = PacketType::OneRtt;
-        fc.is_server = false;
+        fc.is_server = tag == 3;
         FrameReader fr(payload.data(), payload.size(), fc);
         Frame f;
         while (fr.next(f) == FrameReader::Step::Frame) frames.push_back(f);
     }
     forget_keys(cr, k);
     return frames;
+}
+
+std::vector<Frame> server_frames(Crypto &cr, uint8_t *dgram, size_t n, std::vector<uint8_t> &payload) {
+    return frames_of(cr, 4, dgram, n, payload);
 }
 
 bool has_frame(const std::vector<Frame> &fs, FrameType t) {
@@ -2129,14 +2153,14 @@ void test_audit_rules(Crypto &cr) {
         KeyPair k(cr, Aead::Aes128Gcm, cc, talk);
         pump(k, 10);
         say(k, "ping");
-        const size_t n = k.client.build_datagram(out, sizeof out, k.now);
-        k.server.on_datagram(out, n, Ecn::NotEct, k.now);
+        const size_t n = k.client.build_datagram(g_sent,out, sizeof out, k.now);
+        k.server.on_datagram(kPath,out, n, Ecn::NotEct, k.now);
         heard(k);
         Stream *st = k.server.streams().find(0);
         size_t took = 0;
         const uint8_t pong[] = {'p', 'o', 'n', 'g'};
         if (st != nullptr) st->send->write(pong, sizeof pong, took);
-        const size_t m = k.server.build_datagram(out, sizeof out, k.now + 1000);
+        const size_t m = k.server.build_datagram(g_sent,out, sizeof out, k.now + 1000);
         std::vector<uint8_t> payload;
         const std::vector<Frame> fs = server_frames(cr, out, m, payload);
         if (!(has_frame(fs, FrameType::Stream) && has_frame(fs, FrameType::Ack))) {
@@ -2161,10 +2185,10 @@ void test_audit_rules(Crypto &cr) {
         size_t took = 0;
         const uint8_t hi[] = {'h', 'i'};
         st->send->write(hi, 2, took);
-        const size_t n = client.build_datagram(out, sizeof out, 1000);
-        server.on_datagram(out, n, Ecn::NotEct, 1000);  // \~english kept: not confirmed yet  \~spanish guardado: aun sin confirmar  \~
+        const size_t n = client.build_datagram(g_sent,out, sizeof out, 1000);
+        server.on_datagram(kPath,out, n, Ecn::NotEct, 1000);  // \~english kept: not confirmed yet  \~spanish guardado: aun sin confirmar  \~
         server.handshake_confirmed(81000);              // \~english 80 ms later  \~spanish 80 ms despues  \~
-        const size_t m = server.build_datagram(out, sizeof out, 81000);
+        const size_t m = server.build_datagram(g_sent,out, sizeof out, 81000);
         std::vector<uint8_t> payload;
         uint64_t delay = 0;
         for (const Frame &f : server_frames(cr, out, m, payload))
@@ -2178,12 +2202,12 @@ void test_audit_rules(Crypto &cr) {
         KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
         pump(k, 10);
         say(k, "x");
-        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.client.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         check(k.client.recovery().app_limited(), "a sender with room left was not application-limited");
         std::string big(200000, 'y');
         say(k, big.c_str());
-        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.client.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         check(!k.client.recovery().app_limited(), "a sender that filled the window was taken as application-limited");
     }
@@ -2199,7 +2223,7 @@ void test_audit_rules(Crypto &cr) {
         say(k, big.c_str());
         check(k.client.streams().open(true) == nullptr, "a stream past the peer's limit was opened");
         for (int i = 0; i < 3; ++i)
-            while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+            while (k.client.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
             }
         check(k.client.sent().data_blocked == 1, "DATA_BLOCKED was not sent exactly once at the limit");
         check(k.client.sent().streams_blocked == 1, "STREAMS_BLOCKED was not sent exactly once at the limit");
@@ -2210,7 +2234,7 @@ void test_audit_rules(Crypto &cr) {
         KeyPair k(cr, Aead::Aes128Gcm, tight, sc);
         std::string big(5000, 'z');
         say(k, big.c_str());
-        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.client.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         check(k.client.sent().stream_data_blocked == 1 && k.client.sent().data_blocked == 0,
               "STREAM_DATA_BLOCKED was not sent exactly once at the stream's limit");
@@ -2229,7 +2253,7 @@ void test_audit_rules(Crypto &cr) {
         if (server == nullptr) return;
         drive_handshake_server_first(cr, *server);
         server->close(static_cast<uint64_t>(TransportError::ProtocolViolation), false, 0, 2000);
-        const size_t m = server->build_datagram(out, sizeof out, 2000);
+        const size_t m = server->build_datagram(g_sent,out, sizeof out, 2000);
         HeaderContext hc;
         hc.short_dcid_len = 8;
         size_t pos = 0, packets = 0;
@@ -2253,13 +2277,13 @@ void test_audit_rules(Crypto &cr) {
         KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
         pump(k, 5);
         k.server.close(0, true, 0, k.now);
-        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        while (k.server.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
         }
         const uint64_t first = k.server.sent().connection_close;
         for (uint64_t i = 0; i < 8; ++i) {
             const size_t n = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, 500 + i, pkt);
-            k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
-            while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+            k.server.on_datagram(kPath,pkt, n, Ecn::NotEct, k.now);
+            while (k.server.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
             }
         }
         check(k.server.sent().connection_close - first == 4,
@@ -2270,8 +2294,8 @@ void test_audit_rules(Crypto &cr) {
         const uint64_t before = k.server.sent().connection_close;
         for (uint64_t i = 0; i < 8; ++i) {
             const size_t n = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 90 + i, 1200, pkt);
-            k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
-            while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+            k.server.on_datagram(kPath,pkt, n, Ecn::NotEct, k.now);
+            while (k.server.build_datagram(g_sent,out, sizeof out, k.now) != 0) {
             }
         }
         check(k.server.sent().connection_close - before == 1,
@@ -2312,7 +2336,7 @@ void test_audit_rules(Crypto &cr) {
         size_t a1 = craft_initial(cr, false, c2.peer_cid, server_cid, c2.local_cid, nullptr, 0, 30, 1200, two);
         size_t a2 = craft_initial(cr, false, c2.peer_cid, other, c2.local_cid, nullptr, 0, 31, 100, two + a1);
         const uint64_t wrong = server->drops().wrong_cid;
-        server->on_datagram(two, a1 + a2, Ecn::NotEct, 2000);
+        server->on_datagram(kPath,two, a1 + a2, Ecn::NotEct, 2000);
         check(server->drops().wrong_cid == wrong + 1,
               "a coalesced packet with another destination ID was not ignored");
     }
@@ -2324,8 +2348,8 @@ void test_audit_rules(Crypto &cr) {
         Connection client(cr, c2);
         client.set_initial_keys(c2.peer_cid, 8);
         write_crypto(client, Space::Initial, 300);
-        check(client.build_datagram(out, 1000, 0) == 0, "an Initial was built without room for 1200 bytes");
-        const size_t m = client.build_datagram(out, sizeof out, 0);
+        check(client.build_datagram(g_sent,out, 1000, 0) == 0, "an Initial was built without room for 1200 bytes");
+        const size_t m = client.build_datagram(g_sent,out, sizeof out, 0);
         PacketKeys rk, wk;
         make_initial_keys(cr, kVersion1, c2.peer_cid, 8, true, rk, wk);
         HeaderContext hc;
@@ -2344,6 +2368,631 @@ void test_audit_rules(Crypto &cr) {
         forget_keys(cr, rk);
         forget_keys(cr, wk);
         check(crypto, "the ClientHello did not survive a build that had no room");
+    }
+}
+
+/* \~english
+ * Paths and migration (RFC 9000, 8.2 and 9).  Two ends with 1-RTT keys, a
+ * server address, and a client that has up to three local addresses, each
+ * seen by the server through a NAT as its "face".  Changing a face without
+ * the client knowing is a NAT rebinding; delivering a copy from an address
+ * nobody owns is an attacker.
+ * \~spanish
+ * Caminos y migracion (RFC 9000, 8.2 y 9).  Dos extremos con claves 1-RTT, una
+ * direccion de servidor, y un cliente con hasta tres direcciones locales, cada
+ * una vista por el servidor a traves de un NAT como su "cara".  Cambiar una cara
+ * sin que el cliente lo sepa es un cambio de NAT; entregar una copia desde una
+ * direccion que no es de nadie es un atacante.
+ * \~ */
+
+Address addr(uint8_t host, uint8_t port) {
+    const uint8_t b[6] = {203, 0, 113, host, 0x11, port};
+    Address a;
+    make_address(b, sizeof b, a);
+    return a;
+}
+
+/// \~english One datagram as it left, and where to.  \~spanish Un datagrama tal como salio, y a donde.  \~
+struct Sent {
+    Path path;
+    std::vector<uint8_t> bytes;
+};
+
+struct MoveNet {
+    MoveNet(Crypto &c, const ConnectionConfig &cc, const ConnectionConfig &sc)
+        : k(c, Aead::Aes128Gcm, cc, sc), cr(&c) {}
+    KeyPair k;
+    Address server = addr(1, 1);
+    Address local[3] = {addr(10, 1), addr(11, 1), addr(12, 1)};
+    Address face[3] = {addr(10, 1), addr(11, 1), addr(12, 1)};
+    bool to_client = true;
+    bool to_server = true;
+    std::vector<Sent> from_client;
+    std::vector<Sent> from_server;
+    uint64_t lost_to_nobody = 0;
+    /// \~english The number of the client's latest packet, to craft the next one by hand.
+    /// \~spanish El numero del ultimo paquete del cliente, para fabricar a mano el siguiente.  \~
+    uint64_t client_pn = 0;
+    uint64_t server_pn = 0;
+    Crypto *cr = nullptr;
+};
+
+/// \~english Both configured for the client's first address, with room to hand out IDs.
+/// \~spanish Los dos configurados para la primera direccion del cliente, con sitio para repartir identificadores.  \~
+void move_configs(ConnectionConfig &cc, ConnectionConfig &sc) {
+    cc = key_client();
+    sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    cc.peer_active_cid_limit = 4;
+    sc.peer_active_cid_limit = 4;
+    cc.path.local = addr(10, 1);
+    cc.path.peer = addr(1, 1);
+    sc.path.local = addr(1, 1);
+    sc.path.peer = addr(10, 1);
+}
+
+/// \~english The client's datagram arrives at the server from the face of the local address it left.
+/// \~spanish El datagrama del cliente llega al servidor desde la cara de la direccion local por la que salio.  \~
+void deliver_to_server(MoveNet &m, const Path &sent, uint8_t *d, size_t n) {
+    for (size_t i = 0; i < 3; ++i)
+        if (same_address(sent.local, m.local[i])) {
+            Path at;
+            at.local = m.server;
+            at.peer = m.face[i];
+            m.k.server.on_datagram(at, d, n, Ecn::NotEct, m.k.now);
+            return;
+        }
+    ++m.lost_to_nobody;
+}
+
+/// \~english The server's datagram reaches the client only at a face some local address has now.
+/// \~spanish El datagrama del servidor solo llega al cliente en una cara que tenga ahora alguna direccion local.  \~
+void deliver_to_client(MoveNet &m, const Path &sent, uint8_t *d, size_t n) {
+    for (size_t i = 0; i < 3; ++i)
+        if (same_address(sent.peer, m.face[i])) {
+            Path at;
+            at.local = m.local[i];
+            at.peer = sent.local;
+            m.k.client.on_datagram(at, d, n, Ecn::NotEct, m.k.now);
+            return;
+        }
+    ++m.lost_to_nobody;
+}
+
+void move_pump(MoveNet &m, int rounds, uint64_t step = 5000) {
+    uint8_t buf[1500];
+    for (int r = 0; r < rounds; ++r) {
+        size_t n;
+        Path p;
+        while ((n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now)) != 0) {
+            m.from_client.push_back({p, std::vector<uint8_t>(buf, buf + n)});
+            std::vector<uint8_t> payload;
+            frames_of(*m.cr, 3, buf, n, payload, m.client_pn + 1, &m.client_pn);
+            if (m.to_server) deliver_to_server(m, p, buf, n);
+        }
+        while ((n = m.k.server.build_datagram(p, buf, sizeof buf, m.k.now)) != 0) {
+            m.from_server.push_back({p, std::vector<uint8_t>(buf, buf + n)});
+            std::vector<uint8_t> payload;
+            frames_of(*m.cr, 4, buf, n, payload, m.server_pn + 1, &m.server_pn);
+            if (m.to_client) deliver_to_client(m, p, buf, n);
+        }
+        m.k.now += step;
+        if (m.k.client.timer() <= m.k.now) m.k.client.on_timer(m.k.now);
+        if (m.k.server.timer() <= m.k.now) m.k.server.on_timer(m.k.now);
+    }
+}
+
+/// \~english Two ends past their handshake, with the IDs each gave the other already delivered.
+/// \~spanish Dos extremos pasado su saludo, con los identificadores que se dieron ya entregados.  \~
+void move_start(MoveNet &m) {
+    // \~english The handshake would have proven the client's address.
+    // \~spanish El saludo habria probado la direccion del cliente.  \~
+    m.k.server.set_address_validated(m.k.now);
+    say(m.k, "hello");
+    move_pump(m, 10);
+    check(heard(m.k) == "hello", "the pair did not talk before moving");
+    m.from_client.clear();
+    m.from_server.clear();
+}
+
+/// \~english The destination ID of a short-header datagram: its 8 bytes after the first.
+/// \~spanish El identificador de destino de un datagrama de cabecera corta: sus 8 bytes tras el primero.  \~
+std::string dcid_of(const Sent &s) {
+    return s.bytes.size() > 9 ? std::string(s.bytes.begin() + 1, s.bytes.begin() + 9) : std::string();
+}
+
+void expect_migration(Migration got, Migration want, const char *what) {
+    if (got == want) return;
+    std::fprintf(stderr, "FAIL [%s]: %s (got %s, wanted %s)\n", current, what, migration_name(got),
+                 migration_name(want));
+    ++failures;
+}
+
+void test_paths(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/paths", cr.name());
+    ConnectionConfig cc, sc;
+    move_configs(cc, sc);
+
+    /* \~english
+     * A NAT rebinding: the client's face changes and it does not know.  The
+     * server moves to the new address on the next non-probing packet (9.3),
+     * validates it and the old one (9.3.3), limits what it sends there to
+     * three times what came from it until proven (9.3.1), keeps the same ID
+     * since the peer did (9.5), and starts congestion control over once the
+     * address is proven (9.4).  The first challenge could not be 1200 bytes,
+     * so the path's MTU is checked again full size (8.2.3).
+     * \~spanish
+     * Un cambio de NAT: la cara del cliente cambia y el no lo sabe.  El servidor
+     * se mueve a la direccion nueva con el siguiente paquete no de sondeo (9.3),
+     * la valida a ella y a la vieja (9.3.3), limita lo que manda alli a tres
+     * veces lo que llego de ella hasta probarla (9.3.1), mantiene el mismo
+     * identificador porque el otro lo mantuvo (9.5), y empieza de cero el control
+     * de congestion cuando la direccion queda probada (9.4).  El primer desafio no
+     * pudo ser de 1200 bytes, asi que la MTU del camino se comprueba otra vez a
+     * tamano completo (8.2.3).
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        const uint64_t seq_before = m.k.server.peer_cid_sequence();
+        m.face[0] = addr(20, 7);
+        say(m.k, "after");
+        uint8_t buf[1500];
+        Path p;
+        const size_t n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now);
+        m.from_client.push_back({p, std::vector<uint8_t>(buf, buf + n)});
+        deliver_to_server(m, p, buf, n);
+        check(same_address(m.k.server.path().peer, addr(20, 7)) && m.k.server.paths().peer_migrations == 1,
+              "the server did not follow the client to its new address");
+
+        uint64_t first_out = 0;
+        move_pump(m, 3);
+        for (const Sent &s : m.from_server)
+            if (same_address(s.path.peer, addr(20, 7))) {
+                first_out += s.bytes.size();
+                break;
+            }
+        check(first_out != 0 && first_out <= 3 * n, "the server sent an unproven address more than three times what came from it");
+
+        move_pump(m, 800);
+        const PathCounts &pc = m.k.server.paths();
+        check(pc.validated >= 2 && pc.revalidated_mtu >= 1, "the new address was not validated, then its MTU");
+        bool full = false;
+        for (const Sent &s : m.from_server)
+            if (same_address(s.path.peer, addr(20, 7)) && s.bytes.size() >= 1200) full = true;
+        check(full, "no full-size datagram checked the new path's MTU");
+        check(pc.congestion_resets == 1 && m.k.server.recovery().path_resets() == 1,
+              "congestion control did not start over on the proven address");
+        check(pc.challenges_sent >= 2 && pc.abandoned >= 1,
+              "the old address was not challenged, or its failed check never ended");
+        check(m.k.server.peer_cid_sequence() == seq_before && pc.no_connection_id == 0,
+              "a peer that kept its ID across a NAT rebinding was given another");
+        check(heard(m.k) == "after" && m.k.server.state() == ConnState::Active,
+              "the data sent across the rebinding did not arrive");
+        // \~english The client answered on its own path, expanded: no limit binds a client (8.2.2, 21.1.1.1).
+        // \~spanish El cliente contesto por su propio camino, ampliado: ningun limite ata a un cliente (8.2.2, 21.1.1.1).  \~
+        check(m.k.client.paths().responses_sent >= 2, "the client did not answer the challenges");
+        bool expanded = false;
+        for (const Sent &s : m.from_client)
+            if (s.bytes.size() >= 1200) expanded = true;
+        check(expanded, "the client's PATH_RESPONSE was not expanded to 1200 bytes");
+    }
+
+    /* \~english
+     * 9.3.2/9.3.3: an attacker's copy arrives first from an address nobody
+     * owns.  The server moves there but sends it no more than three times
+     * the copy, and challenges the old path; the client, challenged on its
+     * active path, answers with a non-probing packet, and that higher packet
+     * number brings the server straight back.  No congestion reset: the
+     * attacker's address was never proven.
+     * \~spanish
+     * 9.3.2/9.3.3: la copia de un atacante llega primero desde una direccion que
+     * no es de nadie.  El servidor se mueve alli pero no le manda mas de tres
+     * veces la copia, y desafia el camino viejo; el cliente, desafiado en su
+     * camino activo, contesta con un paquete no de sondeo, y ese numero de
+     * paquete mayor devuelve al servidor en el acto.  Sin reinicio de la
+     * congestion: la direccion del atacante nunca quedo probada.
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        say(m.k, "copied");
+        uint8_t buf[1500], copy[1500];
+        Path p;
+        const size_t n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now);
+        std::memcpy(copy, buf, n);
+        Path spoofed;
+        spoofed.local = m.server;
+        spoofed.peer = addr(66, 6);
+        m.k.server.on_datagram(spoofed, copy, n, Ecn::NotEct, m.k.now);
+        deliver_to_server(m, p, buf, n);
+        check(same_address(m.k.server.path().peer, addr(66, 6)), "the server did not follow the copy");
+        check(m.k.server.drops().duplicate >= 1, "the genuine packet behind the copy was not a duplicate");
+
+        move_pump(m, 400);
+        uint64_t to_attacker = 0;
+        for (const Sent &s : m.from_server)
+            if (same_address(s.path.peer, addr(66, 6))) to_attacker += s.bytes.size();
+        check(to_attacker != 0 && to_attacker <= 3 * n, "the attacker's address got more than three times its copy");
+        check(same_address(m.k.server.path().peer, m.face[0]) && m.k.server.paths().peer_migrations == 2,
+              "the client's next packet did not bring the server back");
+        check(m.k.server.paths().congestion_resets == 0, "a spurious migration reset congestion control");
+        check(heard(m.k) == "copied" && m.k.server.state() == ConnState::Active,
+              "the connection did not survive the copy");
+    }
+
+    /* \~english
+     * 9.3.2: the new address fails its validation: back to the last validated
+     * one.  The network goes silent both ways, or the client's next packet
+     * would bring the server back first (9.3.3).
+     * \~spanish
+     * 9.3.2: la direccion nueva no pasa su validacion: vuelta a la ultima
+     * validada.  La red calla en los dos sentidos, o el siguiente paquete del
+     * cliente devolveria antes al servidor (9.3.3).
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        say(m.k, "x");
+        uint8_t buf[1500];
+        Path p;
+        const size_t n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now);
+        Path spoofed;
+        spoofed.local = m.server;
+        spoofed.peer = addr(66, 6);
+        m.k.server.on_datagram(spoofed, buf, n, Ecn::NotEct, m.k.now);
+        m.to_client = false;
+        m.to_server = false;
+        // \~english An attacker's guess at the answer proves nothing (8.2.3).
+        // \~spanish Una respuesta adivinada por un atacante no prueba nada (8.2.3).  \~
+        uint8_t guess[9] = {0x1b, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+        uint8_t pkt[256];
+        const size_t g = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, 5000, pkt, false, guess, sizeof guess);
+        m.k.server.on_datagram(spoofed, pkt, g, Ecn::NotEct, m.k.now);
+        check(m.k.server.paths().stray_responses == 1, "a guessed PATH_RESPONSE was not told apart");
+        move_pump(m, 1200);
+        check(m.k.server.paths().reverted == 1 && same_address(m.k.server.path().peer, m.face[0]) &&
+                  m.k.server.state() == ConnState::Active,
+              "a failed validation did not go back to the last validated address");
+        /* \~english
+         * Challenges no faster than the PTO, doubling (8.2.1, 9.4): within
+         * three initial PTOs that is two, never three.
+         * \~spanish
+         * Desafios no mas deprisa que el PTO, doblando (8.2.1, 9.4): en tres PTO
+         * iniciales son dos, nunca tres.
+         * \~ */
+        unsigned challenges = 0;
+        for (Sent &s : m.from_server) {
+            if (!same_address(s.path.peer, addr(66, 6))) continue;
+            std::vector<uint8_t> payload;
+            for (const Frame &f : frames_of(cr, 4, s.bytes.data(), s.bytes.size(), payload))
+                if (f.type == FrameType::PathChallenge) ++challenges;
+        }
+        check(challenges >= 1 && challenges <= 2, "an unanswered path was challenged faster than the PTO allows");
+    }
+
+    // \~english 9.3: a late packet from the old address, numbered lower, moves nothing back.
+    // \~spanish 9.3: un paquete tardio desde la direccion vieja, de numero menor, no hace volver nada.  \~
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        uint8_t d1[1500], d2[1500];
+        Path p;
+        say(m.k, "a");
+        const size_t n1 = m.k.client.build_datagram(p, d1, sizeof d1, m.k.now);
+        say(m.k, "b");
+        const size_t n2 = m.k.client.build_datagram(p, d2, sizeof d2, m.k.now);
+        Path moved;
+        moved.local = m.server;
+        moved.peer = addr(20, 7);
+        Path old_way;
+        old_way.local = m.server;
+        old_way.peer = m.face[0];
+        m.k.server.on_datagram(moved, d2, n2, Ecn::NotEct, m.k.now);
+        m.k.server.on_datagram(old_way, d1, n1, Ecn::NotEct, m.k.now);
+        check(n1 != 0 && n2 != 0 && same_address(m.k.server.path().peer, addr(20, 7)) &&
+                  m.k.server.paths().peer_migrations == 1,
+              "a reordered packet from the old address moved the server back");
+    }
+
+    // \~english 9.3.3: a challenge on the path in use is answered with a non-probing packet too.
+    // \~spanish 9.3.3: a un desafio en el camino en uso se le contesta tambien con un paquete no de sondeo.  \~
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        // \~english The next number, no gap: nothing else makes the ACK go at once (13.2.1).
+        // \~spanish El numero siguiente, sin hueco: nada mas hace que el ACK salga en el acto (13.2.1).  \~
+        uint8_t challenge[9] = {0x1a, 1, 2, 3, 4, 5, 6, 7, 8};
+        uint8_t pkt[256], out[1500];
+        const size_t g = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, m.client_pn + 1, pkt, false, challenge,
+                                       sizeof challenge);
+        Path here;
+        here.local = m.server;
+        here.peer = m.face[0];
+        m.k.server.on_datagram(here, pkt, g, Ecn::NotEct, m.k.now);
+        const uint64_t pings = m.k.server.sent().ping;
+        Path p;
+        size_t datagrams = 0;
+        while (m.k.server.build_datagram(p, out, sizeof out, m.k.now) != 0) ++datagrams;
+        if (!(m.k.server.paths().responses_sent == 1 && m.k.server.sent().ping == pings + 1 && datagrams == 2)) {
+            std::fprintf(stderr,
+                         "FAIL [%s]: a challenge on the path in use got no non-probing packet besides its answer "
+                         "(%llu answers, %llu pings, %zu datagrams)\n",
+                         current, static_cast<unsigned long long>(m.k.server.paths().responses_sent),
+                         static_cast<unsigned long long>(m.k.server.sent().ping - pings), datagrams);
+            ++failures;
+        }
+    }
+
+    // \~english ...and with no validated address to go back to, the connection is silently gone.
+    // \~spanish ...y sin direccion validada a la que volver, la conexion desaparece en silencio.  \~
+    {
+        MoveNet m(cr, cc, sc);
+        say(m.k, "x");
+        move_pump(m, 10);
+        uint8_t buf[1500];
+        Path p;
+        say(m.k, "y");
+        const size_t n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now);
+        Path spoofed;
+        spoofed.local = m.server;
+        spoofed.peer = addr(66, 6);
+        m.k.server.on_datagram(spoofed, buf, n, Ecn::NotEct, m.k.now);
+        m.to_client = false;
+        m.to_server = false;
+        const uint64_t closes = m.k.server.sent().connection_close;
+        bool closing = false;
+        for (int r = 0; r < 1200; ++r) {
+            move_pump(m, 1);
+            if (m.k.server.state() == ConnState::Closing) closing = true;
+        }
+        check(m.k.server.state() == ConnState::Closed && !closing && m.k.server.sent().connection_close == closes,
+              "with no validated address left the connection did not close silently");
+    }
+
+    // \~english 9: no new address before the handshake is confirmed, nor when migration is disabled.
+    // \~spanish 9: ninguna direccion nueva antes de confirmar el saludo, ni con la migracion desactivada.  \~
+    {
+        ConnectionConfig off = sc;
+        off.disable_active_migration = true;
+        MoveNet m(cr, cc, off);
+        move_start(m);
+        m.face[0] = addr(20, 7);
+        say(m.k, "z");
+        move_pump(m, 3);
+        check(m.k.server.paths().migration_disabled >= 1 && same_address(m.k.server.path().peer, addr(10, 1)),
+              "a server that disabled migration followed the client");
+        check(!m.k.server.closed_by_reset() && m.k.server.state() == ConnState::Active,
+              "a disabled migration ended the connection");
+
+        Connection client(cr, cc);
+        Connection server(cr, sc);
+        install(client, Space::Application, Aead::Aes128Gcm, 4, 3, 0);
+        install(server, Space::Application, Aead::Aes128Gcm, 3, 4, 0);
+        client.handshake_confirmed(0);
+        Stream *st = client.streams().open(true);
+        size_t took = 0;
+        const uint8_t hi[] = {'h', 'i'};
+        st->send->write(hi, 2, took);
+        uint8_t out[1500];
+        Path p;
+        const size_t n = client.build_datagram(p, out, sizeof out, 1000);
+        Path moved;
+        moved.local = addr(1, 1);
+        moved.peer = addr(20, 7);
+        server.on_datagram(moved, out, n, Ecn::NotEct, 1000);
+        check(server.paths().before_confirmed == 1 && same_address(server.path().peer, addr(10, 1)),
+              "a new address was taken before the handshake was confirmed");
+    }
+
+    // \~english 9: a client discards what comes from a server address it does not know.
+    // \~spanish 9: un cliente descarta lo que llega de una direccion del servidor que no conoce.  \~
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        uint8_t pkt[1500];
+        const size_t n = craft_one_rtt(cr, Aead::Aes128Gcm, 4, 0, false, 900, pkt, true);
+        Path other;
+        other.local = m.local[0];
+        other.peer = addr(2, 2);
+        const uint64_t dup = m.k.client.drops().duplicate;
+        m.k.client.on_datagram(other, pkt, n, Ecn::NotEct, m.k.now);
+        check(m.k.client.paths().unknown_address == 1 && m.k.client.drops().duplicate == dup,
+              "a client processed a datagram from an unknown server address");
+    }
+
+    // \~english What a client may not do (9, 9.5, 9.6), each refused with its reason.
+    // \~spanish Lo que un cliente no puede hacer (9, 9.5, 9.6), cada cosa rechazada con su motivo.  \~
+    {
+        Path next;
+        next.local = addr(11, 1);
+        next.peer = addr(1, 1);
+        Connection early(cr, cc);
+        expect_migration(early.migrate(next, 0), Migration::NotConfirmed, "a client moved before confirmation");
+        MoveNet m(cr, cc, sc);
+        expect_migration(m.k.server.migrate(next, 0), Migration::NotClient, "a server started a migration");
+        expect_migration(m.k.client.migrate(next, 0), Migration::NoConnectionId,
+                         "a client moved with no unused ID of the server's");
+        move_start(m);
+        expect_migration(m.k.client.migrate(m.k.client.path(), m.k.now), Migration::SamePath,
+                         "moving to the path in use was not refused");
+        Path elsewhere = next;
+        elsewhere.peer = addr(2, 2);
+        expect_migration(m.k.client.probe_path(elsewhere, m.k.now), Migration::UnknownServer,
+                         "a client probed a server address it was never given");
+        ConnectionConfig no_move = cc;
+        no_move.peer_disable_active_migration = true;
+        MoveNet d(cr, no_move, sc);
+        move_start(d);
+        expect_migration(d.k.client.migrate(next, d.k.now), Migration::Disabled,
+                         "a client moved although the server disabled migration");
+    }
+
+    /* \~english
+     * 9.2: the client moves.  It sends from the new address at once, with an
+     * ID of the server's never used before (9.5); the server follows, and
+     * since the ID changed it answers with one of the client's never used
+     * before too.  Each end validates the path and starts congestion control
+     * over on it (9.4).  And a stateless reset only counts from the address
+     * its ID was sent to (10.3.1).
+     * \~spanish
+     * 9.2: el cliente se mueve.  Manda desde la direccion nueva en el acto, con un
+     * identificador del servidor nunca usado antes (9.5); el servidor le sigue, y
+     * como el identificador cambio contesta tambien con uno del cliente nunca
+     * usado.  Cada extremo valida el camino y empieza de cero el control de
+     * congestion en el (9.4).  Y un reinicio sin estado solo cuenta desde la
+     * direccion a la que se mando su identificador (10.3.1).
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        say(m.k, "old");
+        move_pump(m, 2);
+        std::string client_dcid_before, server_dcid_before;
+        for (const Sent &s : m.from_client) client_dcid_before = dcid_of(s);
+        for (const Sent &s : m.from_server) server_dcid_before = dcid_of(s);
+        heard(m.k);
+        m.from_client.clear();
+        m.from_server.clear();
+
+        Path next;
+        next.local = m.local[1];
+        next.peer = m.server;
+        expect_migration(m.k.client.migrate(next, m.k.now), Migration::Started, "the client could not move");
+        say(m.k, "moved");
+        move_pump(m, 400);
+        /* \~english
+         * From the new address, only a new ID; from the old one, only the
+         * answers to the server's challenges there, which MUST go back on
+         * the path they came on (8.2.2).
+         * \~spanish
+         * Desde la direccion nueva, solo un identificador nuevo; desde la vieja,
+         * solo las respuestas a los desafios del servidor alli, que DEBEN volver
+         * por el camino por el que llegaron (8.2.2).
+         * \~ */
+        bool all_new = !m.from_client.empty();
+        for (Sent &s : m.from_client) {
+            if (same_address(s.path.local, m.local[1])) {
+                if (dcid_of(s) == client_dcid_before) all_new = false;
+                continue;
+            }
+            std::vector<uint8_t> payload;
+            for (const Frame &f : frames_of(cr, 3, s.bytes.data(), s.bytes.size(), payload))
+                if (f.type != FrameType::PathResponse && f.type != FrameType::Padding) all_new = false;
+        }
+        check(all_new, "the client sent more than path answers from its old address, or reused the old ID from the new one");
+        bool server_new = false;
+        for (const Sent &s : m.from_server)
+            if (same_address(s.path.peer, m.face[1]) && !dcid_of(s).empty() && dcid_of(s) != server_dcid_before)
+                server_new = true;
+        check(server_new, "the server sent to the new address with an ID already used on the old one");
+        check(heard(m.k) == "moved" && same_address(m.k.server.path().peer, m.face[1]),
+              "the data sent from the new address did not arrive");
+        check(m.k.client.paths().migrations == 1 && m.k.client.paths().congestion_resets == 1 &&
+                  m.k.server.paths().congestion_resets == 1,
+              "the two ends did not both start congestion control over on the new path");
+
+        // \~english The token of the ID now in use, arriving from the old address: not a reset.
+        // \~spanish El testigo del identificador ahora en uso, llegando desde la direccion vieja: no es un reinicio.  \~
+        const uint8_t *token = nullptr;
+        uint64_t seq;
+        const uint8_t *cid;
+        for (size_t i = 0; m.k.client.local_cid(i, seq, cid, token); ++i)
+            if (seq == m.k.server.peer_cid_sequence()) break;
+        uint8_t pkt[128];
+        if (token != nullptr) {
+            const size_t r = write_stateless_reset(cr, token, 60, pkt, sizeof pkt);
+            Path old_way;
+            old_way.local = m.server;
+            old_way.peer = m.face[0];
+            m.k.server.on_datagram(old_way, pkt, r, Ecn::NotEct, m.k.now);
+            check(!m.k.server.closed_by_reset(), "a reset token counted from an address its ID never went to");
+            const size_t r2 = write_stateless_reset(cr, token, 60, pkt, sizeof pkt);
+            Path new_way;
+            new_way.local = m.server;
+            new_way.peer = m.face[1];
+            m.k.server.on_datagram(new_way, pkt, r2, Ecn::NotEct, m.k.now);
+            check(m.k.server.closed_by_reset(), "a reset from the address its ID went to did not count");
+        } else {
+            check(false, "the ID in use was not found among the client's");
+        }
+    }
+
+    /* \~english
+     * 9.1: a probe from a new local address moves nothing.  The server
+     * answers on the path the challenge came on, expanded, exactly once
+     * (8.2.2), and validates that address itself (9.6.3); the client learns
+     * the path works and stays where it was.
+     * \~spanish
+     * 9.1: un sondeo desde una direccion local nueva no mueve nada.  El servidor
+     * contesta por el camino por el que llego el desafio, ampliado, exactamente
+     * una vez (8.2.2), y valida el mismo esa direccion (9.6.3); el cliente sabe
+     * que el camino sirve y se queda donde estaba.
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        Path probe;
+        probe.local = m.local[2];
+        probe.peer = m.server;
+        expect_migration(m.k.client.probe_path(probe, m.k.now), Migration::Started, "the client could not probe");
+        move_pump(m, 200);
+        check(m.k.client.paths().validated == 1 && same_address(m.k.client.path().local, m.local[0]),
+              "the probed path was not validated, or the probe moved the client");
+        check(m.k.server.paths().peer_migrations == 0 && same_address(m.k.server.path().peer, m.face[0]),
+              "a probing packet moved the server");
+        check(m.k.server.paths().responses_sent == m.k.client.paths().challenges_sent,
+              "the server did not answer each challenge exactly once");
+        bool answered_there = false;
+        bool answered_elsewhere = false;
+        for (Sent &s : m.from_server) {
+            std::vector<uint8_t> payload;
+            for (const Frame &f : frames_of(cr, 4, s.bytes.data(), s.bytes.size(), payload)) {
+                if (f.type != FrameType::PathResponse) continue;
+                if (same_address(s.path.peer, m.face[2]) && s.bytes.size() >= 1200)
+                    answered_there = true;
+                else
+                    answered_elsewhere = true;
+            }
+        }
+        check(answered_there && !answered_elsewhere,
+              "the answer did not go, expanded, on the path the challenge came on");
+        check(m.k.server.paths().validated >= 1, "the server did not validate the address the probe came from");
+    }
+
+    /* \~english
+     * 8.2.3: while the server challenges the address a probe came from, a
+     * guessed answer from there proves nothing.  Checked at once and the pair
+     * thrown away: the hand-made packet takes a number the client will use.
+     * \~spanish
+     * 8.2.3: mientras el servidor desafia la direccion de la que llego un sondeo,
+     * una respuesta adivinada desde alli no prueba nada.  Se comprueba en el acto
+     * y se tira la pareja: el paquete hecho a mano gasta un numero que usara el
+     * cliente.
+     * \~ */
+    {
+        MoveNet m(cr, cc, sc);
+        move_start(m);
+        Path probe;
+        probe.local = m.local[2];
+        probe.peer = m.server;
+        m.k.client.probe_path(probe, m.k.now);
+        uint8_t buf[1500], pkt[256];
+        Path p;
+        const size_t n = m.k.client.build_datagram(p, buf, sizeof buf, m.k.now);
+        deliver_to_server(m, p, buf, n);
+        while (m.k.server.build_datagram(p, buf, sizeof buf, m.k.now) != 0) {
+        }
+        uint8_t guess[9] = {0x1b, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+        const size_t g =
+            craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, m.client_pn + 2, pkt, false, guess, sizeof guess);
+        Path from;
+        from.local = m.server;
+        from.peer = m.face[2];
+        m.k.server.on_datagram(from, pkt, g, Ecn::NotEct, m.k.now);
+        check(m.k.server.paths().challenges_sent >= 1 && m.k.server.paths().stray_responses == 1 &&
+                  m.k.server.paths().validated == 0,
+              "a guessed PATH_RESPONSE validated the path being challenged");
     }
 }
 
@@ -2391,6 +3040,7 @@ void run_all(Crypto &cr) {
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
     test_cid_rules(cr);
     test_audit_rules(cr);
+    test_paths(cr);
 }
 
 } // namespace

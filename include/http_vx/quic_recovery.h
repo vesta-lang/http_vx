@@ -114,6 +114,34 @@ struct SentPacket {
     /// \~english Counts toward bytes in flight: anything but ACK-only.
     /// \~spanish Cuenta en los bytes en vuelo: todo lo que no sea solo ACK.  \~
     bool in_flight;
+    /**
+     * \~english
+     * Belongs to the current path's congestion control and RTT: in flight and
+     * sent since the last `on_new_path`.  One sent on an earlier path is
+     * still detected lost and handed back, but its acknowledgement grows no
+     * window and gives no RTT sample, and its loss is no congestion event
+     * (RFC 9000, 9.4).
+     * \~spanish
+     * Pertenece al control de congestion y al RTT del camino actual: en vuelo y
+     * mandado desde el ultimo `on_new_path`.  Uno mandado por un camino anterior
+     * se sigue detectando perdido y devolviendo, pero su confirmacion no hace
+     * crecer ninguna ventana ni da muestra de RTT, y su perdida no es un evento
+     * de congestion (RFC 9000, 9.4).
+     * \~
+     */
+    bool counted;
+    /**
+     * \~english
+     * Never an RTT sample for the current path: sent on an earlier one
+     * (RFC 9000, 9.4), or a path probe, whose round trip belongs to the path
+     * probed (RFC 9002, 6.2.2).
+     * \~spanish
+     * Nunca una muestra de RTT del camino actual: mandado por uno anterior
+     * (RFC 9000, 9.4), o un sondeo de camino, cuyo viaje es del camino sondeado
+     * (RFC 9002, 6.2.2).
+     * \~
+     */
+    bool other_path;
     /// \~english Outstanding, acknowledged or lost; internal.  \~spanish Pendiente, confirmado o perdido; interno.  \~
     uint8_t state;
 };
@@ -243,11 +271,13 @@ public:
      * \~spanish Anota un paquete recien enviado.
      * \~
      *
+     * @param path_probe \~english a path validation packet: not in flight, never an RTT sample
+     *                   \~spanish un paquete de validacion de camino: no esta en vuelo, nunca es muestra de RTT  \~
      * @return \~english false if the ring is full or @p pn does not increase -- both the caller's bug
      *         \~spanish falso si el anillo esta lleno o @p pn no crece -- los dos, fallo de quien llama  \~
      */
     bool on_packet_sent(Space s, uint64_t pn, uint32_t bytes, bool ack_eliciting,
-                        bool in_flight, uint64_t tag, uint64_t ack_largest,
+                        bool in_flight, bool path_probe, uint64_t tag, uint64_t ack_largest,
                         uint64_t now_us) noexcept;
 
     /**
@@ -297,6 +327,32 @@ public:
      * \~
      */
     void on_retry(uint64_t now_us, RecoveryListener &l) noexcept;
+
+    /**
+     * @brief
+     * \~english The connection moved to a path whose address was just proven: start over on it (RFC 9000, 9.4).
+     * \~spanish La conexion paso a un camino cuya direccion se acaba de probar: empezar de cero en el (RFC 9000, 9.4).
+     * \~
+     *
+     * \~english
+     * Window, threshold and recovery period back to their starting values
+     * (RFC 9002, B.3), and the RTT estimator too (5.3, 6.2.2).  What is in
+     * flight stays in the rings -- it can still be lost, and what it carried
+     * sent again -- but leaves bytes in flight and no longer counts: the old
+     * path's packets MUST NOT alter the new path's congestion control or RTT.
+     * Packet numbers, the PTO backoff and the loss timers go on.
+     * \~spanish
+     * Ventana, umbral y periodo de recuperacion vuelven a sus valores de partida
+     * (RFC 9002, B.3), y tambien el estimador de RTT (5.3, 6.2.2).  Lo que esta en
+     * vuelo sigue en los anillos -- aun se puede perder, y mandarse otra vez lo que
+     * llevaba --, pero sale de los bytes en vuelo y deja de contar: los paquetes
+     * del camino viejo NO DEBEN alterar el control de congestion ni el RTT del
+     * nuevo.  Los numeros de paquete, el retroceso del PTO y los temporizadores de
+     * perdida siguen.
+     * \~
+     */
+    void on_new_path(uint64_t now_us) noexcept;
+    uint64_t path_resets() const noexcept { return path_resets_; }
 
     /* \~english
      * What the connection tells recovery as the handshake advances.  Each
@@ -422,6 +478,7 @@ private:
     uint64_t congestion_events_ = 0;
     uint64_t persistent_ = 0;
     uint64_t pto_events_ = 0;
+    uint64_t path_resets_ = 0;
 };
 
 } // namespace quic
