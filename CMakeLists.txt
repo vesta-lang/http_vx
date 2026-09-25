@@ -198,8 +198,14 @@ if (WIN32)
             PUBLIC http_vx_core vesta_alloc ws2_32 mswsock)
 endif ()
 
+# Los DOS de Linux, que es lo que pide la R8: io_uring y epoll como backends de
+# primera.  No porque dos sean mejor que uno -- porque el que solo esta para los
+# nucleos viejos es el que no corre nadie, y un camino que no corre nadie es un
+# camino que esta roto y no lo sabe.
 if (UNIX)
-    add_library(http_vx_linux STATIC linux/epoll_backend.cpp)
+    add_library(http_vx_linux STATIC
+            linux/epoll_backend.cpp
+            linux/uring_backend.cpp)
     target_include_directories(http_vx_linux
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})

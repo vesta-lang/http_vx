@@ -71,50 +71,127 @@
 #include "http_vx/iocp_backend.h"
 #else
 #include "http_vx/epoll_backend.h"
+#include "http_vx/uring_backend.h"
 #endif
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
 using serve::Greeting;
 
-#ifdef _WIN32
-
-using Reactor = http_vx::IocpBackend;
-
 /**
+ * @brief
+ * \~english Every backend this build has, and the one that was chosen.
+ * \~spanish Todos los backends que tiene esta construccion, y el que se eligio.
+ * \~
+ *
  * \~english
- * The ceiling is on OPERATIONS here, because a completion port holds one
- * record per thing the kernel is doing.  On epoll it is on descriptors, which
- * is the same number counted from the other side, and the two do not have to
- * agree -- which is why this is per platform and not a number in the
- * configuration.
+ * R8 says the backend is chosen in CONFIGURATION, and that is what this is for.
+ * The requirement is not about having two: it is about neither of them being a
+ * path nobody runs, and the first thing that needs is for whoever runs the
+ * server to be able to say which one and to be TOLD which one they got.
+ *
+ * A server that fell back silently -- io_uring if the kernel has it, epoll if
+ * not -- would be one where nobody can tell what they measured, and the epoll
+ * path would go untested on every machine that has a modern kernel.
+ *
  * \~spanish
- * Aqui el techo es de OPERACIONES, porque un puerto de finalizacion guarda un
- * registro por cosa que este haciendo el nucleo.  En epoll es de descriptores,
- * que es el mismo numero contado desde el otro lado, y los dos no tienen por que
- * coincidir -- que es la razon de que esto sea por plataforma y no un numero de
- * la configuracion.
+ * La R8 dice que el backend se elige en CONFIGURACION, y para eso esta esto.  El
+ * requisito no va de tener dos: va de que ninguno de los dos sea un camino que no
+ * corre nadie, y lo primero que hace falta para eso es que quien ejecute el
+ * servidor pueda decir cual y que le DIGAN cual le toco.
+ *
+ * Un servidor que se cayera a otro en silencio -- io_uring si el nucleo lo
+ * tiene, epoll si no -- seria uno donde nadie puede saber que midio, y el camino
+ * de epoll se quedaria sin probar en todas las maquinas con un nucleo moderno.
  * \~
  */
-bool make_reactor(Reactor &io, http_vx::BufferPool &pool,
-                  uint32_t connections) {
-    return io.reset(pool, connections * 2 + 64);
-}
-
+struct Reactors {
+#ifdef _WIN32
+    http_vx::IocpBackend iocp;
 #else
-
-using Reactor = http_vx::EpollBackend;
-
-bool make_reactor(Reactor &io, http_vx::BufferPool &pool,
-                  uint32_t connections) {
-    return io.reset(pool, connections + 64);
-}
-
+    http_vx::EpollBackend epoll;
+    http_vx::UringBackend uring;
 #endif
+
+    http_vx::Backend *io = nullptr;
+    uint16_t port = 0;
+    int32_t error = 0;
+
+    /// \~english Makes the one @p want names, or says why not.
+    /// \~spanish Hace el que nombra @p want, o dice por que no.  \~
+    bool make(const char *want, http_vx::BufferPool &pool,
+              uint32_t connections, const char *host, uint16_t on) {
+#ifdef _WIN32
+        (void)want;
+
+        /* \~english
+         * The ceiling is on OPERATIONS here, because a completion port holds
+         * one record per thing the kernel is doing.
+         * \~spanish
+         * Aqui el techo es de OPERACIONES, porque un puerto de finalizacion
+         * guarda un registro por cosa que este haciendo el nucleo.
+         * \~ */
+        if (!iocp.reset(pool, connections * 2 + 64)) {
+            error = iocp.last_error();
+            return false;
+        }
+        if (!iocp.listen(host, on)) {
+            error = iocp.last_error();
+            return false;
+        }
+        port = iocp.port();
+        io = &iocp;
+        return true;
+#else
+        if (std::strcmp(want, "io_uring") == 0) {
+            /* \~english
+             * The ceiling is on RING ENTRIES, which is neither of the other
+             * two: it bounds what is waiting to be handed over, and the kernel
+             * makes the completion ring twice as large for what is in flight.
+             * \~spanish
+             * El techo es de ENTRADAS DEL ANILLO, que no es ninguno de los otros
+             * dos: acota lo que espera a entregarse, y el nucleo hace el anillo de
+             * finalizaciones del doble para lo que esta en vuelo.
+             * \~ */
+            if (!uring.reset(pool, 1024)) {
+                error = uring.last_error();
+                return false;
+            }
+            if (!uring.listen(host, on)) {
+                error = uring.last_error();
+                return false;
+            }
+            port = uring.port();
+            io = &uring;
+            return true;
+        }
+
+        /* \~english
+         * The ceiling is on DESCRIPTORS, because readiness holds a note per
+         * socket and nothing per operation.
+         * \~spanish
+         * El techo es de DESCRIPTORES, porque la disponibilidad guarda una nota
+         * por socket y nada por operacion.
+         * \~ */
+        if (!epoll.reset(pool, connections + 64)) {
+            error = epoll.last_error();
+            return false;
+        }
+        if (!epoll.listen(host, on)) {
+            error = epoll.last_error();
+            return false;
+        }
+        port = epoll.port();
+        io = &epoll;
+        return true;
+#endif
+    }
+};
 
 /**
  * @brief
@@ -183,6 +260,28 @@ int main(int argc, char **argv) {
     const uint16_t port =
         argc > 2 ? static_cast<uint16_t>(std::atoi(argv[2])) : 8080;
 
+    /* \~english
+     * And WHICH backend, which is what R8 means by choosing it in
+     * configuration.  The default is epoll and not the newest one on purpose:
+     * a default that took io_uring wherever it exists would mean the epoll
+     * path only ever runs on the kernels nobody develops on, which is how a
+     * backend becomes a path nobody tests.
+     *
+     * A name this build does not have is not silently swapped for one it does.
+     * It fails, and says so.
+     *
+     * \~spanish
+     * Y CUAL backend, que es lo que quiere decir la R8 con elegirlo en
+     * configuracion.  El valor por defecto es epoll y no el mas nuevo a
+     * proposito: uno que cogiera io_uring donde exista haria que el camino de
+     * epoll solo corriera en los nucleos en los que no desarrolla nadie, que es
+     * como un backend se convierte en un camino que no prueba nadie.
+     *
+     * Un nombre que esta construccion no tiene no se cambia en silencio por uno
+     * que si.  Falla, y lo dice.
+     * \~ */
+    const char *want = argc > 3 ? argv[3] : "epoll";
+
     http_vx::ShardConfig cfg;
     cfg.connections = 1024;
     cfg.buffers = 128;
@@ -205,7 +304,7 @@ int main(int argc, char **argv) {
     Greeting greeting;
     http_vx::Http1Service service;
     http_vx::Shard shard;
-    Reactor io;
+    Reactors reactors;
 
     http_vx::h1::Limits h1;
     if (!service.reset(cfg.connections, greeting, h1)) {
@@ -213,25 +312,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!make_reactor(io, shard.buffers(), cfg.connections)) {
-        std::fprintf(stderr, "http_vx: no reactor (error %d)\n",
-                     io.last_error());
+    if (!reactors.make(want, shard.buffers(), cfg.connections, host, port)) {
+        std::fprintf(stderr,
+                     "http_vx: cannot listen on %s:%u with %s (error %d)\n",
+                     host, static_cast<unsigned>(port), want, reactors.error);
         return 1;
     }
 
-    if (!io.listen(host, port)) {
-        std::fprintf(stderr, "http_vx: cannot listen on %s:%u (error %d)\n",
-                     host, static_cast<unsigned>(port), io.last_error());
-        return 1;
-    }
-
-    if (!shard.reset(cfg, io, service, now_ticks())) {
+    if (!shard.reset(cfg, *reactors.io, service, now_ticks())) {
         std::fprintf(stderr, "http_vx: no memory for the shard\n");
         return 1;
     }
 
     std::fprintf(stderr, "http_vx: listening on %s:%u, %s backend\n", host,
-                 static_cast<unsigned>(io.port()), io.name());
+                 static_cast<unsigned>(reactors.port), reactors.io->name());
 
     uint64_t last = now_ticks();
 

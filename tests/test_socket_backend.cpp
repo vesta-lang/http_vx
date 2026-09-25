@@ -97,6 +97,7 @@
 #include <unistd.h>
 
 #include "http_vx/epoll_backend.h"
+#include "http_vx/uring_backend.h"
 
 #endif
 
@@ -122,14 +123,15 @@ using http_vx::ShardConfig;
 
 #ifdef _WIN32
 
-using Backend = http_vx::IocpBackend;
 using Sock = SOCKET;
 
 constexpr Sock kNoSock = INVALID_SOCKET;
 
-bool make_backend(Backend &io, http_vx::BufferPool &pool) {
-    return io.reset(pool, 64);
-}
+/// \~english Which backend a run is against.
+/// \~spanish Contra que backend va una corrida.  \~
+enum class Which { Iocp };
+
+const char *which_name(Which) { return "iocp"; }
 
 void unmake(Sock s) { closesocket(s); }
 
@@ -146,26 +148,29 @@ void breathe() { Sleep(1); }
 
 #else
 
-using Backend = http_vx::EpollBackend;
 using Sock = int;
 
 constexpr Sock kNoSock = -1;
 
 /**
  * \~english
- * The ceiling is on descriptors here rather than on operations, which is what
- * readiness costs: there is nothing the kernel is holding to count, so what
- * gets counted is sockets.  A few hundred is far more than a test opens and is
- * what a shard of eight connections would ever reach.
+ * Which backend a run is against -- and on Linux there are TWO, because R8
+ * says io_uring and epoll are both first-class.  The point of naming them here
+ * is that the same cases run against both: a second test file would be a
+ * second set of cases, and the one that drifted would be the one on the kernel
+ * nobody has.
  * \~spanish
- * Aqui el techo es de descriptores y no de operaciones, que es lo que cuesta la
- * disponibilidad: no hay nada que tenga el nucleo que contar, asi que lo que se
- * cuenta son sockets.  Unos cientos son mucho mas de lo que abre una prueba y es
- * a lo que llegaria un fragmento de ocho conexiones.
+ * Contra que backend va una corrida -- y en Linux hay DOS, porque la R8 dice que
+ * io_uring y epoll son los dos de primera.  Nombrarlos aqui sirve para que los
+ * mismos casos corran contra los dos: un segundo fichero de prueba serian dos
+ * juegos de casos, y el que se quedara atras seria el del nucleo que no tiene
+ * nadie.
  * \~
  */
-bool make_backend(Backend &io, http_vx::BufferPool &pool) {
-    return io.reset(pool, 1024);
+enum class Which { Epoll, Uring };
+
+const char *which_name(Which w) {
+    return w == Which::Epoll ? "epoll" : "io_uring";
 }
 
 void unmake(Sock s) { ::close(s); }
@@ -182,9 +187,22 @@ void breathe() { usleep(1000); }
 
 int failures = 0;
 
+/**
+ * \~english
+ * Which backend the run in progress is against, so that a failure says so.
+ * Without it a red on Linux would not tell epoll from io_uring, and the first
+ * thing anybody would have to do is run it again twice to find out.
+ * \~spanish
+ * Contra que backend va la corrida en curso, para que un fallo lo diga.  Sin
+ * esto, un rojo en Linux no distinguiria epoll de io_uring, y lo primero que
+ * tendria que hacer cualquiera es volver a correrlo dos veces para averiguarlo.
+ * \~
+ */
+const char *against = "?";
+
 void check(bool ok, const char *what) {
     if (ok) return;
-    std::fprintf(stderr, "FAIL: %s\n", what);
+    std::fprintf(stderr, "FAIL [%s]: %s\n", against, what);
     ++failures;
 }
 
@@ -333,13 +351,64 @@ struct Server {
     Hello handler;
     Http1Service service;
     Shard shard;
-    Backend io;
 
-    bool start() {
+    /* \~english
+     * Every backend this system has, and only one of them started.  They are
+     * held by value rather than made behind a pointer because what a test needs
+     * from one is more than the interface offers -- binding a port and being
+     * asked which port it got are not things a reactor does -- and a backend
+     * that has not been reset holds nothing.
+     * \~spanish
+     * Todos los backends que tiene este sistema, y solo uno arrancado.  Se tienen
+     * por valor y no se hacen detras de un puntero porque lo que una prueba
+     * necesita de uno es mas de lo que ofrece la interfaz -- atarse a un puerto y
+     * que le pregunten cual le toco no son cosas que haga un reactor -- y un
+     * backend sin arrancar no tiene nada.
+     * \~ */
+#ifdef _WIN32
+    http_vx::IocpBackend iocp;
+#else
+    http_vx::EpollBackend epoll;
+    http_vx::UringBackend uring;
+#endif
+
+    http_vx::Backend *io = nullptr;
+    uint16_t bound = 0;
+
+    bool start(Which which) {
         http_vx::h1::Limits limits;
         if (!service.reset(8, handler, limits)) return false;
-        if (!make_backend(io, shard.buffers())) return false;
-        if (!io.listen("127.0.0.1", 0)) return false;
+
+#ifdef _WIN32
+        (void)which;
+        if (!iocp.reset(shard.buffers(), 64)) return false;
+        if (!iocp.listen("127.0.0.1", 0)) return false;
+        bound = iocp.port();
+        io = &iocp;
+#else
+        if (which == Which::Epoll) {
+            /* \~english
+             * The ceiling is on DESCRIPTORS for epoll and on ring entries for
+             * io_uring, which is the difference between the two models showing
+             * through: one remembers a note per socket, the other holds an
+             * entry per operation the kernel is doing.
+             * \~spanish
+             * El techo es de DESCRIPTORES en epoll y de entradas del anillo en
+             * io_uring, que es la diferencia entre los dos modelos asomando: uno
+             * recuerda una nota por socket y el otro tiene una entrada por
+             * operacion que este haciendo el nucleo.
+             * \~ */
+            if (!epoll.reset(shard.buffers(), 1024)) return false;
+            if (!epoll.listen("127.0.0.1", 0)) return false;
+            bound = epoll.port();
+            io = &epoll;
+        } else {
+            if (!uring.reset(shard.buffers(), 256)) return false;
+            if (!uring.listen("127.0.0.1", 0)) return false;
+            bound = uring.port();
+            io = &uring;
+        }
+#endif
 
         ShardConfig cfg;
         cfg.connections = 8;
@@ -347,10 +416,10 @@ struct Server {
         cfg.idle_ticks = 1000;
         cfg.wheel_slots = 4096;
         cfg.accepts = 4;
-        return shard.reset(cfg, io, service, 0);
+        return shard.reset(cfg, *io, service, 0);
     }
 
-    uint16_t port() const { return io.port(); }
+    uint16_t port() const { return bound; }
 };
 
 /**
@@ -423,9 +492,9 @@ bool answered_twice(const Client &c) {
  * hay nada sustituyendo a nada.
  * \~
  */
-void test_a_request_over_a_socket() {
+void test_a_request_over_a_socket(Which which) {
     Server s;
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
     check(s.port() != 0, "no port was bound");
 
     Client c;
@@ -476,9 +545,9 @@ void test_a_request_over_a_socket() {
  * lado.
  * \~
  */
-void test_a_finished_connection_closes_its_socket() {
+void test_a_finished_connection_closes_its_socket(Which which) {
     Server s;
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -509,9 +578,9 @@ void test_a_finished_connection_closes_its_socket() {
  * va la conexion y no desde cero.
  * \~
  */
-void test_two_requests_on_one_socket() {
+void test_two_requests_on_one_socket(Which which) {
     Server s;
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -552,9 +621,9 @@ void test_two_requests_on_one_socket() {
  * sin que hubiera nada mal en el cable.
  * \~
  */
-void test_four_sockets_at_once() {
+void test_four_sockets_at_once(Which which) {
     Server s;
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
 
     Client c[4];
 
@@ -618,9 +687,9 @@ void test_four_sockets_at_once() {
  * demuestra esto es que lo correcto es algo que un sistema operativo va a hacer.
  * \~
  */
-void test_an_idle_socket_holds_no_buffer() {
+void test_an_idle_socket_holds_no_buffer(Which which) {
     Server s;
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -699,11 +768,11 @@ void test_an_idle_socket_holds_no_buffer() {
  * el caso.
  * \~
  */
-void test_both_directions_at_once_over_a_socket() {
+void test_both_directions_at_once_over_a_socket(Which which) {
     Server s;
     s.handler.wordy = true;
 
-    check(s.start(), "the server would not start");
+    check(s.start(which), "the server would not start");
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -752,6 +821,153 @@ void test_both_directions_at_once_over_a_socket() {
           "the request that arrived mid-answer was never served");
 }
 
+#ifndef _WIN32
+
+/**
+ * @brief
+ * \~english Many operations, and far fewer trips into the kernel.
+ * \~spanish Muchas operaciones, y muchisimos menos viajes al nucleo.
+ * \~
+ *
+ * \~english
+ * The claim io_uring exists for, counted instead of argued about.  Serving a
+ * request takes three operations -- be told, read, write -- so four
+ * connections served a few times over is dozens of them; if each one cost a
+ * trip into the kernel this backend would be epoll with extra steps.
+ *
+ * It is a COUNT and not a time on purpose.  A count has no noise, it does not
+ * depend on how fast the machine is or what else it was doing, and it fails
+ * the same way on every run -- which is what the rest of the measurements in
+ * this project do for the same reason.
+ *
+ * The bound is deliberately generous.  What it exists to catch is not a few
+ * extra trips, it is the shape being wrong: a backend that entered the kernel
+ * once per operation would blow past it by an order of magnitude, and one
+ * that batched properly comes in far under.
+ *
+ * \~spanish
+ * La afirmacion para la que existe io_uring, contada en vez de discutida.
+ * Servir una peticion lleva tres operaciones -- que te avisen, leer, escribir --
+ * asi que cuatro conexiones servidas unas cuantas veces son decenas de ellas; si
+ * cada una costara un viaje al nucleo, este backend seria epoll con pasos de
+ * mas.
+ *
+ * Es una CUENTA y no un tiempo a proposito.  Una cuenta no tiene ruido, no
+ * depende de lo rapida que sea la maquina ni de que mas estuviera haciendo, y
+ * falla igual en todas las corridas -- que es lo que hacen las demas medidas de
+ * este proyecto por lo mismo.
+ *
+ * La cota es generosa a proposito.  Lo que existe para coger no son unos viajes
+ * de mas, es que la forma este mal: un backend que entrara al nucleo una vez por
+ * operacion se la pasaria por un orden de magnitud, y uno que agrupa bien se
+ * queda muy por debajo.
+ * \~
+ */
+void test_a_batch_costs_one_trip(Which which) {
+    if (which != Which::Uring) return;
+
+    Server s;
+    check(s.start(which), "the server would not start");
+
+    Client c[4];
+
+    for (int i = 0; i < 4; ++i)
+        check(c[i].open(s.port()), "a client could not connect");
+
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < 4; ++i)
+            check(insist(s, c[i], "GET /batch HTTP/1.1\r\nHost: a\r\n\r\n"),
+                  "a request never went out");
+
+        /* \~english
+         * Waited for by what the SERVER did, not by how many bytes the client
+         * has.  The first version counted bytes against a threshold that the
+         * previous round had already passed, so every round after the first
+         * finished instantly and the last four requests were never served --
+         * a test that hurried past the thing it was measuring.
+         * \~spanish
+         * Se espera por lo que hizo el SERVIDOR, no por cuantos bytes tiene el
+         * cliente.  La primera version contaba bytes contra un umbral que la ronda
+         * anterior ya habia pasado, asi que todas las rondas menos la primera
+         * acababan en el acto y las ultimas cuatro peticiones no se servian nunca
+         * -- una prueba corriendo por delante de lo que media.
+         * \~ */
+        const int want = (round + 1) * 4;
+
+        for (int turn = 0; turn < 2000 && s.handler.calls < want; ++turn) {
+            s.shard.poll(1, 0);
+            for (int i = 0; i < 4; ++i) c[i].listen_once();
+            breathe();
+        }
+    }
+
+    check(s.handler.calls == 12, "the twelve requests were not all served");
+
+    /* \~english
+     * Twelve requests is at least thirty-six operations, plus the accepts.
+     * Anything near that many trips would mean the ring is being entered per
+     * operation, which is the one thing it is for not doing.
+     * \~spanish
+     * Doce peticiones son por lo menos treinta y seis operaciones, mas las
+     * aceptaciones.  Cualquier numero de viajes cercano a ese querria decir que
+     * se esta entrando al anillo por operacion, que es justo lo que existe para
+     * no hacer.
+     * \~ */
+    /* \~english
+     * And the number is PRINTED, not just checked.  It is the figure that
+     * justifies this backend existing, so a run that merely said "ok" would be
+     * hiding the evidence for its own conclusion -- and the day it creeps
+     * towards the bound, seeing it drift is what tells anybody, long before
+     * the bound is crossed.
+     * \~spanish
+     * Y el numero se IMPRIME, no solo se comprueba.  Es la cifra que justifica
+     * que este backend exista, asi que una corrida que solo dijera "ok" estaria
+     * escondiendo la prueba de su propia conclusion -- y el dia que empiece a
+     * subir hacia la cota, verlo moverse es lo que avisa a alguien mucho antes
+     * de que la cruce.
+     * \~ */
+    std::printf("     12 requests, >=36 operations, %zu trips into the kernel\n",
+                s.uring.enters());
+
+    check(s.uring.enters() < 36,
+          "the ring is being entered about once per operation");
+}
+
+#endif
+
+/**
+ * @brief
+ * \~english Runs every case against @p which.
+ * \~spanish Corre todos los casos contra @p which.
+ * \~
+ *
+ * \~english
+ * One list, so that a backend cannot be the one with fewer cases.  That is the
+ * whole of R8 made mechanical: what stops epoll from being a path nobody tests
+ * is not a promise, it is that skipping it would mean deleting a line here.
+ *
+ * \~spanish
+ * Una lista, para que un backend no pueda ser el que tiene menos casos.  Eso es
+ * toda la R8 hecha mecanica: lo que impide que epoll sea un camino que no prueba
+ * nadie no es una promesa, es que saltarselo seria borrar una linea de aqui.
+ * \~
+ */
+void run_every_case(Which which) {
+    against = which_name(which);
+    std::printf("  -- %s --\n", against);
+
+    test_a_request_over_a_socket(which);
+    test_a_finished_connection_closes_its_socket(which);
+    test_two_requests_on_one_socket(which);
+    test_four_sockets_at_once(which);
+    test_an_idle_socket_holds_no_buffer(which);
+    test_both_directions_at_once_over_a_socket(which);
+
+#ifndef _WIN32
+    test_a_batch_costs_one_trip(which);
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -769,17 +985,38 @@ int main() {
      * \~ */
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
 
-    test_a_request_over_a_socket();
-    test_a_finished_connection_closes_its_socket();
-    test_two_requests_on_one_socket();
-    test_four_sockets_at_once();
-    test_an_idle_socket_holds_no_buffer();
-    test_both_directions_at_once_over_a_socket();
+    run_every_case(Which::Iocp);
 
-#ifdef _WIN32
     WSACleanup();
+#else
+    run_every_case(Which::Epoll);
+
+    /* \~english
+     * And io_uring, if this kernel has one.  It is ASKED rather than deduced
+     * from a version: a kernel can be built without it, a container can forbid
+     * it with seccomp and an administrator can switch it off.
+     *
+     * A kernel without it SKIPS, and says so.  A skip that printed nothing
+     * would be a suite that goes green on a machine where half the backends
+     * never ran -- which is the failure R8 is about, arriving by the back
+     * door.
+     *
+     * \~spanish
+     * Y io_uring, si este nucleo tiene.  Se PREGUNTA en vez de deducirlo de una
+     * version: un nucleo se puede construir sin el, un contenedor lo puede
+     * prohibir con seccomp y un administrador lo puede apagar.
+     *
+     * Un nucleo sin el SALTA, y lo dice.  Un salto que no imprimiera nada seria
+     * una suite que sale verde en una maquina donde la mitad de los backends no
+     * corrio -- que es el fallo del que va la R8, entrando por la puerta de
+     * atras.
+     * \~ */
+    if (http_vx::uring_available()) {
+        run_every_case(Which::Uring);
+    } else {
+        std::printf("  -- io_uring: SKIPPED, this kernel gives no ring --\n");
+    }
 #endif
 
     if (failures != 0) {

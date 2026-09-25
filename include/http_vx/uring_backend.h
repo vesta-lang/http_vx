@@ -1,0 +1,297 @@
+/*
+ * http_vx -- servidor HTTP/1.1, HTTP/2 y HTTP/3
+ *
+ * Copyright (c) 2026 David Lopez T. (DesmonHak)
+ * Licencia: MIT (ver LICENSE).
+ */
+
+/**
+ * @file http_vx/uring_backend.h
+ * @brief
+ * \~english The backend where an operation costs no system call at all.
+ * \~spanish El backend donde una operacion no cuesta ninguna llamada al sistema.
+ * \~
+ *
+ * \~english
+ * R8 asks for this one by name: `linux/` must offer io_uring AND epoll as
+ * first-class backends.  Not because two are better than one -- because the
+ * one that is only there for old kernels is the one nobody runs, and a path
+ * nobody runs is a path that is broken and does not know it.
+ *
+ * **And it is the backend the measurements asked for.**  Serving a request
+ * over a socket spends about eighty per cent of its time in the kernel and
+ * under two per cent in the parser, so what decides this server's cost is how
+ * many times it crosses into the kernel.  epoll got that down from five
+ * crossings per request to three.  Here it goes to nearly NONE:
+ *
+ * **`submit` writes into a shared ring and returns.**  The operation is handed
+ * over by storing it where the kernel can see it, not by asking the kernel to
+ * take it, so a batch of a hundred connections' reads and writes costs a
+ * hundred ring entries and ONE `io_uring_enter` -- which is the same call that
+ * collects the completions.  That is R18 in one sentence, and it is the reason
+ * the interface was made completion-based in the first place (R7): here there
+ * is nothing to adapt, because this IS the interface.
+ *
+ * **Nothing is linked for it.**  `liburing` is a convenience wrapper, and this
+ * project has an assembler, a linker and an archiver of its own -- taking a
+ * dependency to avoid three system calls and two memory barriers would be out
+ * of character and, more to the point, would make the build depend on what a
+ * machine happens to have installed.  The kernel's own header carries the
+ * structures and the opcodes, and that is all a ring needs.
+ *
+ * \~spanish
+ * La R8 pide este por su nombre: `linux/` debe ofrecer io_uring Y epoll como
+ * backends de primera.  No porque dos sean mejor que uno -- porque el que solo
+ * esta para los nucleos viejos es el que no corre nadie, y un camino que no
+ * corre nadie es un camino que esta roto y no lo sabe.
+ *
+ * **Y es el backend que pidieron las medidas.**  Servir una peticion por un
+ * socket se pasa el ochenta por ciento del tiempo en el nucleo y menos del dos
+ * por ciento en el analizador, asi que lo que decide lo que cuesta este servidor
+ * es cuantas veces cruza al nucleo.  epoll lo bajo de cinco cruces por peticion
+ * a tres.  Aqui se va a casi NINGUNO:
+ *
+ * **`submit` escribe en un anillo compartido y vuelve.**  La operacion se
+ * entrega poniendola donde el nucleo la ve, no pidiendole al nucleo que la coja,
+ * asi que un lote con las lecturas y escrituras de cien conexiones cuesta cien
+ * entradas del anillo y UN `io_uring_enter` -- que es ademas la llamada que
+ * recoge las finalizaciones.  Eso es la R18 en una frase, y es la razon por la
+ * que la interfaz se hizo por finalizacion (R7): aqui no hay nada que adaptar,
+ * porque esto ES la interfaz.
+ *
+ * **No se enlaza nada para ello.**  `liburing` es una envoltura de comodidad, y
+ * este proyecto tiene ensamblador, enlazador y archivador propios -- coger una
+ * dependencia para ahorrarse tres llamadas al sistema y dos barreras de memoria
+ * seria impropio y, sobre todo, haria que la construccion dependiera de lo que
+ * tenga instalado una maquina.  La cabecera del propio nucleo trae las
+ * estructuras y los opcodes, y eso es todo lo que necesita un anillo.
+ *
+ * \~
+ */
+#ifndef HTTP_VX_URING_BACKEND_H
+#define HTTP_VX_URING_BACKEND_H
+
+#include "http_vx/buffer_pool.h"
+#include "http_vx/reactor_ops.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace http_vx {
+
+/**
+ * @brief
+ * \~english Whether this kernel has a usable ring.
+ * \~spanish Si este nucleo tiene un anillo utilizable.
+ * \~
+ *
+ * \~english
+ * Asked, not assumed from a version number.  io_uring is a thing a kernel can
+ * be built without, a container can forbid with seccomp and an administrator
+ * can switch off -- so the only answer that means anything is what happens
+ * when a ring is actually asked for, and this asks for one and gives it back.
+ *
+ * It exists so that a server can CHOOSE, which is what R8 means by the backend
+ * being chosen in configuration: a program that fell back silently would be a
+ * program where nobody can tell which path they are on, and that is the
+ * failure R8 describes rather than the one it prevents.
+ *
+ * \~spanish
+ * Se pregunta, no se deduce de un numero de version.  io_uring es algo sin lo
+ * que se puede construir un nucleo, que un contenedor puede prohibir con seccomp
+ * y que un administrador puede apagar -- asi que la unica respuesta que
+ * significa algo es lo que pasa cuando se pide un anillo de verdad, y esto pide
+ * uno y lo devuelve.
+ *
+ * Existe para que un servidor pueda ELEGIR, que es lo que quiere decir la R8 con
+ * que el backend se elija en configuracion: un programa que se cayera a otro en
+ * silencio seria uno donde nadie puede saber en que camino esta, y ese es el
+ * fallo que describe la R8 y no el que evita.
+ * \~
+ *
+ * @return \~english true if a ring could be made  \~spanish true si se pudo hacer un anillo  \~
+ */
+bool uring_available() noexcept;
+
+/**
+ * @brief
+ * \~english A backend that hands operations over through shared memory.
+ * \~spanish Un backend que entrega operaciones por memoria compartida.
+ * \~
+ */
+class UringBackend final : public Backend {
+  public:
+    UringBackend() noexcept = default;
+    ~UringBackend() override;
+
+    /**
+     * @brief
+     * \~english Makes a ring of @p entries and room for that many operations.
+     * \~spanish Hace un anillo de @p entries y sitio para esas operaciones.
+     * \~
+     *
+     * \~english
+     * @p entries is rounded UP to a power of two by the kernel, and it bounds
+     * how many operations may be waiting to be handed over at once -- not how
+     * many may be in flight, which is larger and is bounded by the completion
+     * ring the kernel makes twice as big for exactly this reason.
+     *
+     * \~spanish
+     * @p entries lo redondea el nucleo hacia ARRIBA a una potencia de dos, y
+     * acota cuantas operaciones pueden estar esperando a entregarse a la vez --
+     * no cuantas pueden estar en vuelo, que son mas y las acota el anillo de
+     * finalizaciones, que el nucleo hace del doble justamente por esto.
+     *
+     * \~
+     * @param pool    \~english where the buffers are
+     *                \~spanish donde estan los buffers  \~
+     * @param entries \~english how many operations fit in the ring
+     *                \~spanish cuantas operaciones caben en el anillo  \~
+     * @return        \~english false if the ring or the memory could not be had
+     *                \~spanish false si no se pudo conseguir el anillo o la memoria  \~
+     */
+    bool reset(BufferPool &pool, uint32_t entries) noexcept;
+
+    /**
+     * @brief
+     * \~english Starts listening on @p host and @p port.
+     * \~spanish Empieza a escuchar en @p host y @p port.
+     * \~
+     *
+     * @param host    \~english the address to bind, as text
+     *                \~spanish la direccion donde atarse, como texto  \~
+     * @param port    \~english the port, or zero for any
+     *                \~spanish el puerto, o cero para cualquiera  \~
+     * @param backlog \~english how many may wait to be accepted
+     *                \~spanish cuantas pueden esperar a que las acepten  \~
+     * @return        \~english false if it could not listen
+     *                \~spanish false si no pudo escuchar  \~
+     */
+    bool listen(const char *host, uint16_t port, int backlog = 512) noexcept;
+
+    /// \~english Which port it is listening on.
+    /// \~spanish En que puerto esta escuchando.  \~
+    uint16_t port() const noexcept { return port_; }
+
+    bool submit(const Op &op) noexcept override;
+    size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
+    const char *name() const noexcept override { return "io_uring"; }
+
+    /// \~english What the system said last time something failed.
+    /// \~spanish Lo que dijo el sistema la ultima vez que algo fallo.  \~
+    int32_t last_error() const noexcept { return last_error_; }
+
+    /// \~english How many operations the kernel is holding.
+    /// \~spanish Cuantas operaciones tiene el nucleo.  \~
+    size_t in_flight() const noexcept { return in_flight_; }
+
+    /**
+     * @brief
+     * \~english How many times this has actually entered the kernel.
+     * \~spanish Cuantas veces ha entrado de verdad en el nucleo.
+     * \~
+     *
+     * \~english
+     * The number this backend exists to make small, so it is counted rather
+     * than argued about.  Divided by requests served it is what R18 asks for,
+     * and it is the one figure that tells a batch of a hundred operations in
+     * one call apart from a hundred calls.
+     *
+     * \~spanish
+     * El numero que este backend existe para hacer pequeno, asi que se cuenta en
+     * vez de discutirse.  Dividido por peticiones servidas es lo que pide la
+     * R18, y es la unica cifra que distingue un lote de cien operaciones en una
+     * llamada de cien llamadas.
+     * \~
+     */
+    size_t enters() const noexcept { return enters_; }
+
+    /// \~english Gives everything back and stops listening.
+    /// \~spanish Devuelve todo y deja de escuchar.  \~
+    void release() noexcept;
+
+  private:
+    /**
+     * \~english
+     * One operation the kernel is holding, found again by the number the ring
+     * carries back.  The entry in the ring is NOT this: a submission slot is
+     * reused the moment the kernel has read it, and what has to outlive that
+     * is which connection and which buffer the operation was for.
+     * \~spanish
+     * Una operacion que tiene el nucleo, encontrada otra vez por el numero que
+     * devuelve el anillo.  La entrada del anillo NO es esto: una ranura de
+     * entrega se reutiliza en cuanto el nucleo la ha leido, y lo que tiene que
+     * sobrevivir a eso es de que conexion y de que buffer era la operacion.
+     * \~
+     */
+    struct Slot;
+
+    /// \~english The rings and the numbers that address them.
+    /// \~spanish Los anillos y los numeros que los direccionan.  \~
+    struct Ring;
+
+    /// \~english Takes a place to remember an operation, or says there is none.
+    /// \~spanish Coge un sitio donde recordar una operacion, o dice que no hay.  \~
+    Slot *take() noexcept;
+
+    /// \~english Gives @p s back.  \~spanish Devuelve @p s.  \~
+    void give(Slot *s) noexcept;
+
+    /// \~english Remembers a completion for an operation that never started.
+    /// \~spanish Recuerda una finalizacion de una operacion que no empezo.  \~
+    bool remember(const Op &op, int32_t result, int32_t fd) noexcept;
+
+    /**
+     * @brief
+     * \~english Hands over what is waiting and takes back what is done.
+     * \~spanish Entrega lo que espera y recoge lo que esta hecho.
+     * \~
+     *
+     * \~english
+     * One call for both, which is the whole shape of this backend: asking to
+     * be given completions is also when the kernel is told about everything
+     * submitted since the last time.
+     * \~spanish
+     * Una llamada para las dos cosas, que es toda la forma de este backend: pedir
+     * que le den a uno finalizaciones es tambien cuando se le habla al nucleo de
+     * todo lo entregado desde la ultima vez.
+     * \~
+     *
+     * @param want       \~english how many completions to wait for
+     *                   \~spanish cuantas finalizaciones esperar  \~
+     * @param timeout_ms \~english how long; negative is for ever
+     *                   \~spanish cuanto; negativo es para siempre  \~
+     * @return           \~english what the system said
+     *                   \~spanish lo que dijo el sistema  \~
+     */
+    int enter(uint32_t want, int timeout_ms) noexcept;
+
+    Ring *ring_ = nullptr;
+
+    int fd_ = -1;
+    int listener_ = -1;
+
+    Slot *slots_ = nullptr;
+    uint32_t slot_count_ = 0;
+    uint32_t free_head_ = 0xFFFFFFFF;
+    size_t in_flight_ = 0;
+    size_t enters_ = 0;
+
+    /// \~english How many entries are written and not yet handed over.
+    /// \~spanish Cuantas entradas hay escritas y sin entregar todavia.  \~
+    uint32_t waiting_ = 0;
+
+    BufferPool *pool_ = nullptr;
+
+    /// \~english The completions of operations that failed before they began.
+    /// \~spanish Las finalizaciones de operaciones que fallaron antes de empezar.  \~
+    Completion failed_[64];
+    size_t failed_count_ = 0;
+
+    uint16_t port_ = 0;
+    int32_t last_error_ = 0;
+};
+
+} // namespace http_vx
+
+#endif // HTTP_VX_URING_BACKEND_H
