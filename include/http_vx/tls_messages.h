@@ -246,6 +246,11 @@ struct CertificateMessage {
     Span entries; ///< \~english walked with next_certificate  \~spanish se recorre con next_certificate  \~
 };
 
+struct CertificateRequest {
+    Span context;
+    Extensions ext;
+};
+
 struct CertificateVerify {
     uint16_t scheme = 0;
     Span signature;
@@ -272,6 +277,7 @@ Parsed parse_client_hello(const uint8_t *m, size_t n, ClientHello &out) noexcept
 Parsed parse_server_hello(const uint8_t *m, size_t n, ServerHello &out) noexcept;
 Parsed parse_encrypted_extensions(const uint8_t *m, size_t n, EncryptedExtensions &out) noexcept;
 Parsed parse_certificate(const uint8_t *m, size_t n, CertificateMessage &out) noexcept;
+Parsed parse_certificate_request(const uint8_t *m, size_t n, CertificateRequest &out) noexcept;
 Parsed parse_certificate_verify(const uint8_t *m, size_t n, CertificateVerify &out) noexcept;
 Parsed parse_new_session_ticket(const uint8_t *m, size_t n, NewSessionTicket &out) noexcept;
 

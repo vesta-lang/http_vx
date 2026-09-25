@@ -300,9 +300,16 @@ Alert read_extension(const uint8_t *m, uint16_t type, Span data, Kind kind, Exte
 Alert read_extensions(const uint8_t *m, Span block, Kind kind, Extensions &x) noexcept {
     Cursor c{m, block.off, block.off + static_cast<size_t>(block.len)};
     Seen seen;
-    // \~english The client reads what the server sends: it only ever asks for what it knows (4.2).
-    // \~spanish El cliente lee lo que manda el servidor: solo pide lo que conoce (4.2).  \~
-    const bool tolerate_unknown = kind == kCH || kind == kNST;
+    /* \~english
+     * The client reads what the server sends: it only ever asks for what it
+     * knows (4.2).  A CertificateRequest is the server ASKING, and there the
+     * client MUST ignore what it does not recognize (4.3.2).
+     * \~spanish
+     * El cliente lee lo que manda el servidor: solo pide lo que conoce (4.2).  Un
+     * CertificateRequest es el servidor PIDIENDO, y ahi el cliente DEBE ignorar
+     * lo que no reconoce (4.3.2).
+     * \~ */
+    const bool tolerate_unknown = kind == kCH || kind == kNST || kind == kCR;
     while (!c.bad && c.pos < c.end) {
         const uint16_t type = c.u16();
         const Span data = c.vec(2, 0, 0xffff);
@@ -506,6 +513,23 @@ bool next_certificate(const uint8_t *m, const CertificateMessage &c, uint32_t &a
     if (e.bad) return false;
     at = static_cast<uint32_t>(e.pos);
     return true;
+}
+
+Parsed parse_certificate_request(const uint8_t *m, size_t n, CertificateRequest &out) noexcept {
+    Parsed p;
+    out = CertificateRequest{};
+    Cursor c = body(m, n);
+    // \~english context<0..2^8-1>, extensions<2..2^16-1> (4.3.2).  \~spanish context<0..2^8-1>, extensions<2..2^16-1> (4.3.2).  \~
+    out.context = c.vec(1, 0, 0xff);
+    const Span exts = c.vec(2, 2, 0xffff);
+    if (!c.done()) {
+        p.alert = Alert::DecodeError;
+        return p;
+    }
+    p.alert = read_extensions(m, exts, kCR, out.ext);
+    // \~english signature_algorithms MUST be specified (4.3.2).  \~spanish signature_algorithms DEBE estar (4.3.2).  \~
+    if (p.ok() && !out.ext.has_signature_algorithms) p.alert = Alert::MissingExtension;
+    return p;
 }
 
 Parsed parse_certificate_verify(const uint8_t *m, size_t n, CertificateVerify &out) noexcept {
