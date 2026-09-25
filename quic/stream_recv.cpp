@@ -63,7 +63,20 @@ RecvStream::RecvStream(uint64_t window) noexcept {
     // \~spanish Un numero entero de trozos, y al menos uno.  \~
     const uint64_t chunks = window == 0 ? 1 : (window + kRecvChunk - 1) / kRecvChunk;
     window_ = chunks * kRecvChunk;
-    limit_ = window_;
+    /* \~english
+     * The first limit is EXACTLY the window asked for: it is what the
+     * transport parameter announces, and data past it MUST be a
+     * FLOW_CONTROL_ERROR (4.1, 19.10).  Rounding it up to whole chunks, as the
+     * memory is, would let a peer past a limit it was told.  Later limits are
+     * the ones MAX_STREAM_DATA sends, whatever they are.
+     * \~spanish
+     * El primer limite es EXACTAMENTE la ventana pedida: es lo que anuncia el
+     * parametro de transporte, y los datos por encima DEBEN ser un
+     * FLOW_CONTROL_ERROR (4.1, 19.10).  Redondearlo a trozos enteros, como la
+     * memoria, dejaria al otro pasar de un limite que se le dijo.  Los limites
+     * siguientes son los que manda MAX_STREAM_DATA, sean cuales sean.
+     * \~ */
+    limit_ = window;
 
     /* \~english
      * One slot more than the window holds whole chunks: a window that starts
@@ -277,6 +290,11 @@ bool RecvStream::wants_update() const noexcept {
     // \~spanish Con el tamano conocido no hay nada mas que permitir (3.2).  \~
     if (state_ != RecvState::Recv) return false;
     return limit_ - read_ < window_ / 2;
+}
+
+uint64_t RecvStream::next_limit() const noexcept {
+    const uint64_t next = read_ + window_;
+    return next > limit_ ? next : limit_;
 }
 
 uint64_t RecvStream::advertise() noexcept {

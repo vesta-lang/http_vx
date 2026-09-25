@@ -127,6 +127,10 @@ struct Stream {
     /// \~english A MAX_STREAM_DATA for it was lost: the current limit is owed again.
     /// \~spanish Se perdio un MAX_STREAM_DATA suyo: se vuelve a deber el limite actual.  \~
     bool max_stream_data_owed = false;
+    /// \~english The limit a STREAM_DATA_BLOCKED was last sent at (kNever: none since).
+    /// \~spanish El limite en el que se mando el ultimo STREAM_DATA_BLOCKED (kNever: ninguno desde entonces).  \~
+    uint64_t blocked_sent_at = kNever;
+    uint64_t blocked_sent_time = 0;
 };
 
 /**
@@ -186,6 +190,13 @@ public:
     /// \~spanish Por que `open` devolvio nulo: el MAX_STREAMS del otro extremo, asi que mandar STREAMS_BLOCKED.  \~
     bool blocked_by_peer(bool bidirectional) const noexcept;
 
+    /// \~english An `open` was refused by the peer's limit, and still is: STREAMS_BLOCKED is due (4.6).
+    /// \~spanish Un `open` fue negado por el limite del otro, y lo sigue: toca STREAMS_BLOCKED (4.6).  \~
+    bool open_refused(bool bidirectional) const noexcept;
+    /// \~english The peer's current limit on the streams this end opens.
+    /// \~spanish El limite actual del otro sobre los flujos que abre este extremo.  \~
+    uint64_t peer_limit(bool bidirectional) const noexcept;
+
     /// \~english A MAX_STREAMS from the peer; a lower value changes nothing (4.6).
     /// \~spanish Un MAX_STREAMS del otro extremo; un valor menor no cambia nada (4.6).  \~
     void on_max_streams(bool bidirectional, uint64_t maximum) noexcept;
@@ -207,6 +218,9 @@ public:
     /// \~english Moves this end's limit to closed plus concurrency, and returns it.
     /// \~spanish Mueve el limite de este extremo a cerrados mas concurrencia, y lo devuelve.  \~
     uint64_t advertise_max_streams(bool bidirectional) noexcept;
+    /// \~english What `advertise_max_streams` would announce, without raising the limit: raised once sent.
+    /// \~spanish Lo que anunciaria `advertise_max_streams`, sin subir el limite: se sube al mandarlo.  \~
+    uint64_t next_max_streams(bool bidirectional) const noexcept;
 
     /// \~english The limit announced for the peer's streams of a kind.
     /// \~spanish El limite anunciado para los flujos del otro extremo de una clase.  \~
@@ -248,6 +262,10 @@ private:
     uint64_t opened_[4] = {0, 0, 0, 0};
     uint64_t closed_[4] = {0, 0, 0, 0};
     uint64_t limit_[4] = {0, 0, 0, 0};
+    /// \~english An open refused by the peer's limit, per direction (uni, bidi).
+    /// \~spanish Una apertura negada por el limite del otro, por direccion (uni, bidi).  \~
+    bool refused_[2] = {false, false};
+    void refused(bool bidirectional) noexcept;
     uint64_t local_open_ = 0;
 };
 

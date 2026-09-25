@@ -297,6 +297,43 @@ void test_persistent_congestion() {
     ack_one(r, Space::Application, 8, 9000000, log);
     check(r.persistent_congestion_events() == 0,
           "persistent congestion was declared with no RTT sample before the losses");
+
+    /* \~english
+     * 5.2: after persistent congestion min_rtt becomes the newest sample.  Here
+     * the path got SLOWER -- 10 ms first, 60 ms at the end -- so keeping the
+     * minimum would say 10 and resetting says 60.
+     * \~spanish
+     * 5.2: tras congestion persistente min_rtt pasa a ser la muestra mas nueva.
+     * Aqui el camino se hizo MAS LENTO -- 10 ms al principio, 60 ms al final --,
+     * asi que quedarse con el minimo diria 10 y reiniciarlo dice 60.
+     * \~ */
+    {
+        RecoveryConfig cfg;
+        cfg.max_ack_delay_us = 20000;
+        Recovery s(cfg);
+        Log l2;
+        const Space app = Space::Application;
+        send(s, app, 0, 0);
+        ack_one(s, app, 0, 10000, l2);
+        for (uint64_t pn = 1; pn <= 9; ++pn) send(s, app, pn, pn * 100000);
+        send(s, app, 10, 1000000);
+        ack_one(s, app, 10, 1060000, l2);
+        check(s.persistent_congestion_events() == 1, "the slower path's losses were not persistent congestion");
+        check(s.min_rtt() == 60000, "min_rtt was not reset to the newest sample after persistent congestion");
+    }
+}
+
+/// \~english The peer's max_ack_delay, learnt late, is the one the PTO uses (A.3, A.8).
+/// \~spanish El max_ack_delay del otro, conocido tarde, es el que usa el PTO (A.3, A.8).  \~
+void test_peer_ack_params() {
+    Recovery r;
+    r.set_handshake_confirmed(0);
+    r.set_peer_address_validated(0);
+    send(r, Space::Application, 0, 1000);
+    const uint64_t before = r.timer();
+    r.set_peer_ack_params(125000, 3, 1000);
+    check(before != kNever && r.timer() == before + 100000,
+          "the peer's max_ack_delay did not move the PTO by exactly the difference");
 }
 
 void test_bad_acks_and_full_rings() {
@@ -422,6 +459,7 @@ int main() {
     test_bad_acks_and_full_rings();
     test_pto();
     test_discard_ecn();
+    test_peer_ack_params();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

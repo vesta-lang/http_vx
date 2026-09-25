@@ -321,8 +321,27 @@ void Recovery::detect_lost(Space s, uint64_t now_us, RecoveryListener &l) noexce
         in_recovery_period_ = false;
         recovery_start_ = 0;
         bytes_acked_ca_ = 0;
+        /* \~english
+         * 5.2: "Endpoints SHOULD set the min_rtt to the newest RTT sample after
+         * persistent congestion is established" -- otherwise a path whose RTT
+         * grew keeps being judged by its old floor, and congestion is declared
+         * again and again.
+         * \~spanish
+         * 5.2: los extremos DEBERIAN poner min_rtt a la muestra de RTT mas
+         * reciente tras declarar congestion persistente -- si no, un camino cuyo
+         * RTT crecio se sigue juzgando por su suelo viejo, y se declara congestion
+         * una y otra vez.
+         * \~ */
+        if (has_rtt_sample_) min_rtt_ = latest_rtt_;
         ++persistent_;
     }
+}
+
+void Recovery::set_peer_ack_params(uint64_t max_ack_delay_us, uint8_t ack_delay_exponent,
+                                   uint64_t now_us) noexcept {
+    cfg_.max_ack_delay_us = max_ack_delay_us;
+    cfg_.peer_ack_delay_exponent = ack_delay_exponent;
+    set_timer(now_us);
 }
 
 AckResult Recovery::on_ack_received(Space s, const Frame &ack, const uint8_t *payload,

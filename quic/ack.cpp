@@ -92,11 +92,30 @@ Receipt AckTracker::on_received(uint64_t pn, bool ack_eliciting, Ecn ecn,
     const Receipt c = classify(pn);
     if (c != Receipt::New) return c;
 
-    // \~english A hole right below this packet: something between was not received.
-    // \~spanish Un hueco justo debajo de este paquete: algo de en medio no se recibio.  \~
-    const bool hole_below = any_ && pn > largest_ + 1;
-
     insert(pn);
+
+    /* \~english
+     * 13.2.1: missing packets between the highest ack-eliciting packet and
+     * this one -- measured against the highest ACK-ELICITING one, not the
+     * highest of any kind: a non-eliciting packet in between does not fill
+     * the hole below it.  All received exactly when the range holding pn
+     * reaches down to just above that packet.
+     * \~spanish
+     * 13.2.1: paquetes que faltan entre el mayor que pide confirmacion y este --
+     * medido contra el mayor QUE PIDE CONFIRMACION, no el mayor de cualquier tipo:
+     * uno que no la pide en medio no rellena el hueco que tiene debajo.  Llegaron
+     * todos justo cuando el rango que contiene pn baja hasta el siguiente a ese
+     * paquete.
+     * \~ */
+    bool gap_above_eliciting = false;
+    if (ack_eliciting && any_eliciting_ && pn > largest_eliciting_ + 1) {
+        gap_above_eliciting = true;
+        for (size_t i = 0; i < count_; ++i)
+            if (r_[i].smallest <= pn && pn <= r_[i].largest) {
+                gap_above_eliciting = r_[i].smallest > largest_eliciting_ + 1;
+                break;
+            }
+    }
 
     if (ecn == Ecn::Ect0) ++ecn_[0];
     else if (ecn == Ecn::Ect1) ++ecn_[1];
@@ -125,7 +144,7 @@ Receipt AckTracker::on_received(uint64_t pn, bool ack_eliciting, Ecn ecn,
         // \~english Out of order, or a hole below: the sender needs to hear now (13.2.1).
         // \~spanish Desordenado, o un hueco debajo: el emisor tiene que saberlo ya (13.2.1).  \~
         if (any_eliciting_ && pn < largest_eliciting_) ack_now_ = true;
-        if (any_eliciting_ && pn > largest_eliciting_ && hole_below) ack_now_ = true;
+        if (gap_above_eliciting) ack_now_ = true;
         if (ecn == Ecn::Ce) ack_now_ = true;
 
         if (!any_eliciting_ || pn > largest_eliciting_) largest_eliciting_ = pn;

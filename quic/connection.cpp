@@ -40,6 +40,9 @@ enum : uint8_t {
     kRecHandshakeDone,
     kRecNewCid,
     kRecRetireCid,
+    kRecDataBlocked,
+    kRecStreamDataBlocked,
+    kRecStreamsBlocked,
 };
 
 /// \~english The smallest datagram that may carry an Initial (14.1).
@@ -158,6 +161,7 @@ Connection::Connection(Crypto &crypto, const ConnectionConfig &config) noexcept
     p.used = true;
     p.has_token = cfg_.peer_reset_token_known;
     util::vesta_memcpy_noinline(p.token, cfg_.peer_reset_token, kResetTokenSize);
+    draw_spin_bit();
 }
 
 Connection::~Connection() {
@@ -515,6 +519,13 @@ bool Connection::owns_cid(const uint8_t *cid, size_t len) const noexcept {
     return false;
 }
 
+void Connection::draw_spin_bit() noexcept {
+    uint8_t r = 0;
+    // \~english A provider that cannot draw leaves it at 0: still a valid, disabled spin bit.
+    // \~spanish Un proveedor que no puede sortear lo deja en 0: sigue siendo un bit de espin valido y apagado.  \~
+    spin_bit_ = crypto_.random(&r, 1) && (r & 1) != 0;
+}
+
 bool Connection::local_cid(size_t i, uint64_t &seq, const uint8_t *&cid,
                            const uint8_t *&token) const noexcept {
     for (const LocalCid &l : local_cids_) {
@@ -624,6 +635,7 @@ bool Connection::use_peer_cid(PeerCid &c) noexcept {
     peer_seq_in_use_ = c.seq;
     c.used = true;
     ++cid_counts_.switched;
+    draw_spin_bit();
     return true;
 }
 
@@ -855,6 +867,7 @@ bool Connection::keep_for_later(const uint8_t *p, size_t n, Space s, Ecn ecn) no
         Pending &q = pending_[i];
         if (q.used) continue;
         util::vesta_memcpy(q.bytes, p, n);
+        q.arrived_us = arrival_us_;
         q.len = static_cast<uint16_t>(n);
         q.space = static_cast<uint8_t>(s);
         q.ecn = ecn;
@@ -882,6 +895,9 @@ void Connection::replay(Space s, uint64_t now_us) noexcept {
         PacketHeader h;
         if (parse_packet(q.bytes, q.len, ctx, h) != HeaderError::None) continue;
         ++drops_.buffered;
+        // \~english Its ACK Delay counts from when it arrived, not from now (13.2.5).
+        // \~spanish Su ACK Delay cuenta desde que llego, no desde ahora (13.2.5).  \~
+        arrival_us_ = q.arrived_us;
         process_packet(q.bytes, h, q.ecn, now_us);
     }
 }
@@ -889,6 +905,12 @@ void Connection::replay(Space s, uint64_t now_us) noexcept {
 void Connection::restart_idle(uint64_t now_us) noexcept {
     // \~english Never shorter than three PTOs, or a slow path would time out mid-recovery (10.1).
     // \~spanish Nunca menos de tres PTO, o un camino lento caducaria en plena recuperacion (10.1).  \~
+    // \~english Zero is no timeout at all: "if a max_idle_timeout is specified" (10.1), and 0 specifies none.
+    // \~spanish Cero es ningun plazo: "si se especifica un max_idle_timeout" (10.1), y 0 no especifica ninguno.  \~
+    if (cfg_.idle_timeout_us == 0) {
+        idle_deadline_ = kNever;
+        return;
+    }
     idle_deadline_ = now_us + max64(cfg_.idle_timeout_us, 3 * pto_duration());
 }
 
@@ -1012,6 +1034,17 @@ void Connection::on_lost(Space space, const SentPacket &p) noexcept {
         case kRecRetireCid:
             requeue_retire(f.id);
             break;
+        // \~english A lost *_BLOCKED is said again if still blocked: forgetting it was sent is enough.
+        // \~spanish Un *_BLOCKED perdido se repite si sigue bloqueado: basta con olvidar que se mando.  \~
+        case kRecDataBlocked:
+            data_blocked_at_ = kNever;
+            break;
+        case kRecStreamDataBlocked:
+            if (Stream *b = streams_.find(f.id)) b->blocked_sent_at = kNever;
+            break;
+        case kRecStreamsBlocked:
+            streams_blocked_at_[f.id != 0 ? 1 : 0] = kNever;
+            break;
         default:
             break;
         }
@@ -1051,8 +1084,11 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
     uint8_t tail[kResetTokenSize];
     if (maybe_reset) util::vesta_memcpy(tail, data + n - kResetTokenSize, kResetTokenSize);
     const uint64_t failed_before = drops_.bad_header + drops_.wrong_cid + drops_.forged;
+    arrival_us_ = now_us;
 
     size_t pos = 0;
+    const uint8_t *first_dcid = nullptr;
+    size_t first_dcid_len = 0;
     while (pos < n && state_ != ConnState::Closed && state_ != ConnState::Draining) {
         PacketHeader h;
         if (parse_packet(data + pos, n - pos, ctx, h) != HeaderError::None) {
@@ -1060,6 +1096,25 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
             // \~spanish Sin cabecera no hay forma de encontrar el paquete siguiente: se va tambien el resto.  \~
             ++drops_.bad_header;
             break;
+        }
+        /* \~english
+         * 12.2: "Receivers SHOULD ignore any subsequent packets with a
+         * different Destination Connection ID than the first packet in the
+         * datagram" -- a sender MUST NOT coalesce them, so one that does is
+         * not the peer.
+         * \~spanish
+         * 12.2: los receptores DEBERIAN ignorar los paquetes siguientes con un
+         * Destination Connection ID distinto del primero del datagrama -- un
+         * emisor NO DEBE pegarlos, asi que uno que lo hace no es el otro extremo.
+         * \~ */
+        const uint8_t *dcid = data + pos + h.dcid.off;
+        if (first_dcid == nullptr) {
+            first_dcid = dcid;
+            first_dcid_len = h.dcid.len;
+        } else if (h.dcid.len != first_dcid_len || !bytes_equal(dcid, first_dcid, first_dcid_len)) {
+            ++drops_.wrong_cid;
+            pos += h.size;
+            continue;
         }
         process_packet(data + pos, h, ecn, now_us);
         pos += h.size;
@@ -1076,7 +1131,26 @@ void Connection::on_datagram(uint8_t *data, size_t n, Ecn ecn, uint64_t now_us) 
     }
 
     if (!validated_) recovery_.set_amplification_blocked(amplification_budget() == 0, now_us);
+
+    /* \~english
+     * RFC 9002, 6.2.2.1: when what arrived unblocks a server at its
+     * amplification limit, "if the PTO timer is then set to a time in the
+     * past, it is executed immediately" -- not left for whenever the host
+     * next calls on_timer.
+     * \~spanish
+     * RFC 9002, 6.2.2.1: cuando lo que llego desbloquea a un servidor en su
+     * limite de amplificacion, si el temporizador de PTO queda en el pasado, se
+     * ejecuta en el acto -- no se deja para cuando el anfitrion llame a
+     * on_timer.
+     * \~ */
+    if (state_ == ConnState::Active) run_loss_timer(now_us);
     streams_.collect();
+}
+
+void Connection::run_loss_timer(uint64_t now_us) noexcept {
+    if (recovery_.timer() > now_us) return;
+    const TimeoutAction a = recovery_.on_timeout(now_us, *this);
+    if (a.kind == TimeoutAction::Probe) probe_owed_[idx(a.space)] = true;
 }
 
 bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
@@ -1159,19 +1233,33 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
         return false;
     }
 
+    /* \~english
+     * Closing: a packet attributed to the connection gets the
+     * CONNECTION_CLOSE again, and nothing else (10.2.1) -- before looking at
+     * keys, since a packet this end can no longer open is still the peer
+     * asking.  At a limited rate (10.2.1, SHOULD): the 1st, 2nd, 4th, 8th...
+     * packet is answered, so a peer that keeps sending cannot make this end
+     * answer each one.
+     * \~spanish
+     * Cerrando: un paquete atribuido a la conexion recibe otra vez el
+     * CONNECTION_CLOSE, y nada mas (10.2.1) -- antes de mirar las claves, porque
+     * un paquete que este extremo ya no puede abrir sigue siendo el otro
+     * preguntando.  A ritmo limitado (10.2.1, DEBERIA): se contesta al 1o, 2o, 4o,
+     * 8o... paquete, asi que un otro que sigue mandando no consigue que este
+     * extremo le conteste a cada uno.
+     * \~ */
+    if (state_ == ConnState::Closing) {
+        ++close_rx_;
+        if ((close_rx_ & (close_rx_ - 1)) == 0) close_owed_ = true;
+        ++drops_.after_close;
+        return false;
+    }
+
     Keys &k = keys_[idx(s)];
     if (!can_open(s)) {
         // \~english Keys still to come: keep it (few, bounded).  Keys gone: it is late.
         // \~spanish Claves aun por llegar: se guarda (pocos, acotado).  Claves ya tiradas: llega tarde.  \~
         if (discarded_[idx(s)] || !keep_for_later(p, h.size, s, ecn)) ++drops_.no_keys;
-        return false;
-    }
-
-    // \~english Closing: every packet gets the CONNECTION_CLOSE again, and nothing else (10.2.1).
-    // \~spanish Cerrando: cada paquete recibe otra vez el CONNECTION_CLOSE, y nada mas (10.2.1).  \~
-    if (state_ == ConnState::Closing) {
-        close_owed_ = true;
-        ++drops_.after_close;
         return false;
     }
 
@@ -1233,7 +1321,7 @@ bool Connection::process_packet(uint8_t *p, const PacketHeader &h, Ecn ecn,
     if (!process_frames(s, p + u.payload.off, u.payload.len, h.type, eliciting, now_us))
         return false;
 
-    acks_[idx(s)].on_received(u.pn, eliciting, ecn, now_us);
+    acks_[idx(s)].on_received(u.pn, eliciting, ecn, arrival_us_);
     restart_idle(now_us);
     sent_eliciting_since_receipt_ = false;
 
@@ -1488,7 +1576,6 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
 
         case FrameType::MaxData:
             send_flow_.on_max_data(f.maximum);
-            data_blocked_sent_ = false;
             break;
 
         case FrameType::MaxStreams:
@@ -1558,12 +1645,14 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
     // \~english An ACK when one is owed: at once, or its delay is up.
     // \~spanish Un ACK cuando se debe: al momento, o se acabo su plazo.  \~
     const uint64_t deadline = acks.ack_deadline();
+    bool acked = false;
     if (acks.ranges() != 0 && deadline != kNever && deadline <= now_us) {
         const size_t n = acks.write_ack(p, room, now_us);
         if (n != 0) {
             ack_largest = acks.range(0).largest;
             acks.on_ack_sent();
             used += n;
+            acked = true;
         }
     }
 
@@ -1613,9 +1702,19 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
             path_response_owed_ = false;
             ++sent_.path_response;
         }
+        /* \~english
+         * New limits are computed first and COMMITTED only once their frame is
+         * written: what is enforced is what was sent (4.1, 19.9, 19.10, 19.11),
+         * so a frame that did not fit must not have raised anything.
+         * \~spanish
+         * Los limites nuevos se calculan primero y se COMPROMETEN solo cuando su
+         * trama se escribio: lo que se hace cumplir es lo que se mando (4.1, 19.9,
+         * 19.10, 19.11), asi que una trama que no cupo no debe haber subido nada.
+         * \~ */
         if ((recv_flow_.wants_update() || max_data_owed_) && !full(rec)) {
-            n = write_max_data(p + used, room - used, recv_flow_.advertise());
+            n = write_max_data(p + used, room - used, recv_flow_.next_limit());
             if (n != 0) {
+                recv_flow_.advertise();
                 used += n;
                 eliciting = true;
                 max_data_owed_ = false;
@@ -1626,8 +1725,9 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
         for (int bidi = 1; bidi >= 0; --bidi) {
             if ((streams_.wants_max_streams(bidi != 0) || max_streams_owed_[bidi]) && !full(rec)) {
                 n = write_max_streams(p + used, room - used, bidi != 0,
-                                      streams_.advertise_max_streams(bidi != 0));
+                                      streams_.next_max_streams(bidi != 0));
                 if (n != 0) {
+                    streams_.advertise_max_streams(bidi != 0);
                     used += n;
                     eliciting = true;
                     max_streams_owed_[bidi] = false;
@@ -1639,9 +1739,14 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
         for (size_t i = 0; i < streams_.capacity() && !full(rec); ++i) {
             Stream *st = streams_.slot(i);
             if (st == nullptr) continue;
-            if (st->recv != nullptr && (st->recv->wants_update() || st->max_stream_data_owed)) {
-                n = write_max_stream_data(p + used, room - used, st->id, st->recv->advertise());
+            // \~english A lost one is owed again -- but only in "Recv": past it there is nothing to allow (3.2).
+            // \~spanish Uno perdido se vuelve a deber -- pero solo en "Recv": despues no hay nada que permitir (3.2).  \~
+            if (st->recv != nullptr &&
+                (st->recv->wants_update() ||
+                 (st->max_stream_data_owed && st->recv->state() == RecvState::Recv))) {
+                n = write_max_stream_data(p + used, room - used, st->id, st->recv->next_limit());
                 if (n != 0) {
+                    st->recv->advertise();
                     used += n;
                     eliciting = true;
                     st->max_stream_data_owed = false;
@@ -1702,6 +1807,27 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
             }
         }
         round_robin_ = cap != 0 ? (round_robin_ + 1) % cap : 0;
+        write_blocked(p, room, used, rec, eliciting, now_us);
+    }
+
+    /* \~english
+     * 13.2.1: "An endpoint SHOULD send an ACK frame with other frames when
+     * there are new ack-eliciting packets to acknowledge" -- so a packet
+     * already going out takes the owed ACK along instead of leaving it to
+     * its deadline and a packet of its own.
+     * \~spanish
+     * 13.2.1: un extremo DEBERIA mandar un ACK junto con otras tramas cuando hay
+     * paquetes nuevos que piden confirmacion -- asi que un paquete que ya sale se
+     * lleva el ACK que se debe en vez de dejarlo a su plazo y a un paquete propio.
+     * \~ */
+    if (!acked && eliciting && acks.ranges() != 0 && acks.ack_deadline() != kNever) {
+        const size_t n = acks.write_ack(p + used, room - used, now_us);
+        if (n != 0) {
+            ack_largest = acks.range(0).largest;
+            acks.on_ack_sent();
+            used += n;
+            acked = true;
+        }
     }
 
     // \~english A probe with nothing else to carry is a PING (6.2.4).
@@ -1717,13 +1843,103 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
     return used;
 }
 
+void Connection::write_blocked(uint8_t *p, size_t room, size_t &used, PacketRecord &rec,
+                               bool &eliciting, uint64_t now_us) noexcept {
+    /* \~english
+     * 4.1: a sender blocked by flow control SHOULD say so with DATA_BLOCKED /
+     * STREAM_DATA_BLOCKED, and SHOULD say it again periodically while it has
+     * no ack-eliciting packet in flight -- here, once per PTO -- or the peer
+     * may take the silence for an idle connection.  4.6: one that cannot open
+     * a stream because of the peer's limit SHOULD send STREAMS_BLOCKED.  Each
+     * once per limit; a new limit is a new reason to say it.
+     * \~spanish
+     * 4.1: un emisor bloqueado por el control de flujo DEBERIA decirlo con
+     * DATA_BLOCKED / STREAM_DATA_BLOCKED, y DEBERIA repetirlo de vez en cuando
+     * mientras no tenga ningun paquete que pida confirmacion en vuelo -- aqui,
+     * una vez por PTO --, o el otro puede tomar el silencio por una conexion
+     * inactiva.  4.6: uno que no puede abrir un flujo por el limite del otro
+     * DEBERIA mandar STREAMS_BLOCKED.  Cada uno una vez por limite; un limite
+     * nuevo es un motivo nuevo para decirlo.
+     * \~ */
+    const bool quiet = recovery_.bytes_in_flight() == 0;
+    size_t n = 0;
+
+    bool waiting = false;
+    for (size_t i = 0; i < streams_.capacity() && !waiting; ++i) {
+        const Stream *st = streams_.slot(i);
+        if (st != nullptr && st->send != nullptr && st->send->written() > st->send->sent()) waiting = true;
+    }
+    if (waiting && send_flow_.blocked() && !full(rec)) {
+        const uint64_t lim = send_flow_.limit();
+        const bool again = data_blocked_at_ == lim && quiet && now_us >= data_blocked_time_ + pto_duration();
+        if ((data_blocked_at_ != lim || again) && (n = write_data_blocked(p + used, room - used, lim)) != 0) {
+            used += n;
+            eliciting = true;
+            data_blocked_at_ = lim;
+            data_blocked_time_ = now_us;
+            ++sent_.data_blocked;
+            add_record(rec, kRecDataBlocked, 0, 0, 0, false);
+        }
+    }
+
+    for (size_t i = 0; i < streams_.capacity() && !full(rec); ++i) {
+        Stream *st = streams_.slot(i);
+        if (st == nullptr || st->send == nullptr || !st->send->blocked()) continue;
+        const uint64_t lim = st->send->limit();
+        const bool again = st->blocked_sent_at == lim && quiet && now_us >= st->blocked_sent_time + pto_duration();
+        if (st->blocked_sent_at == lim && !again) continue;
+        n = write_stream_data_blocked(p + used, room - used, st->id, lim);
+        if (n == 0) break;
+        used += n;
+        eliciting = true;
+        st->blocked_sent_at = lim;
+        st->blocked_sent_time = now_us;
+        ++sent_.stream_data_blocked;
+        add_record(rec, kRecStreamDataBlocked, st->id, 0, 0, false);
+    }
+
+    for (int bidi = 1; bidi >= 0 && !full(rec); --bidi) {
+        if (!streams_.open_refused(bidi != 0)) continue;
+        const uint64_t lim = streams_.peer_limit(bidi != 0);
+        if (streams_blocked_at_[bidi] == lim) continue;
+        n = write_streams_blocked(p + used, room - used, bidi != 0, lim);
+        if (n == 0) break;
+        used += n;
+        eliciting = true;
+        streams_blocked_at_[bidi] = lim;
+        ++sent_.streams_blocked;
+        add_record(rec, kRecStreamsBlocked, static_cast<uint64_t>(bidi), 0, 0, false);
+    }
+}
+
 size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, bool &padded,
                                 uint64_t now_us) noexcept {
     padded = false;
     if (!recovery_.can_record(s) && state_ != ConnState::Closing) return 0;
 
+    /* \~english
+     * A packet that must be padded to 1200 bytes and cannot be is not built
+     * at all -- decided HERE, before any frame is written.  Writing the frames
+     * marks their data as sent; dropping the packet after that would leave
+     * bytes counted as in flight that never left and that nothing would ever
+     * retransmit.
+     * \~spanish
+     * Un paquete que hay que rellenar a 1200 bytes y no se puede no se construye
+     * -- decidido AQUI, antes de escribir ninguna trama.  Escribir las tramas
+     * marca sus datos como mandados; tirar el paquete despues dejaria bytes
+     * contados en vuelo que nunca salieron y que nada retransmitiria nunca.
+     * \~ */
+    if (pad != Pad::Never && room < kMinInitial) return 0;
+
     const size_t i = idx(s);
     const uint64_t pn = next_pn_[i];
+
+    // \~english 12.3: at 2^62-1 the sender MUST close without a CONNECTION_CLOSE or anything else.
+    // \~spanish 12.3: en 2^62-1 el emisor DEBE cerrar sin CONNECTION_CLOSE ni nada mas.  \~
+    if (pn >= (uint64_t{1} << 62) - 1) {
+        state_ = ConnState::Closed;
+        return 0;
+    }
     const uint64_t la = recovery_.largest_acked(s);
     size_t pn_len = packet_number_length(pn, la == kNever ? 0 : la, la != kNever);
     if (pn_len == 0) pn_len = 4;
@@ -1791,7 +2007,17 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
             close(static_cast<uint64_t>(TransportError::AeadLimitReached), false, 0, now_us);
         // \~english The fixed bit, and the key phase this end seals with (17.3.1).
         // \~spanish El bit fijo, y la fase de clave con la que sella este extremo (17.3.1).  \~
-        out[h++] = static_cast<uint8_t>(0x40 | (one_rtt_.write_phase ? 0x04 : 0x00));
+        /* \~english
+         * The spin bit (17.4) is not used, and then "it is RECOMMENDED that
+         * endpoints set the spin bit to a random value": one per connection
+         * ID, drawn again whenever the ID changes, so it links nothing.
+         * \~spanish
+         * El bit de espin (17.4) no se usa, y entonces SE RECOMIENDA ponerlo a un
+         * valor aleatorio: uno por identificador de conexion, sorteado otra vez
+         * cada vez que cambia el identificador, asi que no enlaza nada.
+         * \~ */
+        out[h++] = static_cast<uint8_t>(0x40 | (spin_bit_ ? 0x20 : 0x00) |
+                                        (one_rtt_.write_phase ? 0x04 : 0x00));
         util::vesta_memcpy(out + h, cfg_.peer_cid, cfg_.peer_cid_len);
         h += cfg_.peer_cid_len;
     }
@@ -1921,17 +2147,32 @@ size_t Connection::build_datagram(uint8_t *out, size_t room, uint64_t now_us) no
     bool padded = false;
     if (state_ == ConnState::Closing) {
         if (!close_owed_) return 0;
-        // \~english In the highest space this end can still write.
-        // \~spanish En el espacio mas alto en el que este extremo aun puede escribir.  \~
-        for (int s = 2; s >= 0; --s) {
+        close_owed_ = false;
+        /* \~english
+         * 10.2.3: once the handshake is confirmed, the close goes in 1-RTT
+         * (MUST) -- the only keys left then.  Before it, the peer may not be
+         * able to open the highest level yet, so a copy goes at every level
+         * this end still has keys for, coalesced lowest first (SHOULD).
+         * \~spanish
+         * 10.2.3: con el saludo confirmado, el cierre va en 1-RTT (DEBE) -- las
+         * unicas claves que quedan entonces.  Antes, puede que el otro aun no
+         * pueda abrir el nivel mas alto, asi que va una copia en cada nivel para
+         * el que este extremo aun tiene claves, pegadas de la mas baja a la mas
+         * alta (DEBERIA).
+         * \~ */
+        size_t total = 0;
+        for (int s = confirmed_ ? 2 : 0; s <= 2; ++s) {
             if (!keys_[s].have) continue;
-            close_owed_ = false;
+            // \~english A client knows the server has Handshake keys once it has them itself (10.2.3).
+            // \~spanish Un cliente sabe que el servidor tiene claves Handshake en cuanto las tiene el (10.2.3).  \~
+            if (!cfg_.is_server && s == 0 && keys_[1].have) continue;
             // \~english A client's datagram with an Initial is 1200 bytes, a close included (8.1, 14.1).
             // \~spanish Un datagrama de cliente con un Initial mide 1200 bytes, tambien con un cierre (8.1, 14.1).  \~
             const Pad pad = !cfg_.is_server && s == 0 ? Pad::Always : Pad::Never;
-            return build_packet(static_cast<Space>(s), out, room, pad, padded, now_us);
+            total += build_packet(static_cast<Space>(s), out + total, room - total, pad, padded, now_us);
+            if (padded) break;
         }
-        return 0;
+        return total;
     }
 
     size_t total = 0;
@@ -1955,6 +2196,17 @@ size_t Connection::build_datagram(uint8_t *out, size_t room, uint64_t now_us) no
         total += n;
         if (padded || state_ != ConnState::Active) break;
     }
+
+    /* \~english
+     * RFC 9002, 7.8: if the window still has room when this call stops, it
+     * was not the window that stopped it -- too little to send, or flow
+     * control -- and the window SHOULD NOT grow on the acknowledgements.
+     * \~spanish
+     * RFC 9002, 7.8: si la ventana aun tiene sitio cuando esta llamada para, no
+     * fue la ventana lo que la paro -- poco que mandar, o el control de flujo -- y
+     * la ventana NO DEBERIA crecer con las confirmaciones.
+     * \~ */
+    recovery_.set_app_limited(recovery_.window_allows(static_cast<uint32_t>(cfg_.max_datagram)));
     return total;
 }
 
@@ -2002,10 +2254,7 @@ void Connection::on_timer(uint64_t now_us) noexcept {
         ++key_counts_.old_discarded;
     }
 
-    if (recovery_.timer() <= now_us) {
-        const TimeoutAction a = recovery_.on_timeout(now_us, *this);
-        if (a.kind == TimeoutAction::Probe) probe_owed_[idx(a.space)] = true;
-    }
+    run_loss_timer(now_us);
 }
 
 } // namespace quic

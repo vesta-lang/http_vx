@@ -169,6 +169,17 @@ void test_flow_control() {
               transport_error_of(StreamError::FlowControl) == TransportError::FlowControlError,
           "one byte past the limit was not a FLOW_CONTROL_ERROR");
 
+    // \~english A window that is not whole chunks: the limit is still exactly it (4.1, 19.10).
+    // \~spanish Una ventana que no son trozos enteros: el limite sigue siendo exactamente ella (4.1, 19.10).  \~
+    {
+        RecvStream odd(1000);
+        uint64_t f2 = 0;
+        check(odd.on_data(0, buf.data(), 1000, false, f2) == StreamError::None,
+              "data up to an odd window was refused");
+        check(odd.on_data(1000, buf.data(), 1, false, f2) == StreamError::FlowControl,
+              "one byte past an odd window was let through: the limit was rounded up");
+    }
+
     check(!s.wants_update(), "an update was wanted before anything was read");
     const uint8_t *p = nullptr;
     s.consume(s.peek(p));

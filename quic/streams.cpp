@@ -169,9 +169,14 @@ Stream *StreamTable::create(uint64_t id) noexcept {
     if (free_count_ == 0) return nullptr;
     const uint32_t slot = free_[--free_count_];
     Stream &s = slots_[slot];
+    // \~english A reused slot starts clean: nothing owed by the stream that held it before.
+    // \~spanish Una ranura reutilizada empieza limpia: nada debido por el flujo que la tuvo antes.  \~
     s.id = id;
     s.recv = nullptr;
     s.send = nullptr;
+    s.max_stream_data_owed = false;
+    s.blocked_sent_at = kNever;
+    s.blocked_sent_time = 0;
 
     const bool local = is_local(id);
     const bool uni = stream_is_uni(id);
@@ -294,7 +299,13 @@ StreamLookup StreamTable::on_peer_frame(uint64_t id, FrameType type, Stream *&ou
 
 Stream *StreamTable::open(bool bidirectional) noexcept {
     const uint64_t t = local_type(cfg_.is_server, bidirectional);
-    if (opened_[t] >= limit_[t] || local_open_ >= cfg_.local_concurrency) return nullptr;
+    // \~english Refused by the PEER's limit: that is what STREAMS_BLOCKED tells it (4.6).
+    // \~spanish Negado por el limite del OTRO: eso es lo que le dice STREAMS_BLOCKED (4.6).  \~
+    if (opened_[t] >= limit_[t]) {
+        refused(bidirectional);
+        return nullptr;
+    }
+    if (local_open_ >= cfg_.local_concurrency) return nullptr;
     Stream *s = create(opened_[t] * 4 + t);
     if (s == nullptr) return nullptr;
     ++opened_[t];
@@ -309,7 +320,10 @@ bool StreamTable::blocked_by_peer(bool bidirectional) const noexcept {
 
 void StreamTable::on_max_streams(bool bidirectional, uint64_t maximum) noexcept {
     const uint64_t t = local_type(cfg_.is_server, bidirectional);
-    if (maximum > limit_[t]) limit_[t] = maximum;
+    if (maximum > limit_[t]) {
+        limit_[t] = maximum;
+        refused_[bidirectional ? 1 : 0] = false;
+    }
 }
 
 size_t StreamTable::collect() noexcept {
@@ -343,13 +357,30 @@ bool StreamTable::wants_max_streams(bool bidirectional) const noexcept {
     return target > limit_[t] && (target - limit_[t]) * 2 >= conc;
 }
 
-uint64_t StreamTable::advertise_max_streams(bool bidirectional) noexcept {
+uint64_t StreamTable::next_max_streams(bool bidirectional) const noexcept {
     const uint64_t t = peer_type(cfg_.is_server, bidirectional);
     const uint64_t conc = bidirectional ? cfg_.peer_bidi_concurrency : cfg_.peer_uni_concurrency;
     uint64_t target = closed_[t] + conc;
     if (target > kMaxStreams) target = kMaxStreams;
-    if (target > limit_[t]) limit_[t] = target;
+    return target > limit_[t] ? target : limit_[t];
+}
+
+uint64_t StreamTable::advertise_max_streams(bool bidirectional) noexcept {
+    const uint64_t t = peer_type(cfg_.is_server, bidirectional);
+    limit_[t] = next_max_streams(bidirectional);
     return limit_[t];
+}
+
+void StreamTable::refused(bool bidirectional) noexcept {
+    refused_[bidirectional ? 1 : 0] = true;
+}
+
+bool StreamTable::open_refused(bool bidirectional) const noexcept {
+    return refused_[bidirectional ? 1 : 0] && blocked_by_peer(bidirectional);
+}
+
+uint64_t StreamTable::peer_limit(bool bidirectional) const noexcept {
+    return limit_[local_type(cfg_.is_server, bidirectional)];
 }
 
 uint64_t StreamTable::max_streams(bool bidirectional) const noexcept {

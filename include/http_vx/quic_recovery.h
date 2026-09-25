@@ -314,6 +314,26 @@ public:
     /// \~english Nothing to send: the window must not grow on acknowledgements (B.5).
     /// \~spanish Nada que mandar: la ventana no debe crecer con las confirmaciones (B.5).  \~
     void set_app_limited(bool limited) noexcept { app_limited_ = limited; }
+    bool app_limited() const noexcept { return app_limited_; }
+
+    /**
+     * @brief
+     * \~english The peer's max_ack_delay and ack_delay_exponent, once its transport parameters are known.
+     * \~spanish El max_ack_delay y el ack_delay_exponent del otro, cuando se conocen sus parametros de transporte.
+     * \~
+     *
+     * \~english
+     * They are the peer's (RFC 9002, A.3; RFC 9000, 18.2) and arrive with the
+     * handshake, after the connection exists; until then the defaults, 25 ms
+     * and 3, are what the RFC says to assume.
+     * \~spanish
+     * Son los del otro (RFC 9002, A.3; RFC 9000, 18.2) y llegan con el saludo,
+     * despues de que exista la conexion; hasta entonces, los valores por
+     * defecto, 25 ms y 3, son lo que el RFC dice que se suponga.
+     * \~
+     */
+    void set_peer_ack_params(uint64_t max_ack_delay_us, uint8_t ack_delay_exponent,
+                             uint64_t now_us) noexcept;
 
     uint64_t latest_rtt() const noexcept { return latest_rtt_; }
     uint64_t smoothed_rtt() const noexcept { return smoothed_rtt_; }

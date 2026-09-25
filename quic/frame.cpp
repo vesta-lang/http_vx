@@ -216,11 +216,13 @@ TransportError transport_error_of(FrameError e) noexcept {
         return TransportError::NoError;
 
     /* \~english
-     * The RFC names these three PROTOCOL_VIOLATION: the frame is well formed,
-     * it is in the wrong place or came from the wrong end.
+     * The RFC names these four PROTOCOL_VIOLATION (12.4, 19.7, 19.20): a type
+     * written longer than needed, a frame in a packet type that may not carry
+     * it or from the wrong end, and a packet with no frames.
      * \~spanish
-     * El RFC nombra estas tres PROTOCOL_VIOLATION: la trama esta bien formada,
-     * esta en el sitio equivocado o vino del extremo equivocado.
+     * El RFC nombra estas cuatro PROTOCOL_VIOLATION (12.4, 19.7, 19.20): un tipo
+     * escrito mas largo de lo necesario, una trama en un tipo de paquete que no
+     * puede llevarla o del extremo equivocado, y un paquete sin tramas.
      * \~ */
     case FrameError::TypeNotShortest:
     case FrameError::NotAllowedInPacket:
@@ -257,18 +259,24 @@ FrameReader::Step FrameReader::next(Frame &out) noexcept {
     if (type_len == 0) return fail(FrameError::Truncated, 0);
 
     /* \~english
-     * The shortest encoding, and checked here and not in the varint decoder,
-     * which every other field shares and where a longer encoding is legal.
+     * An unknown type first: that one is a MUST (FRAME_ENCODING_ERROR, 12.4),
+     * while a type in a longer encoding than needed MAY be a PROTOCOL_VIOLATION
+     * -- checked the other way round, an unknown type written long would get
+     * the optional error instead of the mandatory one.  The shortest encoding
+     * is checked here and not in the varint decoder, which every other field
+     * shares and where a longer encoding is legal.
      * \~spanish
-     * La codificacion mas corta, y comprobada aqui y no en el descodificador de
-     * enteros, que comparten todos los demas campos y donde una mas larga es
-     * legal.
+     * Primero un tipo desconocido: eso es un DEBE (FRAME_ENCODING_ERROR, 12.4),
+     * mientras que un tipo con codificacion mas larga de lo necesario PUEDE ser un
+     * PROTOCOL_VIOLATION -- mirado al reves, un tipo desconocido escrito largo
+     * recibiria el error opcional en lugar del obligatorio.  La codificacion mas
+     * corta se comprueba aqui y no en el descodificador de enteros, que comparten
+     * todos los demas campos y donde una mas larga es legal.
      * \~ */
-    if (type_len != varint_size(w)) return fail(FrameError::TypeNotShortest, w);
-    pos_ += type_len;
-
     const uint8_t allowed = allowed_in(w);
     if (allowed == 0) return fail(FrameError::UnknownType, w);
+    if (type_len != varint_size(w)) return fail(FrameError::TypeNotShortest, w);
+    pos_ += type_len;
     if ((allowed & packet_bit(ctx_.packet)) == 0)
         return fail(FrameError::NotAllowedInPacket, w);
 

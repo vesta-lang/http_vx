@@ -419,6 +419,9 @@ void test_each_rule() {
     expect_error_hex("1f", one, FrameError::UnknownType, enc, "type 0x1f");
     expect_error_hex("30", one, FrameError::UnknownType, enc, "DATAGRAM, not negotiated");
     expect_error_hex("4001", one, FrameError::TypeNotShortest, proto, "PING in two bytes");
+    // \~english Unknown AND long: the MUST (FRAME_ENCODING_ERROR) wins over the MAY (12.4).
+    // \~spanish Desconocido Y largo: gana el DEBE (FRAME_ENCODING_ERROR) sobre el PUEDE (12.4).  \~
+    expect_error_hex("401f", one, FrameError::UnknownType, enc, "type 0x1f in two bytes");
     expect_error_hex("0800", ctx_of(PacketType::Initial, true), FrameError::NotAllowedInPacket,
                      proto, "STREAM in an Initial");
     expect_error_hex("1e", server, FrameError::OnlyFromServer, proto,

@@ -118,6 +118,29 @@ void test_when_to_acknowledge() {
         check(t.ack_now(), "a packet arriving out of order did not ack now");
     }
     {
+        // \~english 13.2.1: the hole is measured from the highest ACK-ELICITING packet:
+        // \~english 5 eliciting, 6 lost, 7 not eliciting, 8 eliciting -> 6 is missing, ack now.
+        // \~spanish 13.2.1: el hueco se mide desde el mayor QUE PIDE CONFIRMACION:
+        // \~spanish 5 la pide, 6 perdido, 7 no la pide, 8 la pide -> falta el 6, confirmar ya.  \~
+        AckTracker t(p);
+        t.on_received(5, true, Ecn::NotEct, 0);
+        t.on_ack_sent();
+        t.on_received(7, false, Ecn::NotEct, 0);
+        t.on_received(8, true, Ecn::NotEct, 0);
+        check(t.ack_now(), "a hole above the highest ack-eliciting packet did not ack now");
+    }
+    {
+        // \~english ...while with 6 received too, nothing is missing: the normal delay applies.
+        // \~spanish ...mientras que con el 6 recibido tambien, no falta nada: rige el retraso normal.  \~
+        AckTracker t(p);
+        t.on_received(5, true, Ecn::NotEct, 0);
+        t.on_ack_sent();
+        t.on_received(6, false, Ecn::NotEct, 0);
+        t.on_received(7, false, Ecn::NotEct, 0);
+        t.on_received(8, true, Ecn::NotEct, 0);
+        check(!t.ack_now(), "no packet was missing, yet the ACK was not delayed");
+    }
+    {
         AckTracker t(p);
         t.on_received(0, true, Ecn::Ce, 0);
         check(t.ack_now(), "a CE-marked packet did not ack now");

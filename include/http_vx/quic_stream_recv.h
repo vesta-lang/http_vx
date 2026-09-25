@@ -107,11 +107,14 @@ public:
      * \~
      *
      * \~english
-     * The initial limit is @p window: what `initial_max_stream_data_*` says.
-     * It is rounded up to a whole number of chunks.
+     * The initial limit is exactly @p window: what `initial_max_stream_data_*`
+     * says.  Only the memory is rounded up to whole chunks, and the later
+     * limits a MAX_STREAM_DATA sends grow by that rounded window.
      * \~spanish
-     * El limite inicial es @p window: lo que dice `initial_max_stream_data_*`.
-     * Se redondea hacia arriba a un numero entero de trozos.
+     * El limite inicial es exactamente @p window: lo que dice
+     * `initial_max_stream_data_*`.  Solo la memoria se redondea a trozos
+     * enteros, y los limites siguientes que manda un MAX_STREAM_DATA crecen en esa
+     * ventana redondeada.
      * \~
      */
     explicit RecvStream(uint64_t window) noexcept;
@@ -172,6 +175,26 @@ public:
     /// \~spanish Si merece la pena mandar un MAX_STREAM_DATA: se leyo media ventana.  \~
     bool wants_update() const noexcept;
 
+    /**
+     * @brief
+     * \~english The limit an update would announce, WITHOUT raising it yet.
+     * \~spanish El limite que anunciaria una actualizacion, SIN subirlo todavia.
+     * \~
+     *
+     * \~english
+     * The limit enforced is the limit SENT (4.1): it is raised with
+     * `advertise` only once the frame carrying it was written, never before
+     * -- a frame that did not fit would otherwise let the peer past a limit
+     * it never heard.
+     * \~spanish
+     * El limite que se hace cumplir es el limite MANDADO (4.1): se sube con
+     * `advertise` solo cuando la trama que lo lleva se escribio, nunca antes --
+     * si no, una trama que no cupo dejaria al otro pasar de un limite que nunca
+     * oyo.
+     * \~
+     */
+    uint64_t next_limit() const noexcept;
+
     /// \~english Raises the limit to one window past what was read, and returns it.
     /// \~spanish Sube el limite a una ventana por delante de lo leido, y lo devuelve.  \~
     uint64_t advertise() noexcept;
@@ -231,6 +254,11 @@ public:
     void on_consumed(uint64_t n) noexcept { consumed_ += n; }
 
     bool wants_update() const noexcept { return limit_ - consumed_ < window_ / 2; }
+    /// \~english What `advertise` would announce, without raising the limit (see RecvStream).
+    /// \~spanish Lo que anunciaria `advertise`, sin subir el limite (ver RecvStream).  \~
+    uint64_t next_limit() const noexcept {
+        return consumed_ + window_ > limit_ ? consumed_ + window_ : limit_;
+    }
     uint64_t advertise() noexcept;
 
     uint64_t limit() const noexcept { return limit_; }

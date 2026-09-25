@@ -353,6 +353,9 @@ struct SendCounts {
     uint64_t connection_close = 0;
     uint64_t new_connection_id = 0;
     uint64_t retire_connection_id = 0;
+    uint64_t data_blocked = 0;
+    uint64_t stream_data_blocked = 0;
+    uint64_t streams_blocked = 0;
 };
 
 /**
@@ -669,6 +672,7 @@ private:
      */
     struct Pending {
         uint8_t bytes[1500];
+        uint64_t arrived_us;
         uint16_t len;
         uint8_t space;
         Ecn ecn;
@@ -813,6 +817,19 @@ private:
     /// \~english The size of the datagram being processed: an Initial in a small one is dropped (14.1).
     /// \~spanish El tamano del datagrama que se procesa: un Initial en uno pequeno se tira (14.1).  \~
     size_t datagram_len_ = 0;
+    /**
+     * \~english
+     * When the packet being processed arrived: now, or -- for one kept until
+     * its keys came -- the moment it was kept.  The wait for keys belongs in
+     * the ACK Delay (13.2.5).
+     * \~spanish
+     * Cuando llego el paquete que se procesa: ahora, o -- para uno guardado hasta
+     * que llegaron sus claves -- el momento en que se guardo.  La espera por las
+     * claves va dentro del ACK Delay (13.2.5).
+     * \~
+     */
+    uint64_t arrival_us_ = 0;
+    void run_loss_timer(uint64_t now_us) noexcept;
     bool closed_by_reset_ = false;
     CidCounts cid_counts_;
 
@@ -877,7 +894,19 @@ private:
     bool path_response_owed_ = false;
     uint8_t path_response_[kPathDataSize] = {};
     bool probe_owed_[kSpaces] = {false, false, false};
-    bool data_blocked_sent_ = false;
+    /// \~english The limits *_BLOCKED frames were last sent at (kNever: none since), and when.
+    /// \~spanish Los limites en los que se mandaron los ultimos *_BLOCKED (kNever: ninguno desde entonces), y cuando.  \~
+    /// \~english Packets received while closing: the answers are spaced out by it (10.2.1).
+    /// \~spanish Paquetes recibidos mientras se cierra: las respuestas se espacian con esto (10.2.1).  \~
+    uint64_t close_rx_ = 0;
+    /// \~english The random spin bit of the ID in use (17.4).  \~spanish El bit de espin aleatorio del identificador en uso (17.4).  \~
+    bool spin_bit_ = false;
+    void draw_spin_bit() noexcept;
+    uint64_t data_blocked_at_ = kNever;
+    uint64_t data_blocked_time_ = 0;
+    uint64_t streams_blocked_at_[2] = {kNever, kNever};
+    void write_blocked(uint8_t *p, size_t room, size_t &used, PacketRecord &rec, bool &eliciting,
+                       uint64_t now_us) noexcept;
     uint64_t round_robin_ = 0;
 
     uint64_t idle_deadline_ = kNever;

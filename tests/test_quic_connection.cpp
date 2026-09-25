@@ -2072,6 +2072,281 @@ void test_cid_rules(Crypto &cr) {
     }
 }
 
+/* \~english
+ * What the audit of frames, ACKs, recovery, streams and the connection's life
+ * against the RFC text found, one rule per case.
+ * \~spanish
+ * Lo que encontro la auditoria de tramas, ACK, recuperacion, flujos y vida de la
+ * conexion contra el texto del RFC, una regla por caso.
+ * \~ */
+
+/// \~english The frames of a server 1-RTT datagram (tag 4, generation 0), opened as the client would.
+/// \~spanish Las tramas de un datagrama 1-RTT del servidor (marca 4, generacion 0), abiertas como el cliente.  \~
+std::vector<Frame> server_frames(Crypto &cr, uint8_t *dgram, size_t n, std::vector<uint8_t> &payload) {
+    std::vector<Frame> frames;
+    uint8_t s[kMaxSecret];
+    secret(s, 4, 32);
+    KeyMaterial m;
+    PacketKeys k;
+    if (!derive_key_material(cr, kVersion1, Aead::Aes128Gcm, s, 32, m) || !prepare_keys(cr, m, k)) return frames;
+    HeaderContext hc;
+    PacketHeader h;
+    Unprotected u;
+    if (parse_packet(dgram, n, hc, h) == HeaderError::None && unprotect_packet(cr, k, dgram, h, 0, u) == Unprotect::Ok) {
+        payload.assign(dgram + u.payload.off, dgram + u.payload.off + u.payload.len);
+        FrameContext fc;
+        fc.packet = PacketType::OneRtt;
+        fc.is_server = false;
+        FrameReader fr(payload.data(), payload.size(), fc);
+        Frame f;
+        while (fr.next(f) == FrameReader::Step::Frame) frames.push_back(f);
+    }
+    forget_keys(cr, k);
+    return frames;
+}
+
+bool has_frame(const std::vector<Frame> &fs, FrameType t) {
+    for (const Frame &f : fs)
+        if (f.type == t) return true;
+    return false;
+}
+
+void test_audit_rules(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/audit", cr.name());
+    const ConnectionConfig cc = key_client();
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    uint8_t out[1500], pkt[1500];
+
+    // \~english 13.2.1: a packet going out anyway carries the owed ACK, before its deadline.
+    // \~spanish 13.2.1: un paquete que sale de todos modos lleva el ACK debido, antes de su plazo.  \~
+    {
+        // \~english The server needs credit to send its data at all.
+        // \~spanish El servidor necesita credito para poder mandar sus datos.  \~
+        ConnectionConfig talk = sc;
+        talk.peer_max_data = 1 << 20;
+        talk.streams.peer_window_bidi_local = 1 << 20;
+        KeyPair k(cr, Aead::Aes128Gcm, cc, talk);
+        pump(k, 10);
+        say(k, "ping");
+        const size_t n = k.client.build_datagram(out, sizeof out, k.now);
+        k.server.on_datagram(out, n, Ecn::NotEct, k.now);
+        heard(k);
+        Stream *st = k.server.streams().find(0);
+        size_t took = 0;
+        const uint8_t pong[] = {'p', 'o', 'n', 'g'};
+        if (st != nullptr) st->send->write(pong, sizeof pong, took);
+        const size_t m = k.server.build_datagram(out, sizeof out, k.now + 1000);
+        std::vector<uint8_t> payload;
+        const std::vector<Frame> fs = server_frames(cr, out, m, payload);
+        if (!(has_frame(fs, FrameType::Stream) && has_frame(fs, FrameType::Ack))) {
+            std::fprintf(stderr, "FAIL [%s]: data sent before the ACK deadline did not carry the owed ACK "
+                                 "(%zu bytes, frames:", current, m);
+            for (const Frame &f : fs) std::fprintf(stderr, " %s", frame_type_name(f.type));
+            std::fprintf(stderr, ")\n");
+            ++failures;
+        }
+    }
+
+    // \~english 13.2.5: the time a packet waited for its keys is in the ACK Delay.
+    // \~spanish 13.2.5: el tiempo que un paquete espero a sus claves va en el ACK Delay.  \~
+    {
+        ConnectionConfig early_server = sc;
+        Connection client(cr, cc);
+        Connection server(cr, early_server);
+        install(client, Space::Application, Aead::Aes128Gcm, 4, 3, 0);
+        install(server, Space::Application, Aead::Aes128Gcm, 3, 4, 0);
+        client.handshake_confirmed(0);
+        Stream *st = client.streams().open(true);
+        size_t took = 0;
+        const uint8_t hi[] = {'h', 'i'};
+        st->send->write(hi, 2, took);
+        const size_t n = client.build_datagram(out, sizeof out, 1000);
+        server.on_datagram(out, n, Ecn::NotEct, 1000);  // \~english kept: not confirmed yet  \~spanish guardado: aun sin confirmar  \~
+        server.handshake_confirmed(81000);              // \~english 80 ms later  \~spanish 80 ms despues  \~
+        const size_t m = server.build_datagram(out, sizeof out, 81000);
+        std::vector<uint8_t> payload;
+        uint64_t delay = 0;
+        for (const Frame &f : server_frames(cr, out, m, payload))
+            if (f.type == FrameType::Ack) delay = f.ack_delay << 3;  // \~english exponent 3  \~spanish exponente 3  \~
+        check(delay >= 80000, "the wait for keys was left out of the ACK Delay");
+    }
+
+    // \~english RFC 9002, 7.8: stopping with room in the window is being application-limited.
+    // \~spanish RFC 9002, 7.8: parar con sitio en la ventana es estar limitado por la aplicacion.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 10);
+        say(k, "x");
+        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        check(k.client.recovery().app_limited(), "a sender with room left was not application-limited");
+        std::string big(200000, 'y');
+        say(k, big.c_str());
+        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        check(!k.client.recovery().app_limited(), "a sender that filled the window was taken as application-limited");
+    }
+
+    // \~english 4.1 / 4.6: blocked by the peer's limits, a sender says so -- once per limit.
+    // \~spanish 4.1 / 4.6: bloqueado por los limites del otro, un emisor lo dice -- una vez por limite.  \~
+    {
+        ConnectionConfig tight = cc;
+        tight.peer_max_data = 1000;
+        tight.streams.peer_max_streams_bidi = 1;
+        KeyPair k(cr, Aead::Aes128Gcm, tight, sc);
+        std::string big(5000, 'z');
+        say(k, big.c_str());
+        check(k.client.streams().open(true) == nullptr, "a stream past the peer's limit was opened");
+        for (int i = 0; i < 3; ++i)
+            while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+            }
+        check(k.client.sent().data_blocked == 1, "DATA_BLOCKED was not sent exactly once at the limit");
+        check(k.client.sent().streams_blocked == 1, "STREAMS_BLOCKED was not sent exactly once at the limit");
+    }
+    {
+        ConnectionConfig tight = cc;
+        tight.streams.peer_window_bidi_remote = 700;
+        KeyPair k(cr, Aead::Aes128Gcm, tight, sc);
+        std::string big(5000, 'z');
+        say(k, big.c_str());
+        while (k.client.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        check(k.client.sent().stream_data_blocked == 1 && k.client.sent().data_blocked == 0,
+              "STREAM_DATA_BLOCKED was not sent exactly once at the stream's limit");
+    }
+
+    // \~english 10.2.3: before confirmation a server closes at every level it has keys for.
+    // \~spanish 10.2.3: antes de confirmar, un servidor cierra en cada nivel para el que tiene claves.  \~
+    {
+        const ConnectionConfig c2 = small_client(kVersion1);
+        Connection client(cr, c2);
+        uint8_t first[1500];
+        const size_t n = start_client(client, c2, first);
+        Acceptor a(cr, acceptor_config(false));
+        std::unique_ptr<Connection> server = admit(cr, a, first, n, 1000);
+        check(server != nullptr, "the acceptor did not admit the client");
+        if (server == nullptr) return;
+        drive_handshake_server_first(cr, *server);
+        server->close(static_cast<uint64_t>(TransportError::ProtocolViolation), false, 0, 2000);
+        const size_t m = server->build_datagram(out, sizeof out, 2000);
+        HeaderContext hc;
+        hc.short_dcid_len = 8;
+        size_t pos = 0, packets = 0;
+        bool initial = false, handshake = false, one_rtt = false;
+        while (pos < m) {
+            PacketHeader h;
+            if (parse_packet(out + pos, m - pos, hc, h) != HeaderError::None) break;
+            initial |= h.type == PacketType::Initial;
+            handshake |= h.type == PacketType::Handshake;
+            one_rtt |= h.type == PacketType::OneRtt;
+            ++packets;
+            pos += h.size;
+        }
+        check(initial && handshake && one_rtt && packets == 3,
+              "an unconfirmed server did not close at every level it has keys for");
+    }
+
+    // \~english 10.2.1: closing answers are rate-limited -- and 10.2.1 answers packets it cannot open.
+    // \~spanish 10.2.1: las respuestas al cerrar van a ritmo limitado -- y se contesta a paquetes que no puede abrir.  \~
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 5);
+        k.server.close(0, true, 0, k.now);
+        while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+        }
+        const uint64_t first = k.server.sent().connection_close;
+        for (uint64_t i = 0; i < 8; ++i) {
+            const size_t n = craft_one_rtt(cr, Aead::Aes128Gcm, 3, 0, false, 500 + i, pkt);
+            k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
+            while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+            }
+        }
+        check(k.server.sent().connection_close - first == 4,
+              "closing did not answer exactly the 1st, 2nd, 4th and 8th packet");
+        // \~english An Initial the server has no keys for is still the peer asking: the 9th..16th, one answer.
+        // \~spanish Un Initial para el que el servidor no tiene claves sigue siendo el otro preguntando.  \~
+        const uint8_t server_cid[8] = {0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57};
+        const uint64_t before = k.server.sent().connection_close;
+        for (uint64_t i = 0; i < 8; ++i) {
+            const size_t n = craft_initial(cr, false, cc.peer_cid, server_cid, cc.local_cid, nullptr, 0, 90 + i, 1200, pkt);
+            k.server.on_datagram(pkt, n, Ecn::NotEct, k.now);
+            while (k.server.build_datagram(out, sizeof out, k.now) != 0) {
+            }
+        }
+        check(k.server.sent().connection_close - before == 1,
+              "packets without keys were not answered while closing");
+    }
+
+    // \~english 10.1: an idle timeout of zero is none at all.
+    // \~spanish 10.1: un plazo de inactividad de cero es ninguno.  \~
+    {
+        ConnectionConfig forever = cc;
+        forever.idle_timeout_us = 0;
+        KeyPair k(cr, Aead::Aes128Gcm, forever, sc);
+        pump(k, 20);
+        // \~english Closed also answers kNever: the rule is only seen on a live connection.
+        // \~spanish Cerrada tambien responde kNever: la regla solo se ve con la conexion viva.  \~
+        check(k.client.state() == ConnState::Active, "a connection with no idle timeout timed out");
+        k.client.on_timer(k.now + 3600000000ull);
+        check(k.client.state() == ConnState::Active, "an hour of silence closed a connection with no idle timeout");
+    }
+
+    // \~english 12.2: later packets in a datagram with another destination ID are ignored.
+    // \~spanish 12.2: los paquetes siguientes de un datagrama con otro identificador de destino se ignoran.  \~
+    {
+        const ConnectionConfig c2 = small_client(kVersion1);
+        Connection client(cr, c2);
+        uint8_t first[1500];
+        const size_t n = start_client(client, c2, first);
+        Acceptor a(cr, acceptor_config(false));
+        std::unique_ptr<Connection> server = admit(cr, a, first, n, 1000);
+        if (server == nullptr) return;
+        drive_handshake_server_first(cr, *server);
+        uint64_t seq = 0;
+        const uint8_t *other = nullptr;
+        const uint8_t *token = nullptr;
+        check(server->local_cid(1, seq, other, token), "the server has no second ID");
+        const uint8_t server_cid[8] = {0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57};
+        uint8_t two[2500];
+        size_t a1 = craft_initial(cr, false, c2.peer_cid, server_cid, c2.local_cid, nullptr, 0, 30, 1200, two);
+        size_t a2 = craft_initial(cr, false, c2.peer_cid, other, c2.local_cid, nullptr, 0, 31, 100, two + a1);
+        const uint64_t wrong = server->drops().wrong_cid;
+        server->on_datagram(two, a1 + a2, Ecn::NotEct, 2000);
+        check(server->drops().wrong_cid == wrong + 1,
+              "a coalesced packet with another destination ID was not ignored");
+    }
+
+    // \~english An Initial that cannot be padded is not built at all: nothing it would carry is lost.
+    // \~spanish Un Initial que no se puede rellenar no se construye: no se pierde nada de lo que llevaria.  \~
+    {
+        const ConnectionConfig c2 = small_client(kVersion1);
+        Connection client(cr, c2);
+        client.set_initial_keys(c2.peer_cid, 8);
+        write_crypto(client, Space::Initial, 300);
+        check(client.build_datagram(out, 1000, 0) == 0, "an Initial was built without room for 1200 bytes");
+        const size_t m = client.build_datagram(out, sizeof out, 0);
+        PacketKeys rk, wk;
+        make_initial_keys(cr, kVersion1, c2.peer_cid, 8, true, rk, wk);
+        HeaderContext hc;
+        PacketHeader h;
+        Unprotected u;
+        bool crypto = false;
+        if (m != 0 && parse_packet(out, m, hc, h) == HeaderError::None &&
+            unprotect_packet(cr, rk, out, h, 0, u) == Unprotect::Ok) {
+            FrameContext fc;
+            fc.packet = PacketType::Initial;
+            FrameReader fr(out + u.payload.off, u.payload.len, fc);
+            Frame f;
+            while (fr.next(f) == FrameReader::Step::Frame)
+                if (f.type == FrameType::Crypto && f.offset == 0 && f.data.len == 300) crypto = true;
+        }
+        forget_keys(cr, rk);
+        forget_keys(cr, wk);
+        check(crypto, "the ClientHello did not survive a build that had no room");
+    }
+}
+
 void run_all(Crypto &cr) {
     std::printf("-- %s --\n", cr.name());
     /* \~english
@@ -2115,6 +2390,7 @@ void run_all(Crypto &cr) {
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
     test_cid_rules(cr);
+    test_audit_rules(cr);
 }
 
 } // namespace
