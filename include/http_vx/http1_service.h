@@ -51,6 +51,7 @@
 #include "http_vx/h1_limits.h"
 #include "http_vx/h1_parser.h"
 #include "http_vx/h1_writer.h"
+#include "http_vx/response.h"
 #include "http_vx/shard.h"
 
 #include <cstddef>
@@ -114,17 +115,40 @@ class Handler {
      * convierte unos en otros.
      *
      * \~
+     * **And what it answers into names no version.**  A handler says a status,
+     * some fields and a body; whether that becomes a line of text with CRLFs
+     * or a header block and DATA frames is decided by whoever asked, which is
+     * the service, which is the only piece that knows.
+     *
+     * The first version of this interface handed over an `h1::ResponseWriter`
+     * and got that wrong: a handler written against it could not answer an
+     * HTTP/2 request without being rewritten, which would have made the
+     * project's central claim false at the one seam where it is visible.
+     *
+     * \~spanish
+     * **Y aquello en lo que contesta no nombra ninguna version.**  Un manejador
+     * dice un estado, unas cabeceras y un cuerpo; si eso se convierte en una
+     * linea de texto con CRLFs o en un bloque de cabeceras y tramas DATA lo
+     * decide quien se lo pidio, que es el servicio, que es la unica pieza que lo
+     * sabe.
+     *
+     * La primera version de esta interfaz entregaba un `h1::ResponseWriter` y se
+     * equivocaba en eso: un manejador escrito contra ella no podria contestar
+     * una peticion de HTTP/2 sin reescribirlo, lo que habria hecho falsa la
+     * afirmacion central del proyecto justo en la costura donde se ve.
+     *
+     * \~
      * @param req  \~english the request  \~spanish la peticion  \~
      * @param head \~english the bytes its spans point into
      *             \~spanish los bytes a los que apuntan sus trozos  \~
      * @param body \~english its body, or null  \~spanish su cuerpo, o nulo  \~
      * @param n    \~english how long the body is
      *             \~spanish cuanto mide el cuerpo  \~
-     * @param w    \~english where the answer goes  \~spanish donde va la respuesta  \~
+     * @param res  \~english where the answer goes  \~spanish donde va la respuesta  \~
      */
     virtual void handle(const Request &req, const uint8_t *head,
                         const uint8_t *body, size_t n,
-                        h1::ResponseWriter &w) noexcept = 0;
+                        ResponseBuilder &res) noexcept = 0;
 };
 
 /**
@@ -259,9 +283,58 @@ class Http1Service final : public Service {
     /// \~spanish Contesta @p status y acaba la conexion.  \~
     bool refuse(StatusCode status, Buffer &out) noexcept;
 
+    /**
+     * @brief
+     * \~english Writes @p res as HTTP/1.1 into @p out.
+     * \~spanish Escribe @p res como HTTP/1.1 en @p out.
+     * \~
+     *
+     * \~english
+     * Where the version comes back in, and the only place it does.  What the
+     * handler said is a status, some fields and a body; what goes out is a
+     * status line, names with colons, CRLFs and a length -- and an HTTP/2
+     * service given the same response would write the same meaning as a header
+     * block and DATA frames without the handler knowing either way.
+     *
+     * \~spanish
+     * Donde vuelve a aparecer la version, y el unico sitio donde aparece.  Lo
+     * que dijo el manejador es un estado, unas cabeceras y un cuerpo; lo que
+     * sale es una linea de estado, nombres con dos puntos, CRLFs y una longitud
+     * -- y un servicio de HTTP/2 al que le dieran la misma respuesta escribiria
+     * el mismo significado como un bloque de cabeceras y tramas DATA sin que el
+     * manejador se enterara de ninguna de las dos cosas.
+     *
+     * \~
+     * @param res        \~english what the handler said
+     *                   \~spanish lo que dijo el manejador  \~
+     * @param req        \~english the request it answers
+     *                   \~spanish la peticion que contesta  \~
+     * @param keep_alive \~english whether the connection carries on
+     *                   \~spanish si la conexion sigue  \~
+     * @param out        \~english where the bytes go
+     *                   \~spanish donde van los bytes  \~
+     * @return           \~english false if it could not be written
+     *                   \~spanish false si no se pudo escribir  \~
+     */
+    bool render(const ResponseBuilder &res, const Request &req,
+                bool keep_alive, Buffer &out) noexcept;
+
     /// \~english Puts what the writer made into @p out.
     /// \~spanish Pone lo que hizo el escritor en @p out.  \~
     bool flush(h1::ResponseWriter &w, Buffer &out) noexcept;
+
+    /**
+     * \~english
+     * Where a handler's answer is collected before it is written.  One per
+     * service and reused, because a shard is one thread and a response is
+     * finished with before the next one starts.
+     * \~spanish
+     * Donde se recoge la respuesta de un manejador antes de escribirla.  Uno por
+     * servicio y reutilizado, porque un fragmento es un hilo y con una respuesta
+     * se acaba antes de que empiece la siguiente.
+     * \~
+     */
+    Buffer said_;
 
     State *state_ = nullptr;
     uint32_t capacity_ = 0;

@@ -103,7 +103,7 @@ class Greeting final : public http_vx::Handler {
   public:
     void handle(const http_vx::Request &req, const uint8_t *head,
                 const uint8_t *body, size_t n,
-                http_vx::h1::ResponseWriter &w) noexcept override {
+                http_vx::ResponseBuilder &res) noexcept override {
         (void)body;
         ++calls;
 
@@ -113,11 +113,9 @@ class Greeting final : public http_vx::Handler {
             static_cast<int>(req.target.len),
             reinterpret_cast<const char *>(head) + req.target.off, n);
 
-        w.begin(req.version, 200, req.method, true);
-        w.field(http_vx::FieldId::ContentType, "text/plain", 10);
-        w.finish(http_vx::h1::ResponseBody::Length,
-                 static_cast<uint64_t>(len));
-        w.body(text, static_cast<size_t>(len));
+        res.status(200);
+        res.field(http_vx::FieldId::ContentType, "text/plain", 10);
+        res.body(text, static_cast<size_t>(len));
     }
 
     int calls = 0;

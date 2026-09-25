@@ -79,7 +79,7 @@ void check(bool ok, const char *what) {
 class Echo final : public Handler {
   public:
     void handle(const Request &req, const uint8_t *head, const uint8_t *body,
-                size_t n, http_vx::h1::ResponseWriter &w) noexcept override {
+                size_t n, http_vx::ResponseBuilder &res) noexcept override {
         ++calls;
         last_body_size = n;
 
@@ -95,9 +95,8 @@ class Echo final : public Handler {
             last_target[req.target.len] = '\0';
         }
 
-        w.begin(req.version, 200, req.method, true);
-        w.field(http_vx::FieldId::ContentType, "text/plain", 10);
-        w.finish(http_vx::h1::ResponseBody::Length, 0);
+        res.status(200);
+        res.field(http_vx::FieldId::ContentType, "text/plain", 10);
     }
 
     int calls = 0;

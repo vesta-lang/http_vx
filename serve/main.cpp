@@ -85,7 +85,7 @@ class Greeting final : public http_vx::Handler {
   public:
     void handle(const http_vx::Request &req, const uint8_t *head,
                 const uint8_t *body, size_t n,
-                http_vx::h1::ResponseWriter &w) noexcept override {
+                http_vx::ResponseBuilder &res) noexcept override {
         (void)body;
 
         char text[512];
@@ -96,32 +96,39 @@ class Greeting final : public http_vx::Handler {
             reinterpret_cast<const char *>(head) + req.target.off, n);
 
         if (len <= 0) {
-            w.begin(req.version, 500, req.method, false);
-            w.finish(http_vx::h1::ResponseBody::Length, 0);
+            res.status(500);
             return;
         }
 
-        w.begin(req.version, 200, req.method, true);
-        w.field(http_vx::FieldId::ContentType, "text/plain", 10);
-        w.finish(http_vx::h1::ResponseBody::Length,
-                 static_cast<uint64_t>(len));
-
         /* \~english
-         * The body goes through the WRITER.  The first version of this handler
-         * wrote it straight to `stdout` instead, and what came out was the
-         * body and then the status line -- because the head goes out through
-         * the loop, later, and two write paths have no ordering against each
-         * other.  It is the kind of mistake that only a thing you can run
-         * shows you.
+         * Nothing here names a version, and nothing here has to.  There is no
+         * status line, no colon, no CRLF and no length: those are how HTTP/1.1
+         * writes a status, a field and a body, and the same three things
+         * written as HTTP/2 would be a header block and a DATA frame.  Which
+         * one this becomes is decided by the service, downstream, and this
+         * handler would not notice either way.
+         *
+         * The body goes through the response and not to the output, which is
+         * the other thing this handler got wrong once: writing it itself put
+         * it on the wire BEFORE the head, because the head goes out through
+         * the loop, later, and two write paths have no ordering between them.
+         *
          * \~spanish
-         * El cuerpo pasa por el ESCRITOR.  La primera version de este manejador
-         * lo escribia directamente en `stdout`, y lo que salio fue el cuerpo y
-         * despues la linea de estado -- porque la cabeza sale por el bucle, mas
-         * tarde, y dos caminos de escritura no tienen ningun orden entre ellos.
-         * Es de las equivocaciones que solo te ensena algo que se puede
-         * ejecutar.
+         * Aqui no se nombra ninguna version, y no hace falta.  No hay linea de
+         * estado, ni dos puntos, ni CRLF, ni longitud: eso es como escribe
+         * HTTP/1.1 un estado, una cabecera y un cuerpo, y esas mismas tres cosas
+         * escritas como HTTP/2 serian un bloque de cabeceras y una trama DATA.
+         * En cual se convierte lo decide el servicio, mas abajo, y este
+         * manejador no lo notaria de ninguna de las dos formas.
+         *
+         * El cuerpo pasa por la respuesta y no por la salida, que es la otra
+         * cosa que este manejador hizo mal una vez: escribirlo el mismo lo ponia
+         * en el cable ANTES que la cabeza, porque la cabeza sale por el bucle,
+         * mas tarde, y dos caminos de escritura no tienen orden entre ellos.
          * \~ */
-        w.body(text, static_cast<size_t>(len));
+        res.status(200);
+        res.field(http_vx::FieldId::ContentType, "text/plain", 10);
+        res.body(text, static_cast<size_t>(len));
     }
 };
 

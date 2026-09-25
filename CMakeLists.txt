@@ -127,6 +127,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/fields.cpp
         proto/semantics/message.cpp
         proto/semantics/method.cpp
+        proto/semantics/response.cpp
         proto/semantics/status.cpp
 
         proto/h1/chunked.cpp
@@ -204,6 +205,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
+    http_vx_add_test(test_response tests/test_response.cpp)
     http_vx_add_test(test_shard tests/test_shard.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
     http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)

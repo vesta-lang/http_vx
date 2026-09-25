@@ -34,6 +34,7 @@ void Http1Service::release() noexcept {
         state_ = nullptr;
     }
     capacity_ = 0;
+    said_.release();
 }
 
 bool Http1Service::reset(uint32_t connections, Handler &handler,
@@ -107,6 +108,60 @@ bool Http1Service::flush(h1::ResponseWriter &w, Buffer &out) noexcept {
     util::vesta_memcpy(room, w.head(), n);
     out.commit(n);
     return true;
+}
+
+bool Http1Service::render(const ResponseBuilder &res, const Request &req,
+                          bool keep_alive, Buffer &out) noexcept {
+    if (res.failed()) return refuse(500, out);
+
+    h1::ResponseWriter w;
+    w.begin(req.version, res.status(), req.method, keep_alive);
+
+    const uint8_t *bytes = res.bytes();
+
+    for (const Field *f = res.fields().begin(); f != res.fields().end(); ++f) {
+        const char *value = reinterpret_cast<const char *>(bytes + f->value_off);
+
+        /* \~english
+         * A field the project knows is written by its identifier, so the one
+         * table that says how a name is spelled is the one that spells it.  A
+         * field it does not is written by the letters the handler gave -- and
+         * those are the letters, because nobody else has any.
+         * \~spanish
+         * Una cabecera que el proyecto conoce se escribe por su identificador,
+         * asi que la unica tabla que dice como se deletrea un nombre es la que
+         * lo deletrea.  Una que no conoce se escribe con las letras que dio el
+         * manejador -- y esas son las letras, porque no las tiene nadie mas.
+         * \~ */
+        if (f->id != FieldId::Unknown) {
+            w.field(f->id, value, f->value_len);
+        } else {
+            w.field(reinterpret_cast<const char *>(bytes + f->name_off),
+                    f->name_len, value, f->value_len);
+        }
+    }
+
+    const Span b = res.body();
+
+    /* \~english
+     * The framing is decided from what there is, not asked of the handler.  A
+     * handler that had to say how long its own body was would be a handler
+     * that could say a number that did not match it -- and a response whose
+     * length disagrees with its bytes is where one message ends inside
+     * another.
+     * \~spanish
+     * El troceado se decide con lo que hay, no se le pregunta al manejador.  Un
+     * manejador que tuviera que decir cuanto mide su propio cuerpo seria uno que
+     * puede decir un numero que no cuadra -- y una respuesta cuya longitud
+     * discrepa de sus bytes es donde un mensaje acaba dentro de otro.
+     * \~ */
+    w.finish(h1::ResponseBody::Length, b.len);
+
+    if (b.len != 0) w.body(bytes + b.off, b.len);
+
+    const bool wrote = flush(w, out);
+    w.release();
+    return wrote;
 }
 
 bool Http1Service::refuse(StatusCode status, Buffer &out) noexcept {
@@ -265,15 +320,27 @@ bool Http1Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
             body_len = s.decoded;
         }
 
-        h1::ResponseWriter w;
         const uint8_t *body =
             body_len == 0 ? nullptr : in.data() + s.head_size;
 
-        handler_->handle(s.req, in.data(), body, body_len, w);
+        /* \~english
+         * The handler says what it means, and the rendering below is the only
+         * place that turns it into HTTP/1.1.  The request is kept to hand to
+         * the rendering as well, because two things about how a response is
+         * written are facts about the REQUEST: which version to answer in, and
+         * that a `HEAD` gets the fields of a `GET` and none of its bytes.
+         *
+         * \~spanish
+         * El manejador dice lo que significa, y el escribir de abajo es el unico
+         * sitio que lo convierte en HTTP/1.1.  La peticion se guarda para
+         * pasarsela tambien, porque dos cosas de como se escribe una respuesta
+         * son hechos de la PETICION: en que version contestar, y que a un `HEAD`
+         * le tocan las cabeceras de un `GET` y ninguno de sus bytes.
+         * \~ */
+        ResponseBuilder res(said_);
+        handler_->handle(s.req, in.data(), body, body_len, res);
 
-        const bool wrote = flush(w, out);
-        w.release();
-        if (!wrote) return false;
+        if (!render(res, s.req, s.keep_alive, out)) return false;
 
         ++served_;
 
