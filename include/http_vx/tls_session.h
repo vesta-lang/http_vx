@@ -182,6 +182,26 @@ struct SessionConfig {
     size_t tickets_to_issue = 2;
     uint32_t ticket_lifetime_s = 86400;
     const Ticket *resume = nullptr;
+
+    /* \~english
+     * 0-RTT (4.2.10; RFC 9001, 4.6).  A client offers it when resuming with a
+     * ticket that allows it.  A server issues tickets that allow it and
+     * accepts it only with a replay guard (8) -- without one this is refused
+     * out loud -- and only if `early_context` is what it was when the ticket
+     * was issued: whatever the layers above need unchanged for early data to
+     * mean the same (RFC 9001, 4.6.3).
+     * \~spanish
+     * 0-RTT (4.2.10; RFC 9001, 4.6).  Un cliente lo ofrece al reanudar con un
+     * ticket que lo permita.  Un servidor emite tickets que lo permiten y lo
+     * acepta solo con un guardian contra repeticiones (8) -- sin el se rechaza en
+     * voz alta -- y solo si `early_context` es lo que era cuando se emitio el
+     * ticket: lo que las capas de encima necesitan sin cambios para que los datos
+     * tempranos signifiquen lo mismo (RFC 9001, 4.6.3).
+     * \~ */
+    bool early_data = false;
+    ReplayGuard *replay = nullptr;
+    const uint8_t *early_context = nullptr;
+    size_t early_context_len = 0;
 };
 
 /**
@@ -321,6 +341,34 @@ public:
     /// \~english Server: tickets issued.  \~spanish Servidor: tickets emitidos.  \~
     size_t tickets_issued() const noexcept { return tickets_issued_; }
 
+    /**
+     * @brief
+     * \~english The 0-RTT secret: client_early_traffic_secret, `early_size()` bytes (7.1).
+     * \~spanish El secreto de 0-RTT: client_early_traffic_secret, `early_size()` bytes (7.1).
+     * \~
+     *
+     * \~english
+     * A client has it as soon as its ClientHello offered early data, and
+     * sends with it until it knows -- that may turn out refused.  A server
+     * has it only once it accepted.  Its suite is the ticket's (4.2.10).
+     * \~spanish
+     * Un cliente lo tiene en cuanto su ClientHello ofrecio datos tempranos, y
+     * manda con el hasta saberlo -- que puede resultar rechazado.  Un servidor
+     * solo lo tiene cuando acepto.  Su algoritmo es el del ticket (4.2.10).
+     * \~
+     */
+    const uint8_t *early_secret() const noexcept;
+    Aead early_aead() const noexcept { return early_aead_; }
+    size_t early_size() const noexcept { return hash_size(quic::hash_of(early_aead_)); }
+    /// \~english The ClientHello offered early data.  \~spanish El ClientHello ofrecio datos tempranos.  \~
+    bool early_offered() const noexcept { return early_offered_; }
+    /// \~english The server accepted it: a server when it decided, a client from the EncryptedExtensions.
+    /// \~spanish El servidor los acepto: un servidor cuando lo decidio, un cliente por las EncryptedExtensions.  \~
+    bool early_accepted() const noexcept { return early_accepted_; }
+    /// \~english Server: why early data offered was not accepted, in words; null otherwise.
+    /// \~spanish Servidor: por que no se aceptaron los datos tempranos ofrecidos, en palabras; nulo si no.  \~
+    const char *early_refused() const noexcept { return early_refused_; }
+
 private:
     enum class State : uint8_t {
         Start,
@@ -384,6 +432,9 @@ private:
     bool resume_usable() const noexcept;
     bool accept_psk(const uint8_t *m, const ClientHello &ch, bool check_binder, uint16_t &suite) noexcept;
     bool issue_tickets() noexcept;
+    void decide_early(const ClientHello &ch) noexcept;
+    bool derive_early(const uint8_t *psk, Hash h) noexcept;
+    bool context_digest(uint8_t *out) noexcept;
     bool set_suite(uint16_t suite) noexcept;
     bool derive_handshake(const uint8_t *shared, size_t shared_len) noexcept;
     bool finished_for(bool client_side, uint8_t *out) noexcept;
@@ -454,6 +505,17 @@ private:
     size_t kept_count_ = 0;
     size_t tickets_dropped_ = 0;
     size_t tickets_issued_ = 0;
+
+    /* \~english 0-RTT: what was offered and decided, the secret, and on a server the ticket taken.
+     * \~spanish 0-RTT: lo que se ofrecio y decidio, el secreto, y en un servidor el ticket tomado.  \~ */
+    bool early_offered_ = false;
+    bool early_accepted_ = false;
+    const char *early_refused_ = nullptr;
+    uint8_t early_secret_[kMaxHash] = {};
+    Aead early_aead_ = Aead::Aes128Gcm;
+    TicketContents taken_;
+    uint32_t obfuscated_age_ = 0;
+    uint8_t binder_key_[16] = {};
 
     Bytes in_[quic::kSpaces];
     Bytes out_[quic::kSpaces];

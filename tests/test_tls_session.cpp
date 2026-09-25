@@ -1876,6 +1876,257 @@ void test_resumption_edges() {
     }
 }
 
+const uint8_t kContext[] = {'c', 't', 'x', '-', '1'};
+const uint8_t kOtherContext[] = {'c', 't', 'x', '-', '2'};
+
+/// \~english A server that allows 0-RTT with @p guard.  \~spanish Un servidor que permite 0-RTT con @p guard.  \~
+SessionConfig early_server(SessionConfig k, const TicketSealer *sealer, ReplayGuard *guard, const uint8_t *context) {
+    k.tickets = sealer;
+    k.early_data = true;
+    k.replay = guard;
+    k.early_context = context;
+    k.early_context_len = 5;
+    return k;
+}
+
+/// \~english A client that resumes with @p t and tries 0-RTT.  \~spanish Un cliente que reanuda con @p t e intenta 0-RTT.  \~
+SessionConfig early_client(SessionConfig k, const Ticket *t) {
+    k.resume = t;
+    k.early_data = true;
+    return k;
+}
+
+/// \~english A first connection whose ticket allows 0-RTT.  \~spanish Una primera conexion cuyo ticket permite 0-RTT.  \~
+bool early_ticket(Crypto &c, Ends &e, const TicketSealer &sealer, ReplayGuard &guard, Ticket &out) {
+    Session client(c, e.client);
+    Session server(c, early_server(e.server, &sealer, &guard, kContext));
+    client.set_clock(kStart);
+    server.set_clock(kStart);
+    client.start();
+    pump(client, server);
+    expect_ok(server, "the first connection");
+    return client.take_ticket(out);
+}
+
+/// \~english 0-RTT at the TLS level: offered, accepted, and every reason not to.
+/// \~spanish 0-RTT a nivel de TLS: ofrecido, aceptado, y cada motivo para no hacerlo.  \~
+void test_early_data() {
+    test_support::FakeCrypto c;
+    const TicketSealer sealer(c, kTicketKey);
+    section("0-RTT: accepted");
+    {
+        ReplayGuard guard(64, 10000, 0);
+        FakeEnds e(c);
+        Ticket t;
+        check(early_ticket(c, e, sealer, guard, t), "a ticket");
+        check(t.early_data, "that allows 0-RTT (RFC 9001, 4.6.1)");
+        check(t.params_len == sizeof kServerTp && std::memcmp(t.params, kServerTp, t.params_len) == 0,
+              "and remembers the server's transport parameters (RFC 9000, 7.4.1)");
+        Session client(c, early_client(e.client, &t));
+        Session server(c, early_server(e.server, &sealer, &guard, kContext));
+        client.set_clock(kStart + kSecond);
+        server.set_clock(kStart + kSecond);
+        client.start();
+        check(client.early_offered() && client.early_secret() != nullptr && !client.early_accepted(),
+              "the client has its early secret with the ClientHello");
+        check(client.early_aead() == Aead::Aes128Gcm, "for the ticket's suite");
+        size_t n = 0;
+        const uint8_t *p = client.output(Space::Initial, n);
+        server.receive(Space::Initial, p, n);
+        client.sent(Space::Initial, n);
+        expect_ok(server, "the server takes the ClientHello");
+        check(server.early_accepted() && server.early_refused() == nullptr, "and accepts 0-RTT");
+        check(same_secret(client.early_secret(), server.early_secret(), client.early_size()),
+              "both have the same early secret");
+        pump(client, server);
+        check_agreed(client, server, nullptr, 0);
+        check(client.early_accepted(), "the client learns it from the EncryptedExtensions (4.2.10)");
+    }
+
+    section("0-RTT: refused");
+    {
+        // \~english The same ClientHello twice: the second is a replay (8.2), resumed but without 0-RTT.
+        // \~spanish El mismo ClientHello dos veces: el segundo es una repeticion (8.2), reanudado pero sin 0-RTT.  \~
+        ReplayGuard guard(64, 10000, 0);
+        FakeEnds e(c);
+        Ticket t;
+        early_ticket(c, e, sealer, guard, t);
+        Session client(c, early_client(e.client, &t));
+        client.set_clock(kStart + kSecond);
+        client.start();
+        size_t n = 0;
+        const uint8_t *p = client.output(Space::Initial, n);
+        Session first(c, early_server(e.server, &sealer, &guard, kContext));
+        first.set_clock(kStart + kSecond);
+        first.receive(Space::Initial, p, n);
+        Session second(c, early_server(e.server, &sealer, &guard, kContext));
+        second.set_clock(kStart + 2 * kSecond);
+        second.receive(Space::Initial, p, n);
+        check(first.early_accepted(), "the first is accepted");
+        expect_ok(second, "the replay still resumes");
+        check(second.resumed() && !second.early_accepted() && second.early_secret() == nullptr &&
+                  second.early_refused() != nullptr && std::strstr(second.early_refused(), "replayed") != nullptr,
+              "but without 0-RTT, saying why (8.2)");
+    }
+    const char *reasons[6] = {"less than a window", "age does not match", "context changed",
+                              "application protocol", "does not allow", "no PSK"};
+    for (int k = 0; k < 6; ++k) {
+        // \~english 0: guard just started; 1: an age that lies; 2: another context; 3: another protocol;
+        // 4: no early ticket; 5: a ticket that does not open.
+        // \~spanish 0: guardian recien arrancado; 1: una edad que miente; 2: otro contexto; 3: otro protocolo;
+        // 4: ticket sin 0-RTT; 5: un ticket que no se abre.  \~
+        ReplayGuard guard(64, 10000, 0);
+        ReplayGuard fresh(64, 10000, (kStart + kSecond) / 1000);
+        FakeEnds e(c);
+        Ticket t;
+        early_ticket(c, e, sealer, guard, t);
+        if (k == 1) t.age_add += 60000;
+        if (k == 5) t.identity[t.identity_len - 1] ^= 1;
+        const char *const both[2] = {"h2", "h3"};
+        SessionConfig cc = early_client(e.client, &t);
+        if (k == 3) {
+            cc.alpn = both;
+            cc.alpn_count = 2;
+        }
+        SessionConfig sc = early_server(e.server, &sealer, k == 0 ? &fresh : &guard, k == 2 ? kOtherContext : kContext);
+        Ticket plain;
+        if (k == 4) {
+            // \~english A ticket from a server without 0-RTT, claimed to allow it by the client.
+            // \~spanish Un ticket de un servidor sin 0-RTT, que el cliente dice que lo permite.  \~
+            check(first_connection(c, c, e, sealer, kStart, plain), "a ticket without 0-RTT");
+            check(!plain.early_data, "which says so");
+            plain.early_data = true;
+            cc.resume = &plain;
+        }
+        Session client(c, cc);
+        Session server(c, sc);
+        resume(client, server, kStart + kSecond);
+        expect_ok(server, reasons[k]);
+        check(server.resumed() == (k != 5) && !server.early_accepted() && server.early_refused() != nullptr &&
+                  std::strstr(server.early_refused(), reasons[k]) != nullptr,
+              reasons[k]);
+        check(client.complete() && client.early_offered() && !client.early_accepted(), "the client knows");
+    }
+    {
+        // \~english A retry turns 0-RTT down (RFC 9001, 4.6.2), and the second ClientHello drops early_data (4.1.2).
+        // \~spanish Un reintento rechaza el 0-RTT (RFC 9001, 4.6.2), y el segundo ClientHello quita early_data (4.1.2).  \~
+        ReplayGuard guard(64, 10000, 0);
+        FakeEnds e(c);
+        Ticket t;
+        early_ticket(c, e, sealer, guard, t);
+        const Group p256 = Group::Secp256r1;
+        SessionConfig sc = early_server(e.server, &sealer, &guard, kContext);
+        sc.groups = &p256;
+        sc.group_count = 1;
+        Session client(c, early_client(e.client, &t));
+        Session server(c, sc);
+        resume(client, server, kStart + kSecond);
+        check_agreed(client, server, nullptr, 0);
+        check(client.retried() && client.early_offered() && !client.early_accepted() && !server.early_accepted(),
+              "offered, then turned down by the retry");
+    }
+    {
+        // \~english The client does not offer what the ticket does not allow, nor without asking for it.
+        // \~spanish El cliente no ofrece lo que el ticket no permite, ni sin pedirlo.  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        Session client(c, early_client(e.client, &t));
+        client.set_clock(kStart + kSecond);
+        client.start();
+        check(!client.early_offered() && client.early_secret() == nullptr, "a ticket without 0-RTT is not used for it");
+        ReplayGuard guard(64, 10000, 0);
+        Ticket u;
+        early_ticket(c, e, sealer, guard, u);
+        Session plain(c, resuming(e.client, &u));
+        plain.set_clock(kStart + kSecond);
+        plain.start();
+        check(!plain.early_offered() && plain.resumed() == false, "nor when the client did not ask for it");
+    }
+    {
+        // \~english 0-RTT configured without a replay guard is refused out loud (8).
+        // \~spanish 0-RTT configurado sin guardian contra repeticiones se rechaza en voz alta (8).  \~
+        FakeEnds e(c);
+        Session client(c, e.client);
+        Session server(c, early_server(e.server, &sealer, nullptr, kContext));
+        client.start();
+        pump(client, server);
+        expect(server, kInternal, "0-RTT without a replay guard");
+        expect_why(server, "replay guard", "and it says why");
+    }
+
+    section("0-RTT: client rules");
+    {
+        Ticket t;
+        const uint8_t id[] = {'i', 'd'};
+        std::memcpy(t.identity, id, sizeof id);
+        t.identity_len = sizeof id;
+        t.suite = suite::Aes128GcmSha256;
+        t.lifetime_s = 3600;
+        std::memcpy(t.server_name, "example.com", 11);
+        t.server_name_len = 11;
+        t.early_data = true;
+        for (int k = 0; k < 2; ++k) {
+            FakeEnds e(c);
+            Session client(c, early_client(e.client, &t));
+            client.set_clock(kSecond);
+            client.start();
+            ShSpec sh;
+            sh.psk = k == 0;
+            uint8_t m[512];
+            size_t n = server_hello(sh, m, sizeof m);
+            client.receive(Space::Initial, m, n);
+            EeSpec ee;
+            ee.early_data = true;
+            n = encrypted_extensions(ee, m, sizeof m);
+            client.receive(Space::Handshake, m, n);
+            if (k == 0) {
+                expect_ok(client, "early_data answered on a resumed handshake");
+                check(client.early_accepted(), "accepted");
+            } else {
+                expect(client, kIllegal, "early_data accepted without the PSK (4.2.10)");
+            }
+        }
+    }
+}
+
+/// \~english The replay guard on its own (RFC 8446, 8.2, 8.3).  \~spanish El guardian contra repeticiones por si solo (RFC 8446, 8.2, 8.3).  \~
+void test_replay_guard() {
+    section("replay guard");
+    using V = ReplayGuard::Verdict;
+    uint8_t a[16];
+    uint8_t b[16];
+    for (int i = 0; i < 16; ++i) {
+        a[i] = static_cast<uint8_t>(i);
+        b[i] = static_cast<uint8_t>(i);
+    }
+    b[15] = 0xff;  // \~english same start as a: the same slot to begin with  \~spanish mismo principio que a: la misma ranura para empezar  \~
+    ReplayGuard g(16, 1000, 5000);
+    check(g.ready() && g.window_ms() == 1000, "ready");
+    check(g.admit(a, 5500, 5500) == V::Warming, "nothing within a window of starting (8.2)");
+    check(g.admit(a, 7000, 7000) == V::Fresh, "fresh once past it");
+    check(g.admit(a, 7000, 7200) == V::Replay, "the same binder again is a replay");
+    check(g.admit(b, 7100, 7100) == V::Fresh, "another binder is not, even in the same slot");
+    check(g.admit(a, 9000, 7000) == V::Stale && g.admit(a, 5000, 7000) == V::Stale,
+          "an arrival more than a window off, either way, is stale (8.3)");
+    check(g.admit(a, 7000, 8000) == V::Replay, "at the window's edge still remembered");
+    // \~english Once a expired, b past it in the same run must still be found (8.2).
+    // \~spanish Cuando a caduca, b detras de el en la misma racha debe seguir encontrandose (8.2).  \~
+    check(g.admit(b, 7200, 8050) == V::Replay, "a live entry behind an expired one is still seen");
+    check(g.admit(a, 8100, 8100) == V::Fresh, "an expired entry no longer counts");
+    ReplayGuard small(1, 1000, 0);
+    uint8_t k[16] = {};
+    size_t fresh = 0;
+    V last = V::Fresh;
+    for (int i = 0; i < 40; ++i) {
+        k[0] = static_cast<uint8_t>(i);
+        last = small.admit(k, 2000, 2000);
+        if (last == V::Fresh) ++fresh;
+    }
+    check(fresh == 16 && last == V::Full, "a full guard admits nothing (its capacity is at least 16)");
+    check(std::strcmp(verdict_name(V::Replay), "replay") == 0, "names");
+}
+
 /**
  * @brief
  * \~english The sealer on its own: what it seals opens, and nothing else does.
@@ -1901,13 +2152,15 @@ void test_sealer(Crypto &c, bool keyed, const char *name) {
     t.alpn_len = 2;
     t.alpn[0] = 'h';
     t.alpn[1] = '3';
+    t.early = true;
+    for (int i = 0; i < 32; ++i) t.context[i] = static_cast<uint8_t>(0x80 + i);
     uint8_t sealed[TicketSealer::kMaxSealed];
     const size_t n = sealer.seal(t, sealed, sizeof sealed);
     TicketContents back;
     check(n != 0 && sealer.open(sealed, n, back), "what is sealed opens");
     check(back.suite == t.suite && back.issued_ms == t.issued_ms && back.lifetime_s == 3600 &&
               back.age_add == 0xdeadbeef && back.psk_len == 48 && std::memcmp(back.psk, t.psk, 48) == 0 &&
-              back.alpn_len == 2 && back.alpn[1] == '3',
+              back.alpn_len == 2 && back.alpn[1] == '3' && back.early && std::memcmp(back.context, t.context, 32) == 0,
           "and gives back every field");
     uint8_t again[TicketSealer::kMaxSealed];
     const size_t m = sealer.seal(t, again, sizeof again);
@@ -1932,29 +2185,37 @@ void test_sealer(Crypto &c, bool keyed, const char *name) {
      * \~ */
     const uint8_t aad[] = {'h', 't', 't', 'p', '_', 'v', 'x', ' ', 't', 'i', 'c', 'k', 'e', 't'};
     void *aead = c.prepare_aead(Aead::Aes128Gcm, kTicketKey);
-    // \~english layout 1, suite, issued, lifetime 60, age_add, a 32-byte PSK, "h3"
-    // \~spanish forma 1, algoritmo, emision, vida 60, age_add, una PSK de 32 bytes, "h3"  \~
-    uint8_t plain[128] = {1, 0x13, 0x01, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 60, 0, 0, 0, 9, 32};
+    // \~english layout 2, suite, issued, lifetime 60, age_add, a 32-byte PSK, "h3", 0-RTT allowed, a context
+    // \~spanish forma 2, algoritmo, emision, vida 60, age_add, una PSK de 32 bytes, "h3", 0-RTT permitido, un contexto  \~
+    uint8_t plain[160] = {2, 0x13, 0x01, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 60, 0, 0, 0, 9, 32};
     size_t len = 20 + 32;
     plain[len++] = 2;
     plain[len++] = 'h';
     plain[len++] = '3';
-    const size_t variants = 3;
+    const size_t flag_at = len;
+    plain[len++] = 1;
+    for (int i = 0; i < 32; ++i) plain[len++] = static_cast<uint8_t>(0xc0 + i);
+    const size_t variants = 4;
     for (size_t v = 0; v < variants; ++v) {
-        uint8_t p[128];
+        uint8_t p[160];
         std::memcpy(p, plain, len);
         size_t l = len;
-        if (v == 1) p[0] = 2;       // \~english a layout this code does not know  \~spanish una forma que este codigo no conoce  \~
-        if (v == 2) p[l++] = 0xee;  // \~english one byte past the protocol  \~spanish un byte pasado el protocolo  \~
-        uint8_t box[160] = {};
+        if (v == 1) p[0] = 3;       // \~english a layout this code does not know  \~spanish una forma que este codigo no conoce  \~
+        if (v == 2) p[l++] = 0xee;  // \~english one byte past the context  \~spanish un byte pasado el contexto  \~
+        if (v == 3) p[flag_at] = 2; // \~english a 0-RTT flag that is neither yes nor no  \~spanish una marca de 0-RTT que no es ni si ni no  \~
+        uint8_t box[200] = {};
         for (int i = 0; i < 12; ++i) box[i] = static_cast<uint8_t>(0xa0 + i + v);
         c.seal(aead, box, aad, sizeof aad, p, l, box + 12);
         TicketContents got;
         const bool opened = sealer.open(box, 12 + l + 16, got);
+        const char *what[4] = {"the control opens", "an unknown layout does not open",
+                               "bytes past the end do not open", "a 0-RTT flag other than 0 or 1 does not open"};
         if (v == 0)
-            check(opened && got.lifetime_s == 60 && got.alpn_len == 2 && got.psk_len == 32, "the control opens");
+            check(opened && got.lifetime_s == 60 && got.alpn_len == 2 && got.psk_len == 32 && got.early &&
+                      got.context[31] == 0xc0 + 31,
+                  what[v]);
         else
-            check(!opened, v == 1 ? "an unknown layout does not open" : "bytes past the end do not open");
+            check(!opened, what[v]);
     }
     c.forget(aead);
 }
@@ -2074,6 +2335,8 @@ int main() {
     test_sealer(fake, false, "fake");
     test_resumption();
     test_resumption_edges();
+    test_replay_guard();
+    test_early_data();
     int providers = 0;
 #if HTTP_VX_HAVE_OPENSSL
     http_vx::OpensslCrypto openssl;

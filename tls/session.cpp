@@ -182,6 +182,8 @@ Session::~Session() {
     wipe(exporter_, sizeof exporter_);
     wipe(resumption_, sizeof resumption_);
     wipe(psk_, sizeof psk_);
+    wipe(early_secret_, sizeof early_secret_);
+    wipe(binder_key_, sizeof binder_key_);
     if (kept_ != nullptr) {
         wipe(kept_, kKeptTickets * sizeof(Ticket));
         util::host_free(kept_);
@@ -429,11 +431,16 @@ bool Session::client_hello() noexcept {
                             : resume_usable();
     size_t binders_at = 0;
     Hash psk_hash = Hash::Sha256;
+    // \~english Early data only with a ticket that allows it, and never after a retry (4.1.2).
+    // \~spanish Datos tempranos solo con un ticket que los permita, y nunca tras un reintento (4.1.2).  \~
+    const bool offer_early = !retried_ && psk_offered_ && cfg_.early_data && cfg_.resume->early_data;
+    if (!retried_) early_offered_ = offer_early;
     if (psk_offered_) {
         const Ticket &t = *cfg_.resume;
         psk_hash = quic::hash_of(aead_of(t.suite));
         const uint8_t dhe = 1;  // \~english psk_dhe_ke only  \~spanish solo psk_dhe_ke  \~
         write_psk_modes(w, &dhe, 1);
+        if (offer_early) write_empty_extension(w, ext::EarlyData);
         // \~english The age in milliseconds plus ticket_age_add, modulo 2^32 (4.2.11.1).
         // \~spanish La edad en milisegundos mas ticket_age_add, modulo 2^32 (4.2.11.1).  \~
         const uint32_t age = static_cast<uint32_t>((clock_us_ - t.received_us) / 1000) + t.age_add;
@@ -459,8 +466,18 @@ bool Session::client_hello() noexcept {
         !binder(cfg_.resume->psk, psk_hash, w.data(), binders_at, w.data() + binders_at + 3))
         return false;
     if (!commit(Space::Initial, w)) return false;
+    // \~english With the ClientHello in the transcript, the secret 0-RTT goes out with; the ticket's suite (4.2.10).
+    // \~spanish Con el ClientHello en la transcripcion, el secreto con el que sale el 0-RTT; el algoritmo del ticket (4.2.10).  \~
+    if (offer_early) {
+        if (!derive_early(cfg_.resume->psk, psk_hash)) return false;
+        early_aead_ = aead_of(cfg_.resume->suite);
+    }
     state_ = State::WaitServerHello;
     return true;
+}
+
+const uint8_t *Session::early_secret() const noexcept {
+    return (cfg_.server ? early_accepted_ : early_offered_) ? early_secret_ : nullptr;
 }
 
 bool Session::resume_usable() const noexcept {
@@ -581,6 +598,10 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
         return fail(Alert::InternalError, "the provider supports no suite or no group to accept");
     if (cfg_.certificate_count == 0 || cfg_.signing_key == nullptr)
         return fail(Alert::InternalError, "the server has no certificate to authenticate with");
+    // \~english 0-RTT without replay protection is not offered quietly: it is refused out loud (RFC 8446, 8).
+    // \~spanish 0-RTT sin proteccion contra repeticiones no se ofrece en silencio: se rechaza en voz alta (RFC 8446, 8).  \~
+    if (cfg_.early_data && (cfg_.replay == nullptr || !cfg_.replay->ready() || cfg_.tickets == nullptr))
+        return fail(Alert::InternalError, "0-RTT needs tickets and a replay guard (RFC 8446, 8)");
     if (!ch.ext.has_supported_versions || !listed_in(m, ch.ext.versions, kTls13))
         return fail(Alert::ProtocolVersion, "the client does not offer TLS 1.3 (RFC 9001, 4.2)");
     if (ch.session_id.len != 0)
@@ -687,6 +708,12 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     set_suite(chosen);
     keep(msg_at, ch.ext.transport_parameters, peer_tp_);
     if (ch.ext.has_server_name && ch.ext.server_name.len != 0) keep(msg_at, ch.ext.server_name, server_name_);
+    // \~english Decided with the ClientHello alone in the transcript: its early secret is over it (7.1).
+    // \~spanish Se decide con el ClientHello solo en la transcripcion: su secreto temprano es sobre el (7.1).  \~
+    if (ch.ext.has_early_data) {
+        decide_early(ch);
+        if (failed()) return false;
+    }
     return server_flight(m, ch, share_at, share_len);
 }
 
@@ -736,9 +763,88 @@ bool Session::accept_psk(const uint8_t *m, const ClientHello &ch, bool check_bin
         util::vesta_memcpy_noinline(psk_, t.psk, hl);
         psk_len_ = hl;
         resumed_ = true;
+        // \~english What 0-RTT is decided on: the ticket without its PSK, its age, and the binder that was checked.
+        // \~spanish Sobre lo que se decide el 0-RTT: el ticket sin su PSK, su edad, y el binder que se comprobo.  \~
+        taken_ = t;
+        wipe(taken_.psk, sizeof taken_.psk);
+        const uint8_t *age = id + 2 + read16(id);
+        obfuscated_age_ = uint32_t{age[0]} << 24 | uint32_t{age[1]} << 16 | uint32_t{age[2]} << 8 | age[3];
+        util::vesta_memcpy_noinline(binder_key_, b + 1, sizeof binder_key_);
     }
     wipe(&t, sizeof t);
     return usable;
+}
+
+bool Session::context_digest(uint8_t *out) noexcept {
+    // \~english SHA-256 whatever the suite: the ticket holds it, and it is compared, never derived from.
+    // \~spanish SHA-256 sea cual sea el algoritmo: lo guarda el ticket, y se compara, nunca se deriva de el.  \~
+    return c_.digest(Hash::Sha256, cfg_.early_context, cfg_.early_context_len, out) ||
+           fail_provider("the provider could not hash the 0-RTT context");
+}
+
+bool Session::derive_early(const uint8_t *psk, Hash h) noexcept {
+    // \~english client_early_traffic_secret: the PSK's Early Secret over the ClientHello (7.1).
+    // \~spanish client_early_traffic_secret: el Early Secret de la PSK sobre el ClientHello (7.1).  \~
+    KeySchedule ks(c_, h);
+    uint8_t th[kMaxHash];
+    return (ks.start(psk, hash_size(h)) && transcript_.hash(c_, h, th) && ks.early_traffic(th, early_secret_)) ||
+           fail_provider("the provider could not derive the early secret");
+}
+
+void Session::decide_early(const ClientHello &) noexcept {
+    /* \~english
+     * Every condition of 4.2.10 and RFC 9001, 4.6.3, then the replay guard
+     * (8).  Any "no" only turns early data down, with the reason kept: the
+     * handshake goes on, resumed or not.
+     * \~spanish
+     * Cada condicion de 4.2.10 y del RFC 9001, 4.6.3, y luego el guardian
+     * contra repeticiones (8).  Cualquier "no" solo rechaza los datos tempranos,
+     * guardando el motivo: el saludo sigue, reanudado o no.
+     * \~ */
+    size_t alpn_len = 0;
+    const uint8_t *alpn_name = alpn(alpn_len);
+    uint8_t context[32];
+    if (!cfg_.early_data) {
+        early_refused_ = "0-RTT is not enabled on this server";
+    } else if (!resumed_) {
+        early_refused_ = "no PSK was accepted (RFC 8446, 4.2.10)";
+    } else if (!taken_.early) {
+        early_refused_ = "the ticket does not allow 0-RTT";
+    } else if (suite_ != taken_.suite) {
+        early_refused_ = "another cipher suite than the ticket's (RFC 8446, 4.2.10)";
+    } else if (alpn_name == nullptr || alpn_len != taken_.alpn_len || !same(alpn_name, taken_.alpn, alpn_len)) {
+        early_refused_ = "another application protocol than the ticket's (RFC 8446, 4.2.10)";
+    } else if (!context_digest(context)) {
+        return;
+    } else if (!same(context, taken_.context, sizeof context)) {
+        early_refused_ = "the 0-RTT context changed since the ticket (RFC 9001, 4.6.3)";
+    } else {
+        // \~english expected_arrival_time = creation_time + the client's ticket age (8.3).
+        // \~spanish expected_arrival_time = creation_time + la edad del ticket segun el cliente (8.3).  \~
+        const uint32_t client_age = obfuscated_age_ - taken_.age_add;
+        const ReplayGuard::Verdict v =
+            cfg_.replay->admit(binder_key_, taken_.issued_ms + client_age, clock_us_ / 1000);
+        switch (v) {
+        case ReplayGuard::Verdict::Fresh:
+            break;
+        case ReplayGuard::Verdict::Replay:
+            early_refused_ = "a replayed ClientHello (RFC 8446, 8.2)";
+            break;
+        case ReplayGuard::Verdict::Stale:
+            early_refused_ = "the ticket's age does not match its arrival (RFC 8446, 8.3)";
+            break;
+        case ReplayGuard::Verdict::Warming:
+            early_refused_ = "the replay guard started less than a window ago (RFC 8446, 8.2)";
+            break;
+        case ReplayGuard::Verdict::Full:
+            early_refused_ = "the replay guard is full";
+            break;
+        }
+        if (v == ReplayGuard::Verdict::Fresh && derive_early(psk_, hash_)) {
+            early_aead_ = aead_;
+            early_accepted_ = true;
+        }
+    }
 }
 
 bool Session::hello_retry(const ClientHello &) noexcept {
@@ -811,6 +917,9 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
     size_t exts = w.open(2);
     write_alpn(w, cfg_.alpn + alpn_index_, 1);
     write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
+    // \~english Accepting early data is saying so here (4.2.10; RFC 9001, 4.6.2).
+    // \~spanish Aceptar los datos tempranos es decirlo aqui (4.2.10; RFC 9001, 4.6.2).  \~
+    if (early_accepted_) write_empty_extension(w, ext::EarlyData);
     w.close(exts, 2);
     w.end_message(msg);
     if (!commit(Space::Handshake, w)) return false;
@@ -993,8 +1102,15 @@ bool Session::on_encrypted_extensions(const uint8_t *m, size_t n) noexcept {
     // \~english No answer to what was not asked (4.2).  \~spanish Ninguna respuesta a lo que no se pregunto (4.2).  \~
     if (ee.ext.has_server_name && cfg_.server_name == nullptr)
         return fail(Alert::UnsupportedExtension, "a server_name answer to a ClientHello without one (RFC 8446, 4.2)");
-    if (ee.ext.has_early_data)
-        return fail(Alert::UnsupportedExtension, "early_data that was never offered (RFC 8446, 4.2)");
+    if (ee.ext.has_early_data) {
+        // \~english An answer to an offer that was made, after a PSK was accepted (4.2, 4.2.10).
+        // \~spanish Una respuesta a una oferta que se hizo, tras aceptarse una PSK (4.2, 4.2.10).  \~
+        if (!early_offered_ || retried_)
+            return fail(Alert::UnsupportedExtension, "early_data that was never offered (RFC 8446, 4.2)");
+        if (!resumed_)
+            return fail(Alert::IllegalParameter, "early_data accepted without the PSK (RFC 8446, 4.2.10)");
+        early_accepted_ = true;
+    }
     if (!ee.ext.has_alpn)
         return fail(Alert::NoApplicationProtocol, "the server chose no application protocol (RFC 9001, 8.1)");
     // \~english Exactly one name, checked when read: its length byte, then the name.
@@ -1184,6 +1300,21 @@ bool Session::on_new_session_ticket(const uint8_t *m, size_t n) noexcept {
         util::vesta_memcpy_noinline(t.alpn, alpn_name, alpn_len);
         t.alpn_len = static_cast<uint8_t>(alpn_len);
     }
+    /* \~english
+     * 0-RTT with it needs the server's transport parameters, remembered as
+     * they came (RFC 9000, 7.4.1): without room for them, no 0-RTT.
+     * \~spanish
+     * 0-RTT con el necesita los parametros de transporte del servidor,
+     * recordados tal como llegaron (RFC 9000, 7.4.1): sin sitio para ellos, sin
+     * 0-RTT.
+     * \~ */
+    size_t tp_len = 0;
+    const uint8_t *tp = peer_transport_params(tp_len);
+    if (nst.ext.has_early_data && tp != nullptr && tp_len <= sizeof t.params) {
+        util::vesta_memcpy_noinline(t.params, tp, tp_len);
+        t.params_len = tp_len;
+        t.early_data = true;
+    }
     ++kept_count_;
     return true;
 }
@@ -1211,6 +1342,10 @@ bool Session::issue_tickets() noexcept {
             util::vesta_memcpy_noinline(t.alpn, alpn_name, alpn_len);
             t.alpn_len = static_cast<uint8_t>(alpn_len);
         }
+        // \~english 0-RTT with it, if this server allows it, bound to today's context (RFC 9001, 4.6.3).
+        // \~spanish 0-RTT con el, si este servidor lo permite, atado al contexto de hoy (RFC 9001, 4.6.3).  \~
+        t.early = cfg_.early_data;
+        if (t.early && !context_digest(t.context)) return false;
         uint8_t sealed[TicketSealer::kMaxSealed];
         const size_t n = cfg_.tickets->seal(t, sealed, sizeof sealed);
         const uint32_t lifetime = t.lifetime_s;
@@ -1228,7 +1363,11 @@ bool Session::issue_tickets() noexcept {
         const size_t ticket = w.open(2);
         w.bytes(sealed, n);
         w.close(ticket, 2);
-        w.u16(0);
+        const size_t exts = w.open(2);
+        // \~english QUIC's sentinel: 0-RTT allowed, and its amount is the transport's (RFC 9001, 4.6.1).
+        // \~spanish La marca de QUIC: 0-RTT permitido, y su cantidad es cosa del transporte (RFC 9001, 4.6.1).  \~
+        if (cfg_.early_data) write_early_data_ticket(w, 0xffffffffu);
+        w.close(exts, 2);
         w.end_message(msg);
         // \~english After the handshake: not part of the transcript (4.4.1).  \~spanish Tras el saludo: no es parte de la transcripcion (4.4.1).  \~
         if (!commit(Space::Application, w, false)) return false;

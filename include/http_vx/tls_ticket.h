@@ -79,6 +79,19 @@ struct TicketContents {
     uint8_t psk_len = 0;
     uint8_t alpn[255] = {};
     uint8_t alpn_len = 0;
+    /// \~english The ticket allows 0-RTT (RFC 9001, 4.6.1).  \~spanish El ticket permite 0-RTT (RFC 9001, 4.6.1).  \~
+    bool early = false;
+    /**
+     * \~english
+     * SHA-256 of the 0-RTT context when it was issued: what the layers above
+     * need to be the same for early data to mean the same (RFC 9001, 4.6.3).
+     * \~spanish
+     * SHA-256 del contexto de 0-RTT cuando se emitio: lo que las capas de
+     * encima necesitan que sea igual para que los datos tempranos signifiquen
+     * lo mismo (RFC 9001, 4.6.3).
+     * \~
+     */
+    uint8_t context[32] = {};
 };
 
 /**
@@ -102,7 +115,7 @@ public:
     /// \~spanish La clave son dieciseis bytes: AES-128-GCM, que tiene todo proveedor.  \~
     static constexpr size_t kKeySize = 16;
     /// \~english The largest sealed ticket.  \~spanish El ticket sellado mas grande.  \~
-    static constexpr size_t kMaxSealed = 12 + 128 + 255 + quic::kTagSize;
+    static constexpr size_t kMaxSealed = 12 + 128 + 255 + 33 + quic::kTagSize;
 
     TicketSealer(quic::Crypto &c, const uint8_t *key) noexcept;
     ~TicketSealer();
@@ -151,7 +164,98 @@ struct Ticket {
     uint8_t server_name_len = 0;
     uint8_t alpn[255] = {};
     uint8_t alpn_len = 0;
+    /// \~english The server allows 0-RTT with it (RFC 9001, 4.6.1).  \~spanish El servidor permite 0-RTT con el (RFC 9001, 4.6.1).  \~
+    bool early_data = false;
+    /**
+     * \~english
+     * The server's transport parameters on that connection, as sent: 0-RTT
+     * runs on them until the handshake brings new ones (RFC 9000, 7.4.1).
+     * \~spanish
+     * Los parametros de transporte del servidor en aquella conexion, tal cual:
+     * 0-RTT funciona con ellos hasta que el saludo traiga otros (RFC 9000,
+     * 7.4.1).
+     * \~
+     */
+    static constexpr size_t kMaxParams = 256;
+    uint8_t params[kMaxParams] = {};
+    size_t params_len = 0;
 };
+
+/**
+ * @brief
+ * \~english What decides whether a ClientHello's early data may be accepted: fresh, and never seen (RFC 8446, 8.2, 8.3).
+ * \~spanish Lo que decide si se pueden aceptar los datos tempranos de un ClientHello: fresco, y nunca visto (RFC 8446, 8.2, 8.3).
+ * \~
+ *
+ * \~english
+ * TLS gives 0-RTT no replay protection of its own (8): this is the server's.
+ * A ClientHello is fresh when the arrival its ticket's age predicts is
+ * within `window` of now (8.3); a fresh one is remembered, by its validated
+ * binder, for as long as it could still be fresh, and a second one with the
+ * same binder is a replay (8.2).  Until one window has passed since the
+ * guard started nothing is admitted -- a replay of something sent before it
+ * started could not be told apart (8.2: SHOULD) -- and a full table admits
+ * nothing either.  Every "no" only turns 0-RTT down: the handshake goes on.
+ *
+ * One guard for everything that can accept the same ticket: that is the
+ * "at most once per server instance" of 8.  It is not safe to call from two
+ * threads at once.
+ * \~spanish
+ * TLS no da a 0-RTT ninguna proteccion propia contra repeticiones (8): esta es
+ * la del servidor.  Un ClientHello es fresco cuando la llegada que predice la
+ * edad de su ticket esta a menos de `window` de ahora (8.3); uno fresco se
+ * recuerda, por su binder validado, mientras aun pudiera ser fresco, y un
+ * segundo con el mismo binder es una repeticion (8.2).  Hasta que pasa una
+ * ventana desde que arranco el guardian no se admite nada -- una repeticion de
+ * algo mandado antes de arrancar no se podria distinguir (8.2: DEBERIA) --, y
+ * una tabla llena tampoco admite nada.  Cada "no" solo rechaza el 0-RTT: el
+ * saludo sigue.
+ *
+ * Un guardian para todo lo que pueda aceptar el mismo ticket: ese es el "como
+ * mucho una vez por instancia de servidor" de 8.  No se puede llamar desde dos
+ * hilos a la vez.
+ * \~
+ */
+class ReplayGuard {
+public:
+    /// \~english Why a ClientHello's early data was or was not admitted.  \~spanish Por que se admitieron o no los datos tempranos de un ClientHello.  \~
+    enum class Verdict : uint8_t { Fresh, Replay, Stale, Warming, Full };
+
+    /**
+     * @param capacity  \~english how many ClientHellos it remembers at once  \~spanish cuantos ClientHello recuerda a la vez  \~
+     * @param window_ms \~english the tolerance of 8.3, and how long each is remembered  \~spanish la tolerancia de 8.3, y cuanto se recuerda cada uno  \~
+     * @param start_ms  \~english when it starts, on the sessions' clock  \~spanish cuando arranca, en el reloj de las sesiones  \~
+     */
+    ReplayGuard(size_t capacity, uint64_t window_ms, uint64_t start_ms) noexcept;
+    ~ReplayGuard();
+    ReplayGuard(const ReplayGuard &) = delete;
+    ReplayGuard &operator=(const ReplayGuard &) = delete;
+
+    bool ready() const noexcept { return slots_ != nullptr; }
+    uint64_t window_ms() const noexcept { return window_ms_; }
+
+    /**
+     * @brief
+     * \~english Admits a ClientHello known by @p key (16 bytes of its validated binder), expected at @p expected_ms.
+     * \~spanish Admite un ClientHello conocido por @p key (16 bytes de su binder validado), esperado en @p expected_ms.
+     * \~
+     */
+    Verdict admit(const uint8_t *key, uint64_t expected_ms, uint64_t now_ms) noexcept;
+
+private:
+    struct Slot {
+        uint8_t key[16];
+        uint64_t expires_ms;
+        bool used;
+    };
+    Slot *slots_ = nullptr;
+    size_t mask_ = 0;
+    uint64_t window_ms_;
+    uint64_t start_ms_;
+};
+
+/// \~english A short name for @p v.  \~spanish Un nombre corto para @p v.  \~
+const char *verdict_name(ReplayGuard::Verdict v) noexcept;
 
 } // namespace tls
 } // namespace http_vx
