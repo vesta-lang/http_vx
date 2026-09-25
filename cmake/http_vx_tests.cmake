@@ -25,4 +25,13 @@ function(http_vx_add_test name)
     target_compile_options(${name} PRIVATE -Wall -Wextra -pedantic-errors)
     target_link_libraries(${name} PRIVATE http_vx_proto http_vx_core vesta_alloc)
     add_test(NAME ${name} COMMAND ${name})
+
+    # Y con PLAZO.  Ninguna de estas pruebas tarda mas de una decima, asi que
+    # treinta segundos no acota nada que pueda pasar por casualidad -- acota lo
+    # unico que no se puede acotar de otra forma, que es una prueba que se
+    # CUELGA.  Las hay que hablan por tuberias entre hilos, y ahi el modo de
+    # fallar de un orden equivocado no es un resultado malo sino los dos
+    # extremos esperandose para siempre; sin plazo, eso no es un rojo, es una
+    # suite que no termina y que nadie puede leer.
+    set_tests_properties(${name} PROPERTIES TIMEOUT 30)
 endfunction()

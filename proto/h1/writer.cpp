@@ -420,5 +420,41 @@ WriteError ResponseWriter::finish(ResponseBody body, uint64_t length) noexcept {
     return WriteError::None;
 }
 
+WriteError ResponseWriter::body(const void *p, size_t n) noexcept {
+    if (state_ == State::Failed) return WriteError::OutOfOrder;
+
+    /* \~english
+     * Only after the head is finished, because that is the only moment at
+     * which where it goes is decided.  A body written before @c finish would
+     * land among the fields, and one written before @c begin would come out
+     * ahead of the status line -- which is the same mistake as writing it down
+     * a second path, made inside one object instead of between two.
+     * \~spanish
+     * Solo despues de acabar la cabeza, porque es el unico momento en que esta
+     * decidido donde va.  Un cuerpo escrito antes de @c finish caeria entre las
+     * cabeceras, y uno escrito antes de @c begin saldria por delante de la linea
+     * de estado -- que es la misma equivocacion que escribirlo por un segundo
+     * camino, hecha dentro de un objeto en vez de entre dos.
+     * \~ */
+    if (state_ != State::Finished) return fail(WriteError::OutOfOrder);
+
+    /* \~english
+     * A response that may not have a body is not given one.  A `HEAD` carries
+     * the fields of the `GET` and none of its bytes, and a `304` says nothing
+     * at all -- and the length was already written saying so, so appending
+     * here would be a message whose framing and whose contents disagree.
+     * \~spanish
+     * A una respuesta que no puede llevar cuerpo no se le pone.  Un `HEAD` lleva
+     * las cabeceras del `GET` y ninguno de sus bytes, y un `304` no dice nada --
+     * y la longitud ya se escribio diciendolo, asi que anadir aqui seria un
+     * mensaje cuyo troceado y cuyo contenido discrepan.
+     * \~ */
+    if (!body_follows_) return WriteError::None;
+
+    if (n == 0) return WriteError::None;
+    if (!put(p, n)) return fail(WriteError::OutOfMemory);
+    return WriteError::None;
+}
+
 } // namespace h1
 } // namespace http_vx

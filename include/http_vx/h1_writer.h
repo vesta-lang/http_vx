@@ -423,6 +423,50 @@ class ResponseWriter {
 
     /**
      * @brief
+     * \~english Puts @p n bytes of body after the head.
+     * \~spanish Pone @p n bytes de cuerpo detras de la cabeza.
+     * \~
+     *
+     * \~english
+     * For a body the writer has to carry: one the handler made on the spot and
+     * that lives nowhere else, so there is nothing for a scatter list to point
+     * at.  A body that DOES live somewhere -- a file, a static asset -- is
+     * better sent as its own region beside the head, which is what @c gather
+     * is for, and copying one of those in here would be the concatenation R14
+     * is about.
+     *
+     * **It has to go through the writer and not straight to the transport.**
+     * A handler that wrote its body itself would be writing down a second path
+     * with no ordering against the first -- and the body would arrive before
+     * the head, which is not a response at all.  That is not a hypothetical:
+     * it is what the first version of the example handler did, and what it
+     * produced was the body, then the status line.
+     *
+     * \~spanish
+     * Para un cuerpo que tiene que llevar el escritor: uno que el manejador hizo
+     * en el momento y que no vive en ningun otro sitio, asi que no hay a que
+     * apuntar desde una lista dispersa.  Un cuerpo que SI vive en algun sitio --
+     * un fichero, un recurso estatico -- se manda mejor como region propia al
+     * lado de la cabeza, que es para lo que esta @c gather, y copiar uno de esos
+     * aqui seria la concatenacion de la que habla la R14.
+     *
+     * **Tiene que pasar por el escritor y no ir directo al transporte.**  Un
+     * manejador que escribiera su cuerpo el mismo estaria escribiendo por un
+     * segundo camino sin ningun orden contra el primero -- y el cuerpo llegaria
+     * antes que la cabeza, que no es una respuesta en absoluto.  Y no es
+     * hipotetico: es lo que hizo la primera version del manejador de ejemplo, y
+     * lo que salio fue el cuerpo y despues la linea de estado.
+     *
+     * \~
+     * @param p \~english the bytes  \~spanish los bytes  \~
+     * @param n \~english how many  \~spanish cuantos  \~
+     * @return  \~english what went wrong, or @c None
+     *          \~spanish que fue mal, o @c None  \~
+     */
+    WriteError body(const void *p, size_t n) noexcept;
+
+    /**
+     * @brief
      * \~english Gives the memory back and makes it ready for another response.
      * \~spanish Devuelve la memoria y lo deja listo para otra respuesta.
      * \~

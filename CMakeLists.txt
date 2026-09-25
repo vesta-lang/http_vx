@@ -111,6 +111,7 @@ add_library(http_vx_core STATIC
         reactor/conn_table.cpp
         reactor/memory_backend.cpp
         reactor/shard.cpp
+        reactor/stdio_backend.cpp
         reactor/timer_wheel.cpp
 )
 target_include_directories(http_vx_core
@@ -152,6 +153,20 @@ target_include_directories(http_vx_proto
 target_compile_options(http_vx_proto PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 
+# ---------------------------------------------------------------------------
+# Un servidor que se EJECUTA, y sin red por ningun sitio: lee una peticion de su
+# entrada estandar y escribe la respuesta en su salida.  Eso es un transporte de
+# verdad y no un sustituto -- HTTP por una tuberia es como se le habla al demonio
+# de Docker --, y ademas es lo que dice que las piezas son un servidor y no una
+# coleccion de piezas que pasan sus pruebas.
+#
+# Se construye SIEMPRE, tambien cuando las pruebas estan apagadas: si lo que se
+# publica no compila, eso hay que saberlo al construir y no al publicar.
+# ---------------------------------------------------------------------------
+add_executable(http_vx_serve serve/main.cpp)
+target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
+
 if (HTTP_VX_BUILD_TESTS)
     enable_testing()
     include(cmake/http_vx_tests.cmake)
@@ -191,6 +206,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
     http_vx_add_test(test_shard tests/test_shard.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
+    http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
     http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
 endif ()
 

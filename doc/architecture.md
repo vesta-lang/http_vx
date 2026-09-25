@@ -141,6 +141,7 @@ preserializadas.
         h3/        RFC 9114: tramas + QPACK
       quic/        paquetes, perdida, congestion, flujo, migracion
       reactor/     la interfaz por finalizacion
+      serve/       un servidor que se EJECUTA, por descriptores y sin red
       windows/     IOCP
       linux/       io_uring y epoll
       tests/       sobre core/ y proto/, sin red
