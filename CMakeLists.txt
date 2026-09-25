@@ -166,8 +166,12 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 # publica no compila, eso hay que saberlo al construir y no al publicar.
 # ---------------------------------------------------------------------------
 add_executable(http_vx_serve serve/main.cpp)
+target_include_directories(http_vx_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
+
+# El que escucha en un PUERTO va mas abajo, despues de las librerias de
+# plataforma: es lo unico de aqui que enlaza una.
 
 # ---------------------------------------------------------------------------
 # El primer backend con un sistema operativo dentro.  Va en su propia libreria
@@ -201,6 +205,27 @@ if (UNIX)
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
     target_compile_options(http_vx_linux PRIVATE -Wall -Wextra -pedantic-errors)
     target_link_libraries(http_vx_linux PUBLIC http_vx_core vesta_alloc)
+endif ()
+
+# ---------------------------------------------------------------------------
+# Y el mismo servidor, en un PUERTO.  Hasta que existio no habia en el proyecto
+# ningun programa que abriera uno: los backends estaban escritos y los movian
+# las pruebas, y una prueba es un buen sitio para averiguar si un socket
+# funciona y uno malo para averiguar lo que cuesta un servidor -- sirve cinco
+# peticiones y termina.
+#
+# Va aqui y no al lado de `http_vx_serve` porque es lo unico del proyecto que
+# enlaza una libreria de plataforma, y esas se definen justo arriba.
+# ---------------------------------------------------------------------------
+add_executable(http_vx_listen serve/listen.cpp)
+target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_listen PRIVATE http_vx_proto http_vx_core)
+
+if (WIN32)
+    target_link_libraries(http_vx_listen PRIVATE http_vx_windows)
+else ()
+    target_link_libraries(http_vx_listen PRIVATE http_vx_linux)
 endif ()
 
 # ---------------------------------------------------------------------------
