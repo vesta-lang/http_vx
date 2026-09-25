@@ -168,6 +168,24 @@ add_executable(http_vx_serve serve/main.cpp)
 target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
 
+# ---------------------------------------------------------------------------
+# Las medidas.  El README dice que no son opcionales y tiene razon por dos
+# lados: un servidor que promete un millon de conexiones tiene que poder ensenar
+# cuanto ocupa cada una, y uno que promete velocidad tiene que poder ensenar
+# cuanta.  Ademas una de las cuatro medidas es de SEGURIDAD -- que partir la
+# entrada no encarezca el analisis (R12) --, y esa no se puede comprobar
+# leyendo el codigo.
+#
+# Se construyen con OPTIMIZACION aunque el build sea de depuracion: una medida
+# tomada sin optimizar no dice nada de lo que se publica, y publicar una asi
+# seria peor que no medir.
+# ---------------------------------------------------------------------------
+if (HTTP_VX_BUILD_BENCH)
+    add_executable(http_vx_bench bench/main.cpp)
+    target_compile_options(http_vx_bench PRIVATE -Wall -Wextra -pedantic-errors -O2)
+    target_link_libraries(http_vx_bench PRIVATE http_vx_proto http_vx_core)
+endif ()
+
 if (HTTP_VX_BUILD_TESTS)
     enable_testing()
     include(cmake/http_vx_tests.cmake)

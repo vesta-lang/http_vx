@@ -22,6 +22,24 @@ namespace http_vx {
 Backend::~Backend() = default;
 
 bool MemoryBackend::feed(const uint8_t *p, size_t n) noexcept {
+    /* \~english
+     * What has been read is forgotten before more is added.  Without this the
+     * room fills up with bytes nobody will look at again, and a run long
+     * enough -- a benchmark, a fuzzing session -- stops being able to feed
+     * anything: the peer would appear to go quiet for no reason, which is the
+     * kind of thing that looks like a bug in what is being measured.
+     * \~spanish
+     * Lo que ya se leyo se olvida antes de anadir mas.  Sin esto el sitio se
+     * llena de bytes que no va a mirar nadie, y una corrida larga -- un banco,
+     * una sesion de fuzzing -- deja de poder dar nada: el otro extremo pareceria
+     * quedarse callado sin motivo, que es de las cosas que parecen un fallo de
+     * lo que se esta midiendo.
+     * \~ */
+    if (in_read_ == in_len_) {
+        in_read_ = 0;
+        in_len_ = 0;
+    }
+
     if (in_len_ + n > sizeof in_) return false;
     util::vesta_memcpy(in_ + in_len_, p, n);
     in_len_ += n;
@@ -143,6 +161,24 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
             return c;
         }
 
+        /* \~english
+         * No room left is a FAILURE and not a write of nothing.  Reporting
+         * zero would say the operation worked and moved nothing, and a caller
+         * that believed it would submit the rest -- for ever, because there is
+         * no rest that will ever fit.  A loop that spins is worse than an
+         * error, because an error stops.
+         * \~spanish
+         * Que no quede sitio es un FALLO y no una escritura de nada.  Decir cero
+         * diria que la operacion funciono y no movio nada, y quien se lo creyera
+         * entregaria el resto -- para siempre, porque no hay resto que vaya a
+         * caber nunca.  Un bucle que da vueltas es peor que un error, porque un
+         * error para.
+         * \~ */
+        if (take == 0 && op.length != 0) {
+            c.result = -1;
+            return c;
+        }
+
         util::vesta_memcpy(out_ + out_len_, b->data() + op.offset, take);
         out_len_ += take;
 
@@ -180,12 +216,34 @@ size_t MemoryBackend::wait(Completion *out, size_t cap,
      * que no le han mandado -- y se abrazaria solo contra un backend que se
      * portara como este, que es el peor sitio posible para una diferencia.
      * \~ */
-    Op keep[kMaxPending];
+    /* \~english
+     * What is kept is written back over what has been read, in place.  The
+     * first version copied the whole ring into an array on the stack -- two
+     * hundred and fifty-six operations, eight kilobytes, on EVERY wait -- and
+     * that is what the benchmark found first: thirty-three microseconds to
+     * serve a request through memory, almost all of it moving operations
+     * nobody had asked about.
+     *
+     * It works because what is kept is never more than what has been looked
+     * at, so the write index is never ahead of the read index.
+     *
+     * \~spanish
+     * Lo que se queda se escribe encima de lo ya leido, en el sitio.  La
+     * primera version copiaba el anillo entero a un array de la pila --
+     * doscientas cincuenta y seis operaciones, ocho kilobytes, en CADA espera --
+     * y eso es lo primero que encontro el banco: treinta y tres microsegundos en
+     * servir una peticion por memoria, casi todos moviendo operaciones por las
+     * que no habia preguntado nadie.
+     *
+     * Funciona porque lo que se queda no es nunca mas que lo que ya se ha
+     * mirado, asi que el indice de escritura no va nunca por delante del de
+     * lectura.
+     * \~ */
     size_t kept = 0;
-
     const size_t was = pending_count_;
+
     for (size_t k = 0; k < was; ++k) {
-        const Op &op = pending_[(pending_head_ + k) % kMaxPending];
+        const Op op = pending_[(pending_head_ + k) % kMaxPending];
 
         const bool is_read =
             op.kind == OpKind::Recv || op.kind == OpKind::RecvFrom;
@@ -196,15 +254,12 @@ size_t MemoryBackend::wait(Completion *out, size_t cap,
             out[made] = finish(op);
             ++made;
         } else {
-            keep[kept] = op;
+            pending_[(pending_head_ + kept) % kMaxPending] = op;
             ++kept;
         }
     }
 
-    for (size_t i = 0; i < kept; ++i) pending_[i] = keep[i];
-    pending_head_ = 0;
     pending_count_ = kept;
-
     return made;
 }
 

@@ -555,6 +555,29 @@ void Shard::on_write(const Completion &done) noexcept {
      * \~ */
     out->consume(static_cast<size_t>(done.result));
 
+    /* \~english
+     * A write that moved NOTHING while there is still something to move is not
+     * progress, and submitting the rest would ask again for exactly what was
+     * just refused -- for ever.  A backend should report that as a failure and
+     * this one is the loop not taking a backend's word for it: backends are
+     * pluggable, and a loop that spins on a badly behaved one is a server that
+     * stops answering while using a whole core.
+     *
+     * \~spanish
+     * Una escritura que no movio NADA cuando todavia queda algo que mover no es
+     * avance, y entregar el resto seria pedir otra vez exactamente lo que
+     * acaban de rechazar -- para siempre.  Un backend deberia decir que eso es
+     * un fallo, y esto es el bucle no fiandose de su palabra: los backends son
+     * enchufables, y un bucle que da vueltas con uno que se porta mal es un
+     * servidor que deja de contestar gastando un nucleo entero.
+     * \~ */
+    if (done.result == 0 && !out->empty()) {
+        pool_.release(done.buffer);
+        drop_queue(*h);
+        close(done.conn);
+        return;
+    }
+
     if (!out->empty()) {
         Op op;
         op.conn = done.conn;

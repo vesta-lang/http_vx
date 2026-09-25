@@ -1,0 +1,54 @@
+http_vx -- medidas
+  maquina: tdm-gcc-10.3 win10-x64
+  fecha:   Sep 25 2026
+  guardar en bench/baseline/<maquina>.txt
+
+  servir (tdm-gcc-10.3 win10-x64)
+    peticiones por ronda                    900
+    peticiones por segundo              2517483
+    por peticion                            397 ns
+
+  llamadas por peticion (tdm-gcc-10.3 win10-x64) -- R15
+    lecturas                               1.00
+    escrituras                             1.00
+    una peticion sencilla deberia ser una y una
+
+  partir la entrada (tdm-gcc-10.3 win10-x64) -- R12: sin retroceso
+    (cada fila analiza la MISMA cabeza 200000 veces, entregada
+     en mas o menos trozos)
+    trozos     seg (las 200k)        cab/s vs 1 trozo
+    1                  0.0189     10597149      1.00x
+    2                  0.0191     10448284      1.01x
+    4                  0.0195     10237772      1.04x
+    8                  0.0223      8987552      1.18x
+    16                 0.0266      7524200      1.41x
+    32                 0.0373      5359847      1.98x
+
+    la misma pregunta a una cabeza 16 veces mayor:
+    trozos      seg (las 20k)        cab/s vs 1 trozo
+    1                  0.0262       762349      1.00x
+    32                 0.0268       745490      1.02x
+
+    la proporcion de la cabeza GRANDE debe ser MENOR o igual
+    que la de la pequena.  Si es mayor, el analizador
+    vuelve a empezar, y eso es cuadratico contra quien mande
+    una peticion byte a byte a proposito.
+
+  memoria por conexion (tdm-gcc-10.3 win10-x64)
+    registro caliente                        24 B
+    registro frio                            56 B
+    plazo + casilla libre                    16 B
+    FIJO POR CONEXION                        96 B
+    un millon de conexiones                91.6 MB
+    bytes en el pozo                          0 B
+
+    conexiones adoptadas 1024, buffers prestados 64
+    en una interfaz por FINALIZACION, una conexion parada
+    tiene un buffer: para enterarse de que llega algo hace
+    falta una lectura pendiente, y una lectura nombra el
+    buffer.  A 16 KB y un millon, 16 GB -- que es lo que la
+    R1 existe para evitar.  Lo arregla la lectura de LONGITUD
+    CERO (recepcion de cero bytes de IOCP, buffers provistos
+    de io_uring): acaba cuando hay algo, y solo entonces se
+    coge buffer.  Falta, y por eso sale aqui.
+
