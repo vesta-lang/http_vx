@@ -166,6 +166,7 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 # ---------------------------------------------------------------------------
 add_library(http_vx_quic STATIC
         quic/ack.cpp
+        quic/connection.cpp
         quic/frame.cpp
         quic/packet.cpp
         quic/protection.cpp
@@ -402,6 +403,19 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_quic_stream_recv tests/test_quic_stream_recv.cpp)
     http_vx_add_test(test_quic_stream_send tests/test_quic_stream_send.cpp)
     http_vx_add_test(test_quic_streams tests/test_quic_streams.cpp)
+
+    # Dos conexiones enteras por una red simulada: el transporte funcionando, no
+    # una regla suelta.  Contra el proveedor de mentira siempre, y contra los de
+    # verdad que se hayan construido.
+    http_vx_add_test(test_quic_connection tests/test_quic_connection.cpp)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_quic_connection PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_quic_connection PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_quic_connection PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_quic_connection PRIVATE HTTP_VX_HAVE_CNG=1)
+    endif ()
     http_vx_add_test(test_quic_varint tests/test_quic_varint.cpp)
     http_vx_add_test(test_chacha20_poly1305 tests/test_chacha20_poly1305.cpp)
     target_link_libraries(test_chacha20_poly1305 PRIVATE http_vx_chacha)

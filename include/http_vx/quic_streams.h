@@ -124,6 +124,9 @@ struct Stream {
     RecvStream *recv = nullptr;
     /// \~english Null on a stream this end only receives on.  \~spanish Nulo en un flujo por el que este extremo solo recibe.  \~
     SendStream *send = nullptr;
+    /// \~english A MAX_STREAM_DATA for it was lost: the current limit is owed again.
+    /// \~spanish Se perdio un MAX_STREAM_DATA suyo: se vuelve a deber el limite actual.  \~
+    bool max_stream_data_owed = false;
 };
 
 /**

@@ -48,6 +48,8 @@
 #include "http_vx/quic_packet.h"
 #include "http_vx/quic_protection.h"
 
+#include "fake_crypto.h"
+
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -84,102 +86,9 @@ bool same_as(const uint8_t *p, const char *hex) {
     return std::memcmp(p, want, n) == 0;
 }
 
-/**
- * @brief
- * \~english A provider with no cryptography in it, that still behaves like one where it matters.
- * \~spanish Un proveedor sin criptografia dentro, que aun asi se porta como uno donde importa.
- * \~
- */
-class FakeCrypto final : public Crypto {
-public:
-    /// \~english When set, the mask is this and not a function of the sample.
-    /// \~spanish Si se pone, la mascara es esta y no una funcion de la muestra.  \~
-    bool fixed_mask = false;
-    uint8_t the_mask[kMaskSize] = {};
-
-    /// \~english Makes every primitive fail, as a broken provider would.
-    /// \~spanish Hace fallar todas las primitivas, como un proveedor roto.  \~
-    bool broken = false;
-
-    /// \~english When set, the mask is refused for any sample but this one.
-    /// \~spanish Si se pone, la mascara se niega para cualquier muestra que no sea esta.  \~
-    bool check_sample = false;
-    uint8_t expected_sample[kSampleSize] = {};
-
-    const char *name() const noexcept override { return "fake"; }
-    bool supports(Aead) const noexcept override { return true; }
-
-    bool extract(Hash, const uint8_t *, size_t, const uint8_t *, size_t,
-                 uint8_t *) noexcept override {
-        return false;
-    }
-    bool expand(Hash, const uint8_t *, size_t, const uint8_t *, size_t,
-                uint8_t *, size_t) noexcept override {
-        return false;
-    }
-
-    // \~english Any non-null pointer will do; nothing is kept behind it.
-    // \~spanish Vale cualquier puntero no nulo; detras no se guarda nada.  \~
-    void *prepare_aead(Aead, const uint8_t *) noexcept override { return this; }
-    void *prepare_hp(Aead, const uint8_t *) noexcept override { return this; }
-    void forget(void *) noexcept override {}
-
-    bool seal(void *, const uint8_t *nonce, const uint8_t *ad, size_t ad_len,
-              const uint8_t *in, size_t n, uint8_t *out) noexcept override {
-        if (broken) return false;
-        uint8_t tag[kTagSize];
-        make_tag(nonce, ad, ad_len, in, n, tag);
-        for (size_t i = 0; i < n; ++i) out[i] = in[i] ^ stream(nonce, i);
-        std::memcpy(out + n, tag, kTagSize);
-        return true;
-    }
-
-    OpenResult open(void *, const uint8_t *nonce, const uint8_t *ad,
-                    size_t ad_len, const uint8_t *in, size_t n,
-                    uint8_t *out) noexcept override {
-        if (broken) return OpenResult::Failed;
-        if (n < kTagSize) return OpenResult::Forged;
-        const size_t body = n - kTagSize;
-        uint8_t got[kTagSize];
-        std::memcpy(got, in + body, kTagSize);
-        for (size_t i = 0; i < body; ++i) out[i] = in[i] ^ stream(nonce, i);
-        uint8_t want[kTagSize];
-        make_tag(nonce, ad, ad_len, out, body, want);
-        return std::memcmp(got, want, kTagSize) == 0 ? OpenResult::Ok
-                                                     : OpenResult::Forged;
-    }
-
-    bool mask(void *, const uint8_t *sample, uint8_t *out) noexcept override {
-        if (broken) return false;
-        if (check_sample && std::memcmp(sample, expected_sample, kSampleSize) != 0)
-            return false;
-        for (size_t i = 0; i < kMaskSize; ++i)
-            out[i] = fixed_mask ? the_mask[i]
-                                : static_cast<uint8_t>(sample[i] ^ sample[15 - i] ^ 0xA5);
-        return true;
-    }
-
-private:
-    static uint8_t stream(const uint8_t *nonce, size_t i) {
-        return static_cast<uint8_t>(nonce[i % kNonceSize] + 31 * i);
-    }
-
-    /// \~english An FNV-style checksum over nonce, associated data and plaintext.
-    /// \~spanish Una suma de comprobacion al estilo FNV sobre nonce, datos asociados y texto claro.  \~
-    static void make_tag(const uint8_t *nonce, const uint8_t *ad, size_t ad_len,
-                         const uint8_t *pt, size_t n, uint8_t *tag) {
-        uint64_t a = 1469598103934665603ull;
-        uint64_t b = 0x9E3779B97F4A7C15ull;
-        for (size_t i = 0; i < kNonceSize; ++i) a = (a ^ nonce[i]) * 1099511628211ull;
-        for (size_t i = 0; i < ad_len; ++i) a = (a ^ ad[i]) * 1099511628211ull;
-        b ^= ad_len;
-        for (size_t i = 0; i < n; ++i) b = (b ^ pt[i]) * 1099511628211ull;
-        for (size_t i = 0; i < 8; ++i) {
-            tag[i] = static_cast<uint8_t>(a >> (8 * i));
-            tag[8 + i] = static_cast<uint8_t>(b >> (8 * i));
-        }
-    }
-};
+// \~english The provider with no cryptography in it, shared with the other tests.
+// \~spanish El proveedor sin criptografia dentro, compartido con las demas pruebas.  \~
+using test_support::FakeCrypto;
 
 /**
  * @brief
