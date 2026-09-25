@@ -425,6 +425,62 @@ class Connection {
     bool put_frame(FrameType type, uint8_t flags, uint32_t id,
                    const uint8_t *payload, size_t n) noexcept;
 
+    /**
+     * @brief
+     * \~english Gives the CONNECTION back @p n bytes nobody will ever be handed.
+     * \~spanish Devuelve a la CONEXION @p n bytes que no se le van a dar a nadie.
+     * \~
+     *
+     * \~english
+     * The other half of flow control, and the half that is easy to leave out
+     * because nothing complains about it.  @c release_window is for bytes the
+     * caller RECEIVED and finished with; this is for bytes that were charged to
+     * the connection and then never reached anybody:
+     *
+     *  - the padding of a DATA frame, which the reader strips and the peer
+     *    counted;
+     *  - the whole payload of a frame for a stream that is already over, which
+     *    is @c Verdict::Discard -- a frame the peer sent before it could have
+     *    known.
+     *
+     * Neither has a stream to credit: one has no reader and the other has no
+     * stream.  So only the connection's window moves, and it moves here rather
+     * than being left for a caller that has not been told the bytes existed.
+     *
+     * A server that skipped this would lose a little allowance on every padded
+     * or discarded frame and stop for good after enough of them, with neither
+     * end able to say why -- which is the exact failure the stream table's own
+     * notes describe and then do not prevent.
+     *
+     * \~spanish
+     * La otra mitad del control de flujo, y la que es facil dejarse porque no se
+     * queja nadie.  @c release_window es para bytes que quien llama RECIBIO y con
+     * los que acabo; esto es para bytes que se le cobraron a la conexion y no
+     * llegaron nunca a nadie:
+     *
+     *  - el relleno de una trama DATA, que el lector quita y el otro extremo
+     *    conto;
+     *  - la carga entera de una trama de un flujo ya terminado, que es
+     *    @c Verdict::Discard -- una trama que el otro mando antes de poder
+     *    saberlo.
+     *
+     * Ninguno de los dos tiene flujo al que abonar: uno no tiene lector y el otro
+     * no tiene flujo.  Asi que solo se mueve la ventana de la conexion, y se
+     * mueve aqui y no se le deja a quien llama, que no se ha enterado de que esos
+     * bytes existieran.
+     *
+     * Un servidor que se saltara esto perderia un poco de credito en cada trama
+     * rellenada o descartada y se pararia para siempre despues de bastantes, sin
+     * que ninguno de los dos extremos supiera decir por que -- que es justo el
+     * fallo que describen las notas de la tabla de flujos y luego no evitan.
+     *
+     * \~
+     * @param n \~english how many bytes  \~spanish cuantos bytes  \~
+     * @return  \~english false if there was no room to say so yet
+     *          \~spanish false si todavia no habia sitio para decirlo  \~
+     */
+    bool credit_connection(uint32_t n) noexcept;
+
     Event fail(ErrorCode code) noexcept;
     Event on_settings(const View &v) noexcept;
     Event on_ping(const View &v) noexcept;

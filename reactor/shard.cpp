@@ -175,6 +175,39 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
     if (b == kNoBuffer) {
         b = pool_.acquire();
         if (b == kNoBuffer) return;
+
+        /* \~english
+         * And it is told where in the connection it is starting.  A buffer
+         * comes out of the pool having forgotten everything, which is right for
+         * a new connection and wrong for this one: the connection may be
+         * thousands of bytes in, and a reader that kept a position measured
+         * from the start of it would find that position sitting before a buffer
+         * that thinks it begins at zero.
+         *
+         * Nothing would report that.  The reader would simply be told its bytes
+         * are not here, for ever, and what anybody could see is a connection
+         * that stops moving with nothing wrong in any frame -- the one failure
+         * that R1 buys and that has to be paid for right here, because this is
+         * the only place that knows both that a buffer is fresh and how far the
+         * connection has come.
+         *
+         * \~spanish
+         * Y se le dice por donde de la conexion empieza.  Un buffer sale del pozo
+         * habiendolo olvidado todo, que esta bien para una conexion nueva y mal
+         * para esta: la conexion puede llevar miles de bytes, y un lector que
+         * guardara una posicion medida desde su principio se encontraria esa
+         * posicion por detras de un buffer que cree empezar en cero.
+         *
+         * Eso no lo diria nadie.  Al lector se le contestaria simplemente que sus
+         * bytes no estan, para siempre, y lo que se veria desde fuera es una
+         * conexion que deja de avanzar sin que haya nada mal en ninguna trama --
+         * el unico fallo que compra la R1, y que hay que pagar justo aqui, porque
+         * este es el unico sitio que sabe a la vez que un buffer viene limpio y
+         * cuanto lleva andado la conexion.
+         * \~ */
+        Buffer *fresh = pool_.at(b);
+        const ConnCold *cold = conns_.cold(c);
+        if (fresh != nullptr && cold != nullptr) fresh->rebase(cold->bytes_in);
     }
 
     Op op;

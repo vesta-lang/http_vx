@@ -29,22 +29,38 @@ namespace {
  * \~
  *
  * \~english
- * A PING echo: nine bytes of header and eight of payload.  It is the number
- * the room check is made against before reading a frame, so that a frame is
- * never read whose answer cannot be written -- which would mean either
- * dropping the answer or growing the buffer, and the second is what the fixed
- * buffer exists to rule out.
+ * A DATA frame for a stream that is over, which is the frame that provokes the
+ * MOST: a RST_STREAM saying so, and two WINDOW_UPDATEs giving back an
+ * allowance nobody is going to consume.  It is the number the room check is
+ * made against before reading a frame, so that a frame is never read whose
+ * answer cannot be written -- which would mean either dropping the answer or
+ * growing the buffer, and the second is what the fixed buffer exists to rule
+ * out.
+ *
+ * It was a PING echo -- seventeen bytes -- until the frames that give window
+ * back were written, and that was not a tight estimate that got tighter: an
+ * answer the room was not checked for is an answer that is quietly dropped,
+ * and the one being dropped here would have been the allowance that keeps the
+ * connection moving.
  *
  * \~spanish
- * El eco de un PING: nueve bytes de cabecera y ocho de carga.  Es el numero
- * contra el que se comprueba el sitio antes de leer una trama, para no leer
- * nunca una cuya respuesta no se pueda escribir -- que seria o tirar la
- * respuesta o hacer crecer el buffer, y lo segundo es lo que el buffer fijo
- * existe para descartar.
+ * Una trama DATA de un flujo ya terminado, que es la que provoca MAS: un
+ * RST_STREAM diciendolo, y dos WINDOW_UPDATE devolviendo un credito que no va a
+ * consumir nadie.  Es el numero contra el que se comprueba el sitio antes de
+ * leer una trama, para no leer nunca una cuya respuesta no se pueda escribir --
+ * que seria o tirar la respuesta o hacer crecer el buffer, y lo segundo es lo
+ * que el buffer fijo existe para descartar.
+ *
+ * Era el eco de un PING -- diecisiete bytes -- hasta que se escribieron las
+ * tramas que devuelven ventana, y eso no fue una estimacion justa que se quedo
+ * mas justa: una respuesta para la que no se comprobo el sitio es una respuesta
+ * que se tira por lo bajo, y la que se estaria tirando aqui es el credito que
+ * mantiene la conexion en marcha.
  *
  * \~
  */
-constexpr size_t kLargestAnswer = kFrameHeaderSize + 8;
+constexpr size_t kLargestAnswer =
+    (kFrameHeaderSize + 4) + 2 * (kFrameHeaderSize + 4);
 
 } // namespace
 
@@ -173,6 +189,18 @@ bool Connection::release_window(uint32_t id, uint32_t n) noexcept {
     Stream *s = streams_.find(id);
     if (s != nullptr) s->recv.give(n);
 
+    return true;
+}
+
+bool Connection::credit_connection(uint32_t n) noexcept {
+    if (n == 0) return true;
+    if (!control_room(kFrameHeaderSize + 4)) return false;
+
+    uint8_t payload[4];
+    put_be32(payload, n);
+
+    put_frame(FrameType::WindowUpdate, 0, 0, payload, sizeof payload);
+    recv_.give(n);
     return true;
 }
 
@@ -535,8 +563,25 @@ Event Connection::read(const View &v, Buffer &headers,
 
         if (o.verdict == Verdict::ConnectionError) return fail(o.error);
 
+        /* \~english
+         * A frame nobody is going to read still has to give its allowance
+         * back, and it has to give it back HERE.  There is no stream to credit
+         * -- it is over, which is why the frame is being refused -- and no
+         * caller to ask, because a caller is only told about bytes it is being
+         * handed.  Skipping it loses a little window on every reset stream, and
+         * enough of them stop the connection for good.
+         *
+         * \~spanish
+         * Una trama que no va a leer nadie tiene que devolver su credito igual, y
+         * tiene que devolverlo AQUI.  No hay flujo al que abonarlo -- esta
+         * terminado, que es la razon de que la trama se rechace -- ni a quien
+         * llama a quien pedirselo, porque a quien llama solo se le habla de los
+         * bytes que se le dan.  Saltarselo pierde un poco de ventana en cada
+         * flujo abortado, y con bastantes la conexion se para para siempre.
+         * \~ */
         if (o.verdict == Verdict::StreamError) {
             reset_stream(h.stream_id, o.error);
+            credit_connection(h.length);
 
             Event e;
             e.kind = EventKind::StreamEnded;
@@ -545,9 +590,28 @@ Event Connection::read(const View &v, Buffer &headers,
             return e;
         }
 
-        if (o.verdict == Verdict::Discard) return Event{};
+        if (o.verdict == Verdict::Discard) {
+            credit_connection(h.length);
+            return Event{};
+        }
 
         const Span p = reader_.payload();
+
+        /* \~english
+         * And the padding, which the reader took off and the peer paid for.
+         * The bytes are charged to both windows and reach nobody, so both are
+         * credited -- which is what @c release_window does, and the stream is
+         * still open here, so it is the right call rather than a near one.
+         *
+         * \~spanish
+         * Y el relleno, que el lector quito y el otro extremo pago.  Los bytes se
+         * cobran a las dos ventanas y no llegan a nadie, asi que se abonan las dos
+         * -- que es lo que hace @c release_window, y aqui el flujo sigue abierto,
+         * asi que es la llamada correcta y no una parecida.
+         * \~ */
+        if (h.length > p.len)
+            release_window(h.stream_id,
+                           static_cast<uint32_t>(h.length - p.len));
 
         Event e;
         e.kind = EventKind::Body;

@@ -532,6 +532,61 @@ class Buffer {
 
     /**
      * @brief
+     * \~english Says this empty buffer carries on from byte @p at of a connection.
+     * \~spanish Dice que este buffer vacio sigue desde el byte @p at de una conexion.
+     * \~
+     *
+     * \~english
+     * The fourth thing, and it exists because R1 and the stream position pull
+     * against each other.  A connection that has nothing in flight gives its
+     * buffer back, and the next one it is lent has been recycled -- so it
+     * starts the stream at zero, while the connection is four thousand bytes
+     * in.  Every position a reader remembered is then measured from a point
+     * that connection passed long ago.
+     *
+     * Nothing reports that.  A reader asking for a position it kept gets told
+     * the bytes are not here -- @c View::has is doing exactly its job -- and
+     * what the caller sees is a connection that stops making progress with
+     * every frame of it perfectly legal.  It is the failure shape this whole
+     * file was written to avoid, arriving through the one door left open: the
+     * stream is a property of the CONNECTION and the count was living in the
+     * buffer.
+     *
+     * Only on an empty one, because on any other it would move bytes that are
+     * already here without moving what points at them.
+     *
+     * \~spanish
+     * La cuarta cosa, y existe porque la R1 y la posicion del flujo tiran en
+     * sentidos contrarios.  Una conexion sin nada en vuelo devuelve su buffer, y
+     * el siguiente que le prestan viene reciclado -- asi que empieza el flujo en
+     * cero, mientras la conexion lleva cuatro mil bytes --.  Todas las posiciones
+     * que recordara un lector quedan entonces medidas desde un punto por el que
+     * esa conexion paso hace rato.
+     *
+     * Eso no lo dice nadie.  Un lector que pregunte por una posicion que guardo
+     * recibe que esos bytes no estan -- @c View::has haciendo justo su trabajo --
+     * y lo que se ve desde fuera es una conexion que deja de avanzar con todas
+     * sus tramas perfectamente legales.  Es el modo de fallar que este fichero
+     * entero se escribio para evitar, llegando por la unica puerta que quedaba
+     * abierta: el flujo es una propiedad de la CONEXION y la cuenta vivia en el
+     * buffer.
+     *
+     * Solo sobre uno vacio, porque sobre cualquier otro moveria unos bytes que
+     * ya estan aqui sin mover lo que les apunta.
+     *
+     * \~
+     * @param at \~english which byte of the connection the next one will be
+     *           \~spanish que byte de la conexion sera el siguiente  \~
+     */
+    void rebase(uint64_t at) noexcept {
+        if (head_ != tail_) return;
+        head_ = 0;
+        tail_ = 0;
+        origin_ = at;
+    }
+
+    /**
+     * @brief
      * \~english Gives the memory back.
      * \~spanish Devuelve la memoria.
      * \~
