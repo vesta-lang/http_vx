@@ -193,6 +193,7 @@ target_link_libraries(http_vx_quic PUBLIC vesta_alloc)
 # TCP.  Sin ninguna cabecera del sistema, por la R6, como el resto.
 # ---------------------------------------------------------------------------
 add_library(http_vx_tls STATIC
+        tls/messages.cpp
         tls/schedule.cpp
 )
 target_include_directories(http_vx_tls
@@ -466,6 +467,8 @@ if (HTTP_VX_BUILD_TESTS)
 
     # TLS 1.3 contra el RFC 8448: las etiquetas con cualquier proveedor, los
     # secretos con los de verdad que se hayan construido.
+    http_vx_add_test(test_tls_messages tests/test_tls_messages.cpp)
+    target_link_libraries(test_tls_messages PRIVATE http_vx_tls)
     http_vx_add_test(test_tls_schedule tests/test_tls_schedule.cpp)
     target_link_libraries(test_tls_schedule PRIVATE http_vx_tls)
     if (TARGET http_vx_crypto_openssl)
