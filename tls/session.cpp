@@ -181,6 +181,11 @@ Session::~Session() {
     wipe(ap_server_, sizeof ap_server_);
     wipe(exporter_, sizeof exporter_);
     wipe(resumption_, sizeof resumption_);
+    wipe(psk_, sizeof psk_);
+    if (kept_ != nullptr) {
+        wipe(kept_, kKeptTickets * sizeof(Ticket));
+        util::host_free(kept_);
+    }
     for (size_t i = 0; i < quic::kSpaces; ++i) {
         release(in_[i]);
         release(out_[i]);
@@ -235,12 +240,51 @@ bool Session::begin(Space s, size_t need, Writer &w) noexcept {
     return true;
 }
 
-bool Session::commit(Space s, Writer &w) noexcept {
+bool Session::commit(Space s, Writer &w, bool in_transcript) noexcept {
     if (w.failed()) return fail_provider("a handshake message did not fit where it was written");
     Bytes &b = out_[static_cast<size_t>(s)];
-    // \~english Every message sent is part of the transcript (4.4.1).  \~spanish Cada mensaje enviado es parte de la transcripcion (4.4.1).  \~
-    if (!add(b.p + b.len, w.size())) return false;
+    // \~english Every handshake message sent is part of the transcript (4.4.1).  \~spanish Cada mensaje del saludo enviado es parte de la transcripcion (4.4.1).  \~
+    if (in_transcript && !add(b.p + b.len, w.size())) return false;
     b.len += w.size();
+    return true;
+}
+
+bool Session::binder(const uint8_t *psk, Hash h, const uint8_t *partial, size_t partial_len, uint8_t *out) noexcept {
+    /* \~english
+     * A Finished whose base key is the binder key, over the transcript so
+     * far followed by the ClientHello up to its binders (4.2.11.2): after a
+     * HelloRetryRequest the transcript already holds message_hash and the
+     * retry.  Hashed in one piece, like every transcript here.
+     * \~spanish
+     * Un Finished cuya clave base es la del binder, sobre la transcripcion hasta
+     * ahora seguida del ClientHello hasta sus binders (4.2.11.2): tras un
+     * HelloRetryRequest la transcripcion ya lleva message_hash y el reintento.
+     * Resumido de una pieza, como todas las transcripciones de aqui.
+     * \~ */
+    const size_t total = transcript_.size() + partial_len;
+    const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed, util::AllocFill::All);
+    uint8_t *buf = static_cast<uint8_t *>(util::host_alloc(total));
+    if (buf == nullptr) return fail_provider("out of memory for a PSK binder");
+    if (transcript_.size() != 0) util::vesta_memcpy(buf, transcript_.bytes(), transcript_.size());
+    util::vesta_memcpy(buf + transcript_.size(), partial, partial_len);
+    KeySchedule ks(c_, h);
+    uint8_t key[kMaxHash];
+    uint8_t th[kMaxHash];
+    const bool ok = ks.start(psk, hash_size(h)) && ks.binder_key(true, key) && c_.digest(h, buf, total, th) &&
+                    finished_data(c_, h, key, th, out);
+    wipe(buf, total);
+    util::host_free(buf);
+    wipe(key, sizeof key);
+    return ok || fail_provider("the provider could not compute a PSK binder");
+}
+
+bool Session::take_ticket(Ticket &out) noexcept {
+    if (kept_count_ == 0) return false;
+    out = kept_[0];
+    for (size_t i = 1; i < kept_count_; ++i) kept_[i - 1] = kept_[i];
+    --kept_count_;
+    // \~english The slot freed held a PSK.  \~spanish La ranura liberada tenia una PSK.  \~
+    wipe(&kept_[kept_count_], sizeof(Ticket));
     return true;
 }
 
@@ -255,10 +299,12 @@ bool Session::set_suite(uint16_t s) noexcept {
 }
 
 bool Session::derive_handshake(const uint8_t *shared, size_t shared_len) noexcept {
-    // \~english No PSK: the Early Secret from zeros, then the (EC)DHE secret over ClientHello..ServerHello (7.1).
-    // \~spanish Sin PSK: el Early Secret de ceros, y luego el secreto (EC)DHE sobre ClientHello..ServerHello (7.1).  \~
+    // \~english The Early Secret, then the (EC)DHE secret over ClientHello..ServerHello (7.1).
+    // \~spanish El Early Secret, y luego el secreto (EC)DHE sobre ClientHello..ServerHello (7.1).  \~
     uint8_t th[kMaxHash];
-    if (!schedule().start(nullptr, 0) || !transcript_.hash(c_, hash_, th) ||
+    // \~english A resumed handshake starts from the PSK instead of zeros (7.1).
+    // \~spanish Un saludo reanudado empieza desde la PSK en lugar de ceros (7.1).  \~
+    if (!schedule().start(resumed_ ? psk_ : nullptr, resumed_ ? psk_len_ : 0) || !transcript_.hash(c_, hash_, th) ||
         !schedule().handshake(shared, shared_len, th, hs_client_, hs_server_))
         return fail_provider("the provider could not derive the handshake secrets");
     has_handshake_keys_ = true;
@@ -335,7 +381,8 @@ bool Session::client_hello() noexcept {
         alpn_total += 1 + len;
     }
     const size_t need = 512 + cfg_.transport_params_len + name_len + alpn_total +
-                        2 * (4 + quic::kMaxPublicKey) + cookie_.len;
+                        2 * (4 + quic::kMaxPublicKey) + cookie_.len +
+                        (cfg_.resume != nullptr ? cfg_.resume->identity_len + 64 : 0);
     Writer w(nullptr, 0);
     if (!begin(Space::Initial, need, w)) return false;
 
@@ -366,11 +413,73 @@ bool Session::client_hello() noexcept {
     // \~english The HelloRetryRequest's cookie goes back as it came (4.2.2).  \~spanish La cookie del HelloRetryRequest vuelve tal como vino (4.2.2).  \~
     if (cookie_.present) write_cookie(w, transcript_.bytes() + cookie_.at, cookie_.len);
     write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
+
+    /* \~english
+     * A ticket, if one is usable: after a retry only if its hash is the
+     * suite's (4.1.4).  psk_key_exchange_modes goes with it (4.2.9), and
+     * pre_shared_key goes last (4.2.11), its binder written once the
+     * message around it is complete.
+     * \~spanish
+     * Un ticket, si hay uno usable: tras un reintento solo si su resumen es el
+     * del algoritmo (4.1.4).  psk_key_exchange_modes va con el (4.2.9), y
+     * pre_shared_key va la ultima (4.2.11), con su binder escrito cuando el
+     * mensaje que lo rodea esta completo.
+     * \~ */
+    psk_offered_ = retried_ ? psk_offered_ && quic::hash_of(aead_of(cfg_.resume->suite)) == hash_
+                            : resume_usable();
+    size_t binders_at = 0;
+    Hash psk_hash = Hash::Sha256;
+    if (psk_offered_) {
+        const Ticket &t = *cfg_.resume;
+        psk_hash = quic::hash_of(aead_of(t.suite));
+        const uint8_t dhe = 1;  // \~english psk_dhe_ke only  \~spanish solo psk_dhe_ke  \~
+        write_psk_modes(w, &dhe, 1);
+        // \~english The age in milliseconds plus ticket_age_add, modulo 2^32 (4.2.11.1).
+        // \~spanish La edad en milisegundos mas ticket_age_add, modulo 2^32 (4.2.11.1).  \~
+        const uint32_t age = static_cast<uint32_t>((clock_us_ - t.received_us) / 1000) + t.age_add;
+        const size_t e = w.begin_extension(ext::PreSharedKey);
+        const size_t ids = w.open(2);
+        const size_t id = w.open(2);
+        w.bytes(t.identity, t.identity_len);
+        w.close(id, 2);
+        w.u32(age);
+        w.close(ids, 2);
+        binders_at = w.size();
+        const size_t list = w.open(2);
+        const size_t entry = w.open(1);
+        const uint8_t zeros[kMaxHash] = {};
+        w.bytes(zeros, hash_size(psk_hash));
+        w.close(entry, 1);
+        w.close(list, 2);
+        w.close(e, 2);
+    }
     w.close(exts, 2);
     w.end_message(msg);
+    if (psk_offered_ && !w.failed() &&
+        !binder(cfg_.resume->psk, psk_hash, w.data(), binders_at, w.data() + binders_at + 3))
+        return false;
     if (!commit(Space::Initial, w)) return false;
     state_ = State::WaitServerHello;
     return true;
+}
+
+bool Session::resume_usable() const noexcept {
+    if (cfg_.server || cfg_.resume == nullptr) return false;
+    const Ticket &t = *cfg_.resume;
+    if (t.identity_len == 0 || t.identity_len > Ticket::kMaxIdentity || t.lifetime_s == 0) return false;
+    // \~english A suite of its hash must be one this end offers (4.6.1).  \~spanish Un algoritmo de su resumen tiene que ser uno que ofrece este extremo (4.6.1).  \~
+    if (!listed(suites_, suite_count_, t.suite)) return false;
+    // \~english Not past its lifetime, and never past seven days (4.2.11.1, 4.6.1).
+    // \~spanish No pasado su vida, y nunca pasados siete dias (4.2.11.1, 4.6.1).  \~
+    if (clock_us_ < t.received_us) return false;
+    const uint64_t age_s = (clock_us_ - t.received_us) / 1000000;
+    if (age_s >= t.lifetime_s || age_s >= kMaxTicketLifetime) return false;
+    // \~english Only for the host name it came from (4.6.1: SHOULD).  \~spanish Solo para el nombre del que vino (4.6.1: DEBERIA).  \~
+    size_t name_len = 0;
+    if (cfg_.server_name != nullptr)
+        while (cfg_.server_name[name_len] != '\0') ++name_len;
+    return name_len == t.server_name_len &&
+           (name_len == 0 || same(reinterpret_cast<const uint8_t *>(cfg_.server_name), t.server_name, name_len));
 }
 
 bool Session::receive(Space s, const uint8_t *data, size_t n) noexcept {
@@ -478,13 +587,15 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
         return fail_quic(kProtocolViolation, "a non-empty legacy_session_id: no compatibility mode in QUIC (RFC 9001, 8.4)");
     if (ch.ext.has_supported_groups != ch.ext.has_key_share)
         return fail(Alert::MissingExtension, "supported_groups and key_share go together (RFC 8446, 9.2)");
-    if (!ch.ext.has_supported_groups || !ch.ext.has_signature_algorithms) {
-        // \~english With a PSK they may be absent (9.2), but resumption is not done yet: nothing to agree on.
-        // \~spanish Con una PSK pueden faltar (9.2), pero la reanudacion aun no esta: no hay en que ponerse de acuerdo.  \~
+    if (!ch.ext.has_supported_groups) {
+        // \~english Without groups only psk_ke is left, and this end resumes only with (EC)DHE (4.2.9).
+        // \~spanish Sin grupos solo queda psk_ke, y este extremo solo reanuda con (EC)DHE (4.2.9).  \~
         if (ch.ext.has_pre_shared_key)
-            return fail(Alert::HandshakeFailure, "a ClientHello that relies on a PSK, and resumption is not supported");
-        return fail(Alert::MissingExtension, "no signature_algorithms or supported_groups without a PSK (RFC 8446, 9.2)");
+            return fail(Alert::HandshakeFailure, "a ClientHello that offers only psk_ke: this end resumes with (EC)DHE");
+        return fail(Alert::MissingExtension, "no supported_groups without a PSK (RFC 8446, 9.2)");
     }
+    if (!ch.ext.has_signature_algorithms && !ch.ext.has_pre_shared_key)
+        return fail(Alert::MissingExtension, "no signature_algorithms without a PSK (RFC 8446, 9.2)");
     if (!ch.ext.has_transport_parameters)
         return fail(Alert::MissingExtension, "no quic_transport_parameters (RFC 9001, 8.2)");
     if (second) {
@@ -495,15 +606,19 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     }
 
     uint16_t chosen = suite_;
+    // \~english A ticket that opens and is alive steers the suite: one of its hash (4.2.11).
+    // \~spanish Un ticket que se abre y sigue vivo guia el algoritmo: uno de su resumen (4.2.11).  \~
+    uint16_t ticket_suite = second ? suite_ : 0;
+    const bool may_resume = accept_psk(m, ch, false, ticket_suite);
     if (second) {
         // \~english The same suite as the HelloRetryRequest (4.1.4).  \~spanish El mismo algoritmo que el HelloRetryRequest (4.1.4).  \~
         if (!listed_in(m, ch.cipher_suites, suite_))
             return fail(Alert::IllegalParameter, "the second ClientHello dropped the suite of the HelloRetryRequest (RFC 8446, 4.1.4)");
+    } else if (may_resume) {
+        chosen = ticket_suite;
     } else if (!choose_suite(m, ch.cipher_suites, chosen)) {
         return fail(Alert::HandshakeFailure, "no cipher suite in common (RFC 8446, 4.1.1)");
     }
-    if (!listed_in(m, ch.ext.signature_algorithms, static_cast<uint16_t>(cfg_.scheme)))
-        return fail(Alert::HandshakeFailure, "the client accepts no signature this certificate makes (RFC 8446, 4.1.1)");
     if (!ch.ext.has_alpn) return fail(Alert::NoApplicationProtocol, "no ALPN: QUIC requires it (RFC 9001, 8.1)");
     if (!choose_alpn(m, ch.ext.alpn))
         return fail(Alert::NoApplicationProtocol, "no application protocol in common (RFC 7301, 3.2)");
@@ -527,6 +642,27 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     }
     if (second && (entries != 1 || share_group != group_))
         return fail(Alert::IllegalParameter, "the second ClientHello must carry one share, for the group asked (RFC 8446, 4.1.2)");
+
+    /* \~english
+     * With a share there is no retry, so this is the ClientHello the PSK is
+     * accepted on -- after its binder, over the transcript before it
+     * (4.2.11.2).  A binder that does not match ends the handshake; a
+     * ticket that cannot be used just means no resumption.
+     * \~spanish
+     * Con una clave no hay reintento, asi que este es el ClientHello en el que
+     * se acepta la PSK -- tras su binder, sobre la transcripcion anterior a el
+     * (4.2.11.2).  Un binder que no casa acaba el saludo; un ticket que no se
+     * puede usar solo significa que no se reanuda.
+     * \~ */
+    if (share_len != 0 && may_resume && !accept_psk(m, ch, true, chosen) && failed()) return false;
+    // \~english A certificate is only needed without a PSK -- and on a retry, the second ClientHello decides.
+    // \~spanish Un certificado solo hace falta sin PSK -- y en un reintento, decide el segundo ClientHello.  \~
+    if (!resumed_ && !(share_len == 0 && may_resume)) {
+        if (!ch.ext.has_signature_algorithms)
+            return fail(Alert::MissingExtension, "no signature_algorithms and no PSK accepted (RFC 8446, 9.2)");
+        if (!listed_in(m, ch.ext.signature_algorithms, static_cast<uint16_t>(cfg_.scheme)))
+            return fail(Alert::HandshakeFailure, "the client accepts no signature this certificate makes (RFC 8446, 4.1.1)");
+    }
 
     const size_t msg_at = transcript_.size();
     if (!add(m, n)) return false;
@@ -552,6 +688,57 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     keep(msg_at, ch.ext.transport_parameters, peer_tp_);
     if (ch.ext.has_server_name && ch.ext.server_name.len != 0) keep(msg_at, ch.ext.server_name, server_name_);
     return server_flight(m, ch, share_at, share_len);
+}
+
+bool Session::accept_psk(const uint8_t *m, const ClientHello &ch, bool check_binder, uint16_t &suite) noexcept {
+    if (cfg_.tickets == nullptr || !ch.ext.has_pre_shared_key || !ch.ext.has_psk_modes) return false;
+    // \~english Only psk_dhe_ke is accepted: never a mode the client did not list (4.2.9).
+    // \~spanish Solo se acepta psk_dhe_ke: nunca un modo que el cliente no listo (4.2.9).  \~
+    bool dhe = false;
+    for (uint32_t i = 0; i < ch.ext.psk_modes.len; ++i) dhe = dhe || m[ch.ext.psk_modes.off + i] == 1;
+    if (!dhe) return false;
+
+    // \~english The first identity alone: one PSK chosen, one binder checked (4.2.11).
+    // \~spanish Solo la primera identidad: se elige una PSK y se comprueba un binder (4.2.11).  \~
+    const uint8_t *id = m + ch.ext.psk_identities.off;
+    TicketContents t;
+    if (!cfg_.tickets->open(id + 2, read16(id), t)) return false;
+    const uint64_t now_ms = clock_us_ / 1000;
+    const Hash h = quic::hash_of(aead_of(t.suite));
+    bool usable = listed(suites_, suite_count_, t.suite) && t.issued_ms <= now_ms &&
+                  now_ms - t.issued_ms < uint64_t{t.lifetime_s} * 1000;
+    // \~english Choosing: its own suite, if the client offers it.  Accepting: the suite chosen has the PSK's hash (4.2.11).
+    // \~spanish Al elegir: su propio algoritmo, si el cliente lo ofrece.  Al aceptar: el algoritmo elegido tiene el resumen de la PSK (4.2.11).  \~
+    if (usable && !check_binder && suite == 0) {
+        usable = listed_in(m, ch.cipher_suites, t.suite);
+        suite = t.suite;
+    }
+    if (usable && check_binder) usable = quic::hash_of(aead_of(suite)) == h;
+    if (usable && check_binder) {
+        const size_t hl = hash_size(h);
+        const uint8_t *b = m + ch.ext.psk_binders.off;
+        if (b[0] != hl) {
+            wipe(&t, sizeof t);
+            return fail(Alert::DecryptError, "a PSK binder of the wrong length (RFC 8446, 4.2.11.2)");
+        }
+        uint8_t want[kMaxHash];
+        const bool computed = binder(t.psk, h, m, ch.ext.psk_binders_at, want);
+        const bool match = computed && same(want, b + 1, hl);
+        wipe(want, sizeof want);
+        if (!computed) {
+            wipe(&t, sizeof t);
+            return false;
+        }
+        if (!match) {
+            wipe(&t, sizeof t);
+            return fail(Alert::DecryptError, "the PSK binder does not match (RFC 8446, 4.2.11.2)");
+        }
+        util::vesta_memcpy_noinline(psk_, t.psk, hl);
+        psk_len_ = hl;
+        resumed_ = true;
+    }
+    wipe(&t, sizeof t);
+    return usable;
 }
 
 bool Session::hello_retry(const ClientHello &) noexcept {
@@ -605,6 +792,9 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
         const size_t exts = w.open(2);
         write_supported_versions_server(w, kTls13);
         write_key_share_server(w, group_, share_pubs_[0], quic::public_key_size(g));
+        // \~english The PSK taken: the first identity, the only one looked at (4.2.11).
+        // \~spanish La PSK tomada: la primera identidad, la unica que se miro (4.2.11).  \~
+        if (resumed_) write_psk_server(w, 0);
         w.close(exts, 2);
         w.end_message(msg);
         ok = commit(Space::Initial, w) && derive_handshake(shared, quic::kMaxShared);
@@ -625,13 +815,37 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
     w.end_message(msg);
     if (!commit(Space::Handshake, w)) return false;
 
+    // \~english A PSK or a certificate, never both (4.4); and no CertificateRequest with a PSK (4.3.2).
+    // \~spanish Una PSK o un certificado, nunca los dos (4.4); y ningun CertificateRequest con una PSK (4.3.2).  \~
+    if (!resumed_ && !server_certificate()) return false;
+
+    // \~english Finished, and with it the application secrets (4.4.4, 7.1).
+    // \~spanish Finished, y con el los secretos de aplicacion (4.4.4, 7.1).  \~
+    const size_t hl = hash_size(hash_);
+    uint8_t th[kMaxHash];
+    uint8_t fin[kMaxHash];
+    if (!finished_for(false, fin) || !begin(Space::Handshake, 4 + hl, w)) return false;
+    msg = w.begin_message(Handshake::Finished);
+    w.bytes(fin, hl);
+    w.end_message(msg);
+    if (!commit(Space::Handshake, w)) return false;
+    if (!transcript_.hash(c_, hash_, th) || !schedule().application(th, ap_client_, ap_server_, exporter_))
+        return fail_provider("the provider could not derive the application secrets");
+    has_application_keys_ = true;
+    state_ = cert_requested_ ? State::WaitCertificate : State::WaitFinished;
+    return true;
+}
+
+bool Session::server_certificate() noexcept {
+    Writer w(nullptr, 0);
+    size_t msg = 0;
     if (cfg_.request_certificate) {
         // \~english CertificateRequest: an empty context in the handshake, and the schemes accepted (4.3.2).
         // \~spanish CertificateRequest: un contexto vacio en el saludo, y los esquemas aceptados (4.3.2).  \~
         if (!begin(Space::Handshake, 32, w)) return false;
         msg = w.begin_message(Handshake::CertificateRequest);
         w.u8(0);
-        exts = w.open(2);
+        const size_t exts = w.open(2);
         write_u16_list(w, ext::SignatureAlgorithms, kSchemes, kSchemeCount);
         w.close(exts, 2);
         w.end_message(msg);
@@ -674,21 +888,7 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
     w.bytes(sig, sig_len);
     w.close(signature, 2);
     w.end_message(msg);
-    if (!commit(Space::Handshake, w)) return false;
-
-    // \~english Finished, and with it the application secrets (4.4.4, 7.1).
-    // \~spanish Finished, y con el los secretos de aplicacion (4.4.4, 7.1).  \~
-    uint8_t fin[kMaxHash];
-    if (!finished_for(false, fin) || !begin(Space::Handshake, 4 + hl, w)) return false;
-    msg = w.begin_message(Handshake::Finished);
-    w.bytes(fin, hl);
-    w.end_message(msg);
-    if (!commit(Space::Handshake, w)) return false;
-    if (!transcript_.hash(c_, hash_, th) || !schedule().application(th, ap_client_, ap_server_, exporter_))
-        return fail_provider("the provider could not derive the application secrets");
-    has_application_keys_ = true;
-    state_ = cert_requested_ ? State::WaitCertificate : State::WaitFinished;
-    return true;
+    return commit(Space::Handshake, w);
 }
 
 bool Session::on_server_hello(const uint8_t *m, size_t n) noexcept {
@@ -709,8 +909,21 @@ bool Session::on_server_hello(const uint8_t *m, size_t n) noexcept {
 
     if (retried_ && sh.cipher_suite != suite_)
         return fail(Alert::IllegalParameter, "the ServerHello changed the suite of the HelloRetryRequest (RFC 8446, 4.1.4)");
-    if (sh.ext.has_pre_shared_key)
-        return fail(Alert::UnsupportedExtension, "a pre_shared_key that was never offered (RFC 8446, 4.2)");
+    if (sh.ext.has_pre_shared_key) {
+        if (!psk_offered_)
+            return fail(Alert::UnsupportedExtension, "a pre_shared_key that was never offered (RFC 8446, 4.2)");
+        // \~english One identity was offered; its hash is the suite's; and psk_dhe_ke needs a share (4.2.11).
+        // \~spanish Se ofrecio una identidad; su resumen es el del algoritmo; y psk_dhe_ke necesita una clave (4.2.11).  \~
+        if (sh.ext.psk_selected != 0)
+            return fail(Alert::IllegalParameter, "a selected_identity out of the range offered (RFC 8446, 4.2.11)");
+        if (quic::hash_of(aead_of(sh.cipher_suite)) != quic::hash_of(aead_of(cfg_.resume->suite)))
+            return fail(Alert::IllegalParameter, "a suite whose hash is not the PSK's (RFC 8446, 4.2.11)");
+        if (!sh.ext.has_key_share)
+            return fail(Alert::IllegalParameter, "no key_share, and only psk_dhe_ke was offered (RFC 8446, 4.2.11)");
+        psk_len_ = hash_size(quic::hash_of(aead_of(cfg_.resume->suite)));
+        util::vesta_memcpy_noinline(psk_, cfg_.resume->psk, psk_len_);
+        resumed_ = true;
+    }
     if (!sh.ext.has_key_share)
         return fail(Alert::MissingExtension, "no key_share, and no PSK was offered (RFC 8446, 4.1.3)");
     size_t mine = share_count_;
@@ -799,7 +1012,8 @@ bool Session::on_encrypted_extensions(const uint8_t *m, size_t n) noexcept {
     if (!add(m, n)) return false;
     keep(msg_at, ee.ext.transport_parameters, peer_tp_);
     keep(msg_at, name, alpn_);
-    state_ = State::WaitCertificate;
+    // \~english Resumed: no certificate, straight to the Finished (4.4).  \~spanish Reanudado: sin certificado, directo al Finished (4.4).  \~
+    state_ = resumed_ ? State::WaitFinished : State::WaitCertificate;
     return true;
 }
 
@@ -887,7 +1101,9 @@ bool Session::on_finished(const uint8_t *m, size_t n) noexcept {
         complete_ = true;
         reading_ = Space::Application;
         state_ = State::Connected;
-        return true;
+        // \~english Tickets only once the client's Finished is in: they come from its transcript (4.6.1).
+        // \~spanish Tickets solo cuando esta el Finished del cliente: salen de su transcripcion (4.6.1).  \~
+        return issue_tickets();
     }
     if (!transcript_.hash(c_, hash_, th) || !schedule().application(th, ap_client_, ap_server_, exporter_))
         return fail_provider("the provider could not derive the application secrets");
@@ -929,7 +1145,95 @@ bool Session::on_new_session_ticket(const uint8_t *m, size_t n) noexcept {
     // \~spanish QUIC reutiliza max_early_data_size como marca: 0xffffffff o ausente (RFC 9001, 4.6.1).  \~
     if (nst.ext.has_early_data && nst.ext.max_early_data != 0xffffffffu)
         return fail_quic(kProtocolViolation, "a NewSessionTicket early_data other than 0xffffffff (RFC 9001, 4.6.1)");
-    ++tickets_;
+    // \~english A lifetime of zero: discarded at once (4.6.1).  \~spanish Una vida de cero: se tira en el acto (4.6.1).  \~
+    if (nst.lifetime == 0) return true;
+    // \~english Past what this end keeps: not kept, and counted -- never silently.
+    // \~spanish Pasado lo que guarda este extremo: no se guarda, y se cuenta -- nunca en silencio.  \~
+    if (nst.ticket.len > Ticket::kMaxIdentity || kept_count_ == kKeptTickets) {
+        ++tickets_dropped_;
+        return true;
+    }
+    if (kept_ == nullptr) {
+        const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed, util::AllocFill::All);
+        kept_ = static_cast<Ticket *>(util::host_alloc(kKeptTickets * sizeof(Ticket)));
+        if (kept_ == nullptr) return fail_provider("out of memory for session tickets");
+        for (size_t i = 0; i < kKeptTickets; ++i) new (&kept_[i]) Ticket();
+    }
+    Ticket &t = kept_[kept_count_];
+    t = Ticket{};
+    // \~english The PSK: HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce) (4.6.1).
+    // \~spanish La PSK: HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce) (4.6.1).  \~
+    if (!ticket_psk(c_, hash_, resumption_, m + nst.nonce.off, nst.nonce.len, t.psk))
+        return fail_provider("the provider could not derive a ticket's PSK");
+    util::vesta_memcpy_noinline(t.identity, m + nst.ticket.off, nst.ticket.len);
+    t.identity_len = nst.ticket.len;
+    t.suite = suite_;
+    t.age_add = nst.age_add;
+    t.lifetime_s = nst.lifetime;
+    t.received_us = clock_us_;
+    // \~english The host name and the protocol: resuming checks the first (4.6.1), 0-RTT the second.
+    // \~spanish El nombre y el protocolo: reanudar comprueba el primero (4.6.1), 0-RTT el segundo.  \~
+    size_t name_len = 0;
+    if (cfg_.server_name != nullptr)
+        while (cfg_.server_name[name_len] != '\0' && name_len < sizeof t.server_name) ++name_len;
+    util::vesta_memcpy_noinline(t.server_name, cfg_.server_name, name_len);
+    t.server_name_len = static_cast<uint8_t>(name_len);
+    size_t alpn_len = 0;
+    const uint8_t *alpn_name = alpn(alpn_len);
+    if (alpn_name != nullptr && alpn_len <= sizeof t.alpn) {
+        util::vesta_memcpy_noinline(t.alpn, alpn_name, alpn_len);
+        t.alpn_len = static_cast<uint8_t>(alpn_len);
+    }
+    ++kept_count_;
+    return true;
+}
+
+bool Session::issue_tickets() noexcept {
+    if (cfg_.tickets == nullptr || cfg_.ticket_lifetime_s == 0) return true;
+    const size_t hl = hash_size(hash_);
+    size_t alpn_len = 0;
+    const uint8_t *alpn_name = alpn(alpn_len);
+    for (size_t i = 0; i < cfg_.tickets_to_issue && i < 256; ++i) {
+        TicketContents t;
+        t.suite = suite_;
+        t.issued_ms = clock_us_ / 1000;
+        // \~english Never more than seven days (4.6.1).  \~spanish Nunca mas de siete dias (4.6.1).  \~
+        t.lifetime_s = cfg_.ticket_lifetime_s < kMaxTicketLifetime ? cfg_.ticket_lifetime_s : kMaxTicketLifetime;
+        // \~english A fresh ticket_age_add per ticket, and a nonce unique on this connection (4.6.1).
+        // \~spanish Un ticket_age_add nuevo por ticket, y un nonce unico en esta conexion (4.6.1).  \~
+        uint8_t add[4];
+        if (!c_.random(add, sizeof add)) return fail_provider("the provider gave no random bytes");
+        t.age_add = uint32_t{add[0]} << 24 | uint32_t{add[1]} << 16 | uint32_t{add[2]} << 8 | add[3];
+        const uint8_t nonce = static_cast<uint8_t>(i);
+        if (!ticket_psk(c_, hash_, resumption_, &nonce, 1, t.psk)) return fail_provider("the provider could not derive a ticket's PSK");
+        t.psk_len = static_cast<uint8_t>(hl);
+        if (alpn_name != nullptr && alpn_len <= sizeof t.alpn) {
+            util::vesta_memcpy_noinline(t.alpn, alpn_name, alpn_len);
+            t.alpn_len = static_cast<uint8_t>(alpn_len);
+        }
+        uint8_t sealed[TicketSealer::kMaxSealed];
+        const size_t n = cfg_.tickets->seal(t, sealed, sizeof sealed);
+        const uint32_t lifetime = t.lifetime_s;
+        const uint32_t age_add = t.age_add;
+        wipe(&t, sizeof t);
+        if (n == 0) return fail_provider("a ticket could not be sealed");
+
+        Writer w(nullptr, 0);
+        if (!begin(Space::Application, 32 + n, w)) return false;
+        const size_t msg = w.begin_message(Handshake::NewSessionTicket);
+        w.u32(lifetime);
+        w.u32(age_add);
+        w.u8(1);
+        w.u8(nonce);
+        const size_t ticket = w.open(2);
+        w.bytes(sealed, n);
+        w.close(ticket, 2);
+        w.u16(0);
+        w.end_message(msg);
+        // \~english After the handshake: not part of the transcript (4.4.1).  \~spanish Tras el saludo: no es parte de la transcripcion (4.4.1).  \~
+        if (!commit(Space::Application, w, false)) return false;
+        ++tickets_issued_;
+    }
     return true;
 }
 

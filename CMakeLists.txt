@@ -198,6 +198,7 @@ add_library(http_vx_tls STATIC
         tls/schedule.cpp
         tls/session.cpp
         tls/quic.cpp
+        tls/ticket.cpp
 )
 target_include_directories(http_vx_tls
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

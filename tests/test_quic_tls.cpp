@@ -77,6 +77,7 @@ const char *const kH3[] = {"h3"};
 const char *const kH2[] = {"h2"};
 const uint8_t kFakeCert[] = {'f', 'a', 'k', 'e', ' ', 'c', 'e', 'r', 't'};
 const uint8_t kHello[] = {'h', 'e', 'l', 'l', 'o', ',', ' ', 'q', 'u', 'i', 'c'};
+const uint8_t kTicketKey[16] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 1, 2, 3, 4, 5, 6, 7, 8};
 
 /// \~english What a run changes.  \~spanish Lo que cambia una corrida.  \~
 struct Options {
@@ -107,6 +108,11 @@ struct Options {
     /// \~english Once the client completed, the server adds bytes at Handshake that TLS will never read.
     /// \~spanish Cuando el cliente completo, el servidor anade en Handshake bytes que TLS no leera nunca.  \~
     bool junk_late = false;
+    /// \~english The server issues tickets; the client resumes with one.  \~spanish El servidor emite tickets; el cliente reanuda con uno.  \~
+    const http_vx::tls::TicketSealer *sealer = nullptr;
+    const http_vx::tls::Ticket *resume = nullptr;
+    /// \~english When the run starts: one clock across runs, as tickets need.  \~spanish Cuando empieza la corrida: un reloj entre corridas, como necesitan los tickets.  \~
+    uint64_t start_us = 0;
     uint64_t client_idle_us = 30000000;
     uint64_t server_idle_us = 20000000;
 };
@@ -124,6 +130,9 @@ struct Outcome {
     bool server_exists = false;
     bool retried = false;
     uint64_t peer_streams = 0;
+    bool resumed = false;
+    size_t tickets = 0;
+    http_vx::tls::Ticket ticket;
 };
 
 struct Datagram {
@@ -170,8 +179,9 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     ccfg.alpn = o.alpn_mismatch ? kH2 : kH3;
     ccfg.alpn_count = 1;
     ccfg.server_name = "example.com";
+    ccfg.resume = o.resume;
     QuicHandshake ch(client_crypto, client, ccfg);
-    check(ch.start(0), "the client's handshake did not start");
+    check(ch.start(o.start_us), "the client's handshake did not start");
 
     std::vector<uint8_t> filler(o.filler_certificate, 0x5a);
     const uint8_t *certs[2] = {cert, filler.data()};
@@ -185,6 +195,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     scfg.certificate_count = filler.empty() ? 1 : 2;
     scfg.signing_key = key;
     scfg.scheme = scheme;
+    scfg.tickets = o.sealer;
 
     AcceptorConfig ac;
     ac.require_retry = o.retry;
@@ -196,7 +207,7 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
 
     std::vector<Datagram> air;
     unsigned sent_each[2] = {0, 0};
-    uint64_t now = 0;
+    uint64_t now = o.start_us;
     bool opened = false;
     uint64_t stream_id = 0;
     std::vector<uint8_t> back;
@@ -328,6 +339,9 @@ Outcome run(Crypto &client_crypto, Crypto &server_crypto, const uint8_t *cert, s
     out.client_closed_by_peer = client.closed_by_peer();
     out.retried = client.retried();
     out.peer_streams = client.streams().peer_limit(true);
+    out.resumed = ch.session().resumed();
+    out.tickets = ch.session().tickets();
+    ch.take_ticket(out.ticket);
     if (srv) {
         out.server_exists = true;
         out.server_confirmed = srv->is_handshake_confirmed();
@@ -359,7 +373,24 @@ void run_good(Crypto &cc, Crypto &sc, const uint8_t *cert, size_t cert_len, void
         check(r.echoed, "the hello came back: the transport parameters were applied");
         check(r.retried == o.retry, "the Retry was taken when asked");
         check(r.peer_streams != 0, "the server's stream limit came with its parameters");
+        check(!r.resumed, "no ticket, no resumption");
     }
+
+    // \~english Tickets travel in 1-RTT CRYPTO frames (RFC 9001, 4.5); the next connection resumes.
+    // \~spanish Los tickets viajan en tramas CRYPTO de 1-RTT (RFC 9001, 4.5); la siguiente conexion reanuda.  \~
+    std::snprintf(current, sizeof current, "%s: resumption", name);
+    const http_vx::tls::TicketSealer sealer(sc, kTicketKey);
+    Options first;
+    first.sealer = &sealer;
+    const Outcome a = run(cc, sc, cert, cert_len, key, scheme, first);
+    check(a.echoed && a.tickets >= 1 && a.ticket.identity_len != 0, "the first connection leaves a ticket");
+    Options second;
+    second.sealer = &sealer;
+    second.resume = &a.ticket;
+    second.retry = true;
+    second.start_us = 10000000;
+    const Outcome b = run(cc, sc, cert, cert_len, key, scheme, second);
+    check(b.echoed && b.resumed, "the second resumes, through a Retry, and says hello");
 }
 
 /// \~english What must fail, with the fake provider.  \~spanish Lo que debe fallar, con el proveedor falso.  \~

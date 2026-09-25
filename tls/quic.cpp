@@ -52,6 +52,9 @@ bool QuicHandshake::fail(uint64_t code, const char *why, uint64_t now_us) noexce
 bool QuicHandshake::start(uint64_t now_us) noexcept {
     if (tp_len_ == 0) return fail(kCryptoError + static_cast<uint8_t>(Alert::InternalError),
                                   "this end's transport parameters do not fit", now_us);
+    // \~english The connection's clock is the session's: ticket ages are measured on it.
+    // \~spanish El reloj de la conexion es el de la sesion: las edades de los tickets se miden con el.  \~
+    session_.set_clock(now_us);
     if (!session_.start()) return fail(session_.failure().code, session_.failure().why, now_us);
     return step(now_us);
 }
@@ -120,6 +123,7 @@ bool QuicHandshake::install(Space s, bool &done, uint64_t now_us) noexcept {
 bool QuicHandshake::step(uint64_t now_us) noexcept {
     if (failed_) return false;
     if (conn_.state() != quic::ConnState::Active) return false;
+    session_.set_clock(now_us);
     if (!feed(now_us)) return false;
     drain();
     if (!install(Space::Handshake, handshake_installed_, now_us) ||

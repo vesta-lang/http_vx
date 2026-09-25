@@ -232,9 +232,15 @@ void check_agreed(const Session &c, const Session &s, const uint8_t *cert, size_
     p = s.server_name(len);
     check(is_text(p, len, "example.com"), "server has the host name");
     const uint8_t *leaf = nullptr;
-    check(c.peer_certificate(0, leaf, len) && len == cert_len && std::memcmp(leaf, cert, len) == 0,
-          "client has the server's certificate");
-    check(!c.peer_certificate(1, leaf, len), "and only one");
+    if (cert == nullptr) {
+        // \~english Resumed: a PSK instead of a certificate (4.4).  \~spanish Reanudado: una PSK en lugar de un certificado (4.4).  \~
+        check(!c.peer_certificate(0, leaf, len) && c.resumed() && s.resumed(), "resumed, with no certificate");
+    } else {
+        check(c.peer_certificate(0, leaf, len) && len == cert_len && std::memcmp(leaf, cert, len) == 0,
+              "client has the server's certificate");
+        check(!c.peer_certificate(1, leaf, len), "and only one");
+        check(!c.resumed() && !s.resumed(), "a full handshake");
+    }
     size_t left = 0;
     for (size_t l = 0; l < 3; ++l) {
         size_t k = 0;
@@ -271,6 +277,7 @@ struct ShSpec {
     uint16_t group = group::X25519;
     uint8_t key_fill = 0x11;
     bool psk = false;
+    uint16_t psk_selected = 0;
     bool cookie = false;
 };
 
@@ -299,7 +306,7 @@ size_t server_hello(const ShSpec &sp, uint8_t *out, size_t room) {
             write_key_share_server(w, sp.group, key, sp.group == group::X25519 ? 32 : 65);
         }
     }
-    if (sp.psk) write_psk_server(w, 0);
+    if (sp.psk) write_psk_server(w, sp.psk_selected);
     if (sp.cookie) {
         const uint8_t cookie[] = {0xc0, 0x0c, 0x1e};
         write_cookie(w, cookie, sizeof cookie);
@@ -330,6 +337,11 @@ struct ChSpec {
     bool tp = true;
     bool early_data = false;
     uint8_t random_fill = 0x33;
+    /// \~english A pre_shared_key with this identity, a junk binder and these modes.
+    /// \~spanish Un pre_shared_key con esta identidad, un binder cualquiera y estos modos.  \~
+    const uint8_t *psk_identity = nullptr;
+    size_t psk_identity_len = 0;
+    uint8_t psk_mode = 1;
 };
 
 size_t client_hello(const ChSpec &sp, uint8_t *out, size_t room) {
@@ -362,6 +374,22 @@ size_t client_hello(const ChSpec &sp, uint8_t *out, size_t room) {
     }
     if (sp.early_data) write_empty_extension(w, ext::EarlyData);
     if (sp.tp) write_transport_parameters(w, kClientTp, sizeof kClientTp);
+    if (sp.psk_identity != nullptr) {
+        write_psk_modes(w, &sp.psk_mode, 1);
+        const size_t e = w.begin_extension(ext::PreSharedKey);
+        const size_t ids = w.open(2);
+        const size_t id = w.open(2);
+        w.bytes(sp.psk_identity, sp.psk_identity_len);
+        w.close(id, 2);
+        w.u32(1234);
+        w.close(ids, 2);
+        const size_t list = w.open(2);
+        const size_t b = w.open(1);
+        for (int i = 0; i < 32; ++i) w.u8(0x77);
+        w.close(b, 1);
+        w.close(list, 2);
+        w.close(e, 2);
+    }
     w.close(exts, 2);
     w.end_message(msg);
     return w.failed() ? 0 : w.size();
@@ -1283,6 +1311,654 @@ void test_client_certificate() {
     }
 }
 
+const uint8_t kTicketKey[TicketSealer::kKeySize] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+const uint8_t kOtherKey[TicketSealer::kKeySize] = {16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+constexpr uint64_t kSecond = 1000000;
+constexpr uint64_t kStart = 1000 * kSecond;
+
+/**
+ * @brief
+ * \~english A full handshake at @p at whose server issues tickets; the client's first one lands in @p out.
+ * \~spanish Un saludo completo en @p at cuyo servidor emite tickets; el primero del cliente acaba en @p out.
+ * \~
+ */
+bool first_connection(Crypto &cc, Crypto &sc, Ends &e, const TicketSealer &sealer, uint64_t at, Ticket &out) {
+    SessionConfig server = e.server;
+    server.tickets = &sealer;
+    Session client(cc, e.client);
+    Session srv(sc, server);
+    client.set_clock(at);
+    srv.set_clock(at);
+    client.start();
+    pump(client, srv);
+    expect_ok(client, "the first connection's client");
+    expect_ok(srv, "the first connection's server");
+    check(srv.tickets_issued() == 2 && client.tickets() == 2, "two tickets issued and kept (C.4)");
+    return client.take_ticket(out);
+}
+
+/// \~english A second connection resuming with @p t; what it ended as is left in the sessions.
+/// \~spanish Una segunda conexion que reanuda con @p t; como acabo queda en las sesiones.  \~
+void resume(Session &client, Session &server, uint64_t at) {
+    client.set_clock(at);
+    server.set_clock(at);
+    client.start();
+    pump(client, server);
+}
+
+/// \~english A server configuration with tickets from @p sealer.  \~spanish Una configuracion de servidor con tickets de @p sealer.  \~
+SessionConfig with_tickets(SessionConfig k, const TicketSealer *sealer) {
+    k.tickets = sealer;
+    return k;
+}
+
+/// \~english A client configuration that resumes with @p t.  \~spanish Una configuracion de cliente que reanuda con @p t.  \~
+SessionConfig resuming(SessionConfig k, const Ticket *t) {
+    k.resume = t;
+    return k;
+}
+
+/// \~english Whether the ClientHello waiting in @p client offers a PSK.  \~spanish Si el ClientHello que espera en @p client ofrece una PSK.  \~
+bool offers_psk(const Session &client) {
+    size_t n = 0;
+    const uint8_t *p = client.output(Space::Initial, n);
+    ClientHello ch;
+    return p != nullptr && parse_client_hello(p, n, ch).ok() && ch.ext.has_pre_shared_key;
+}
+
+/// \~english Resumption with the fake provider: what works, and what falls back or fails.
+/// \~spanish Reanudacion con el proveedor falso: lo que funciona, y lo que vuelve atras o falla.  \~
+void test_resumption() {
+    test_support::FakeCrypto c;
+    const TicketSealer sealer(c, kTicketKey);
+    check(sealer.ready(), "the sealer is ready");
+
+    section("resume: tickets");
+    {
+        FakeEnds e(c);
+        SessionConfig server = e.server;
+        server.tickets = &sealer;
+        Session client(c, e.client);
+        Session srv(c, server);
+        client.set_clock(kStart);
+        srv.set_clock(kStart);
+        client.start();
+        pump(client, srv);
+        Ticket a;
+        Ticket b;
+        check(client.take_ticket(a) && client.take_ticket(b) && !client.take_ticket(b), "two tickets, taken once each");
+        check(a.identity_len != 0 && a.lifetime_s == 86400 && a.received_us == kStart && a.suite == suite::Aes128GcmSha256,
+              "the first carries what the server said");
+        check(a.server_name_len == 11 && std::memcmp(a.server_name, "example.com", 11) == 0 && a.alpn_len == 2 &&
+                  std::memcmp(a.alpn, "h3", 2) == 0,
+              "and the host name and protocol it came with");
+        check(std::memcmp(a.psk, b.psk, 32) != 0 && (a.identity_len != b.identity_len ||
+                                                     std::memcmp(a.identity, b.identity, a.identity_len) != 0),
+              "two tickets, two PSKs, two identities (4.6.1)");
+        check(a.age_add != b.age_add, "a fresh ticket_age_add each (4.6.1)");
+    }
+
+    section("resume: resumed");
+    {
+        FakeEnds e(c);
+        Ticket t;
+        check(first_connection(c, c, e, sealer, kStart, t), "a ticket from the first connection");
+        Session client(c, resuming(e.client, &t));
+        Session server(c, with_tickets(e.server, &sealer));
+        resume(client, server, kStart + 5 * kSecond);
+        check_agreed(client, server, nullptr, 0);
+        check(client.tickets() == 2, "and new tickets for the next time (C.4)");
+    }
+    {
+        section("resume: through a retry");
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        const Group p256 = Group::Secp256r1;
+        SessionConfig server = with_tickets(e.server, &sealer);
+        server.groups = &p256;
+        server.group_count = 1;
+        Session client(c, resuming(e.client, &t));
+        Session srv(c, server);
+        resume(client, srv, kStart + kSecond);
+        check_agreed(client, srv, nullptr, 0);
+        check(client.retried() && srv.retried(), "resumed after a HelloRetryRequest");
+    }
+    {
+        section("resume: request refused on a PSK");
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        SessionConfig server = with_tickets(e.server, &sealer);
+        server.request_certificate = true;
+        Session client(c, resuming(e.client, &t));
+        Session srv(c, server);
+        resume(client, srv, kStart + kSecond);
+        check_agreed(client, srv, nullptr, 0);
+    }
+
+    section("resume: falls back");
+    {
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        t.identity[t.identity_len - 1] ^= 1;
+        Session client(c, resuming(e.client, &t));
+        Session server(c, with_tickets(e.server, &sealer));
+        resume(client, server, kStart + kSecond);
+        check_agreed(client, server, kFakeCert, sizeof kFakeCert);
+    }
+    {
+        // \~english The client thinks it lives a week; the server knows it was a day (4.6.1).
+        // \~spanish El cliente cree que vive una semana; el servidor sabe que era un dia (4.6.1).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        t.lifetime_s = kMaxTicketLifetime;
+        Session client(c, resuming(e.client, &t));
+        Session server(c, with_tickets(e.server, &sealer));
+        client.set_clock(kStart + 2 * 86400 * kSecond);
+        client.start();
+        check(offers_psk(client), "the client still offers it");
+        server.set_clock(kStart + 2 * 86400 * kSecond);
+        pump(client, server);
+        check_agreed(client, server, kFakeCert, sizeof kFakeCert);
+    }
+    {
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        Session late(c, resuming(e.client, &t));
+        late.set_clock(kStart + 86400 * kSecond);
+        late.start();
+        check(!offers_psk(late), "a ticket past its lifetime is not offered (4.2.11.1)");
+        Session early(c, resuming(e.client, &t));
+        early.set_clock(kStart - kSecond);
+        early.start();
+        check(!offers_psk(early), "nor one from the future");
+        SessionConfig elsewhere = resuming(e.client, &t);
+        elsewhere.server_name = "example.org";
+        Session other_host(c, elsewhere);
+        other_host.set_clock(kStart + kSecond);
+        other_host.start();
+        check(!offers_psk(other_host), "nor one for another host name (4.6.1)");
+        const Aead aes256 = Aead::Aes256Gcm;
+        SessionConfig no_suite = resuming(e.client, &t);
+        no_suite.suites = &aes256;
+        no_suite.suite_count = 1;
+        Session other_hash(c, no_suite);
+        other_hash.set_clock(kStart + kSecond);
+        other_hash.start();
+        check(!offers_psk(other_hash), "nor one whose hash no offered suite has (4.6.1)");
+        Session fine(c, resuming(e.client, &t));
+        fine.set_clock(kStart + kSecond);
+        fine.start();
+        check(offers_psk(fine), "the control: offered when it fits");
+    }
+
+    section("resume: refused");
+    {
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        t.psk[0] ^= 1;
+        Session client(c, resuming(e.client, &t));
+        Session server(c, with_tickets(e.server, &sealer));
+        resume(client, server, kStart + kSecond);
+        expect(server, kDecryptError, "a binder made with another PSK (4.2.11.2)");
+    }
+    {
+        // \~english A real ticket with a junk binder: psk_dhe_ke checks it, psk_ke alone is not taken (4.2.9).
+        // \~spanish Un ticket de verdad con un binder cualquiera: psk_dhe_ke lo comprueba, psk_ke solo no se toma (4.2.9).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        for (uint8_t mode = 0; mode < 2; ++mode) {
+            ChSpec sp;
+            sp.psk_identity = t.identity;
+            sp.psk_identity_len = t.identity_len;
+            sp.psk_mode = mode;
+            Session server(c, with_tickets(e.server, &sealer));
+            server.set_clock(kStart + kSecond);
+            uint8_t m[2048];
+            const size_t n = client_hello(sp, m, sizeof m);
+            server.receive(Space::Initial, m, n);
+            if (mode == 0) {
+                expect_ok(server, "psk_ke alone: a full handshake instead");
+                check(!server.resumed(), "not resumed");
+            } else {
+                expect(server, kDecryptError, "psk_dhe_ke with a junk binder (4.2.11)");
+            }
+        }
+    }
+
+    section("resume: client rules");
+    {
+        Ticket t;
+        const uint8_t id[] = {'i', 'd'};
+        std::memcpy(t.identity, id, sizeof id);
+        t.identity_len = sizeof id;
+        t.suite = suite::Aes128GcmSha256;
+        t.lifetime_s = 3600;
+        std::memcpy(t.server_name, "example.com", 11);
+        t.server_name_len = 11;
+        ShSpec specs[4];
+        for (ShSpec &s : specs) s.psk = true;
+        specs[0].psk_selected = 1;
+        specs[1].suite = suite::Aes256GcmSha384;
+        specs[2].key_share = false;
+        const uint64_t want[4] = {kIllegal, kIllegal, kIllegal, 0};
+        const char *what[4] = {"a selected_identity out of range (4.2.11)", "a suite of another hash (4.2.11)",
+                               "no key_share with psk_dhe_ke (4.2.11)", "a PSK accepted as offered"};
+        for (size_t i = 0; i < 4; ++i) {
+            FakeEnds e(c);
+            Session client(c, resuming(e.client, &t));
+            client.set_clock(kSecond);
+            client.start();
+            check(offers_psk(client), "offered");
+            uint8_t m[512];
+            const size_t n = server_hello(specs[i], m, sizeof m);
+            client.receive(Space::Initial, m, n);
+            if (want[i] == 0) {
+                expect_ok(client, what[i]);
+                check(client.resumed(), "resumed");
+            } else {
+                expect(client, want[i], what[i]);
+            }
+        }
+        // \~english After the PSK a certificate is out of place (4.4).  \~spanish Tras la PSK un certificado esta fuera de lugar (4.4).  \~
+        FakeEnds e(c);
+        Session client(c, resuming(e.client, &t));
+        client.set_clock(kSecond);
+        client.start();
+        ShSpec ok;
+        ok.psk = true;
+        uint8_t m[512];
+        size_t n = server_hello(ok, m, sizeof m);
+        client.receive(Space::Initial, m, n);
+        n = encrypted_extensions(EeSpec{}, m, sizeof m);
+        client.receive(Space::Handshake, m, n);
+        const uint8_t cert[] = {11, 0, 0, 9, 0, 0, 0, 5, 0, 0, 1, 'x', 0, 0};
+        client.receive(Space::Handshake, cert, 4 + 9);
+        expect(client, kUnexpected, "a Certificate in a resumed handshake (4.4)");
+    }
+
+    section("resume: tickets kept");
+    {
+        FakeEnds e(c);
+        Session client(c, e.client);
+        Session server(c, e.server);
+        client.start();
+        pump(client, server);
+        uint8_t m[64];
+        for (int i = 0; i < 6; ++i) {
+            Writer w(m, sizeof m);
+            const size_t msg = w.begin_message(Handshake::NewSessionTicket);
+            w.u32(i == 0 ? 0 : 3600);  // \~english the first: lifetime zero  \~spanish el primero: vida cero  \~
+            w.u32(7);
+            w.u8(1);
+            w.u8(static_cast<uint8_t>(i));
+            w.u16(3);
+            w.u8(0x61);
+            w.u8(0x62);
+            w.u8(static_cast<uint8_t>(i));
+            w.u16(0);
+            w.end_message(msg);
+            client.receive(Space::Application, m, w.size());
+        }
+        expect_ok(client, "six tickets");
+        check(client.tickets() == 4 && client.tickets_dropped() == 1,
+              "one of lifetime zero thrown away (4.6.1), four kept, one more counted as dropped");
+        Ticket t;
+        check(client.take_ticket(t) && t.identity_len == 3 && t.identity[2] == 1, "the oldest kept comes out first");
+    }
+}
+
+/**
+ * @brief
+ * \~english Gives the binder at the end of a ClientHello one byte more, fixing every length around it.
+ * \~spanish Da al binder del final de un ClientHello un byte mas, arreglando cada longitud a su alrededor.
+ * \~
+ *
+ * \~english
+ * pre_shared_key is last (4.2.11) and the binder last in it, so every
+ * enclosing length runs to the end of the message: each grows by one.  The
+ * binder is over the ClientHello up to the binders (4.2.11.2), so its value
+ * is still right -- only its length is not.
+ * \~spanish
+ * pre_shared_key va la ultima (4.2.11) y el binder el ultimo dentro, asi que
+ * cada longitud que lo contiene llega hasta el final del mensaje: cada una
+ * crece en uno.  El binder es sobre el ClientHello hasta los binders (4.2.11.2),
+ * asi que su valor sigue siendo correcto -- solo su longitud no.
+ * \~
+ */
+size_t lengthen_binder(uint8_t *m, size_t n) {
+    ClientHello ch;
+    parse_client_hello(m, n, ch);
+    size_t p = 4 + 2 + 32;
+    p += 1 + m[p];
+    p += 2 + read16(m + p);
+    p += 1 + m[p];
+    const size_t ext_block = p;
+    // \~english The extension's length field: before the identities' own length.
+    // \~spanish El campo de longitud de la extension: antes de la longitud de las identidades.  \~
+    const size_t psk_ext = ch.ext.psk_identities.off - 4;
+    const size_t list = ch.ext.psk_binders_at;
+    const size_t entry = ch.ext.psk_binders.off;
+    const uint32_t body = uint32_t{m[1]} << 16 | uint32_t{m[2]} << 8 | m[3];
+    m[1] = static_cast<uint8_t>((body + 1) >> 16);
+    m[2] = static_cast<uint8_t>((body + 1) >> 8);
+    m[3] = static_cast<uint8_t>(body + 1);
+    const size_t fields[3] = {ext_block, psk_ext, list};
+    for (size_t f : fields) {
+        const uint16_t v = static_cast<uint16_t>(read16(m + f) + 1);
+        m[f] = static_cast<uint8_t>(v >> 8);
+        m[f + 1] = static_cast<uint8_t>(v);
+    }
+    m[entry] = static_cast<uint8_t>(m[entry] + 1);
+    m[n] = 0x99;
+    return n + 1;
+}
+
+/// \~english The edges of resumption: each check the tests above do not reach.
+/// \~spanish Los bordes de la reanudacion: cada comprobacion a la que no llegan las pruebas de arriba.  \~
+void test_resumption_edges() {
+    test_support::FakeCrypto c;
+    const TicketSealer sealer(c, kTicketKey);
+    section("resume: edges");
+    {
+        // \~english The right binder with one byte more: the length is Hash.length (4.2.11.2).
+        // \~spanish El binder correcto con un byte mas: la longitud es Hash.length (4.2.11.2).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        Session client(c, resuming(e.client, &t));
+        client.set_clock(kStart + kSecond);
+        client.start();
+        size_t n = 0;
+        const uint8_t *p = client.output(Space::Initial, n);
+        uint8_t m[4096];
+        std::memcpy(m, p, n);
+        const size_t longer = lengthen_binder(m, n);
+        ClientHello ch;
+        check(parse_client_hello(m, longer, ch).ok(), "the lengthened ClientHello still parses");
+        Session server(c, with_tickets(e.server, &sealer));
+        server.set_clock(kStart + kSecond);
+        server.receive(Space::Initial, m, longer);
+        expect(server, kDecryptError, "a binder longer than the hash (4.2.11.2)");
+        // \~english Refused for its length: the value could not match anyway, the lengths are in what it covers.
+        // \~spanish Rechazado por su longitud: el valor no podria casar igualmente, las longitudes estan en lo que cubre.  \~
+        expect_why(server, "wrong length", "and it says the length is wrong");
+
+        // \~english The obfuscated age: milliseconds since it arrived, plus ticket_age_add (4.2.11.1).
+        // \~spanish La edad ofuscada: milisegundos desde que llego, mas ticket_age_add (4.2.11.1).  \~
+        const uint8_t *id = p + ch.ext.psk_identities.off;
+        const size_t id_len = read16(id);
+        const uint8_t *age = id + 2 + id_len;
+        const uint32_t got = uint32_t{age[0]} << 24 | uint32_t{age[1]} << 16 | uint32_t{age[2]} << 8 | age[3];
+        check(got == static_cast<uint32_t>(1000 + t.age_add), "obfuscated_ticket_age is the age plus ticket_age_add");
+    }
+    {
+        // \~english A ticket issued after the server's now: not alive (4.6.1).
+        // \~spanish Un ticket emitido despues del ahora del servidor: no esta vivo (4.6.1).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        Session client(c, resuming(e.client, &t));
+        Session server(c, with_tickets(e.server, &sealer));
+        client.set_clock(kStart + kSecond);
+        server.set_clock(kStart - 10 * kSecond);
+        client.start();
+        pump(client, server);
+        check_agreed(client, server, kFakeCert, sizeof kFakeCert);
+    }
+    {
+        // \~english The ticket's suite not offered: not resumed, and no suite forced on the client (4.2.11).
+        // \~spanish El algoritmo del ticket no ofrecido: no se reanuda, y no se impone al cliente ningun algoritmo (4.2.11).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        ChSpec sp;
+        sp.suites[0] = suite::ChaCha20Poly1305Sha256;
+        sp.psk_identity = t.identity;
+        sp.psk_identity_len = t.identity_len;
+        Session server(c, with_tickets(e.server, &sealer));
+        server.set_clock(kStart + kSecond);
+        uint8_t m[2048];
+        const size_t n = client_hello(sp, m, sizeof m);
+        server.receive(Space::Initial, m, n);
+        expect_ok(server, "a full handshake with the suite offered");
+        size_t len = 0;
+        const uint8_t *out = server.output(Space::Initial, len);
+        ServerHello sh;
+        check(out != nullptr && parse_server_hello(out, len, sh).ok() &&
+                  sh.cipher_suite == suite::ChaCha20Poly1305Sha256 && !sh.ext.has_pre_shared_key,
+              "ChaCha20, the only one offered, and no PSK");
+    }
+    {
+        // \~english A retry to a suite of another hash: the second ClientHello drops the PSK (4.1.4).
+        // \~spanish Un reintento a un algoritmo de otro resumen: el segundo ClientHello quita la PSK (4.1.4).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        const Aead aes256 = Aead::Aes256Gcm;
+        const Group p256 = Group::Secp256r1;
+        SessionConfig sc = with_tickets(e.server, &sealer);
+        sc.suites = &aes256;
+        sc.suite_count = 1;
+        sc.groups = &p256;
+        sc.group_count = 1;
+        Session client(c, resuming(e.client, &t));
+        Session server(c, sc);
+        client.set_clock(kStart + kSecond);
+        server.set_clock(kStart + kSecond);
+        client.start();
+        check(offers_psk(client), "the first ClientHello offers it");
+        size_t n = 0;
+        const uint8_t *p = client.output(Space::Initial, n);
+        server.receive(Space::Initial, p, n);
+        client.sent(Space::Initial, n);
+        p = server.output(Space::Initial, n);
+        client.receive(Space::Initial, p, n);
+        server.sent(Space::Initial, n);
+        check(client.retried() && !offers_psk(client), "the second does not: SHA-384 now");
+        pump(client, server);
+        check_agreed(client, server, kFakeCert, sizeof kFakeCert);
+    }
+    {
+        // \~english The binder after a retry, computed here from the messages that went by (4.2.11.2).
+        // \~spanish El binder tras un reintento, calculado aqui con los mensajes que pasaron (4.2.11.2).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        const Group p256 = Group::Secp256r1;
+        SessionConfig sc = with_tickets(e.server, &sealer);
+        sc.groups = &p256;
+        sc.group_count = 1;
+        Session client(c, resuming(e.client, &t));
+        Session server(c, sc);
+        client.set_clock(kStart + kSecond);
+        server.set_clock(kStart + kSecond);
+        client.start();
+        uint8_t ch1[2048];
+        size_t n1 = 0;
+        const uint8_t *p = client.output(Space::Initial, n1);
+        std::memcpy(ch1, p, n1);
+        server.receive(Space::Initial, ch1, n1);
+        client.sent(Space::Initial, n1);
+        uint8_t hrr[512];
+        size_t nh = 0;
+        p = server.output(Space::Initial, nh);
+        std::memcpy(hrr, p, nh);
+        server.sent(Space::Initial, nh);
+        client.receive(Space::Initial, hrr, nh);
+        size_t n2 = 0;
+        const uint8_t *ch2 = client.output(Space::Initial, n2);
+        ClientHello second;
+        check(ch2 != nullptr && parse_client_hello(ch2, n2, second).ok() && second.ext.has_pre_shared_key,
+              "the second ClientHello offers the PSK");
+        // \~english message_hash(ClientHello1) || HelloRetryRequest || Truncate(ClientHello2) (4.2.11.2, 4.4.1).
+        // \~spanish message_hash(ClientHello1) || HelloRetryRequest || Truncate(ClientHello2) (4.2.11.2, 4.4.1).  \~
+        uint8_t all[4096];
+        size_t k = 0;
+        all[k++] = 254;
+        all[k++] = 0;
+        all[k++] = 0;
+        all[k++] = 32;
+        c.digest(Hash::Sha256, ch1, n1, all + k);
+        k += 32;
+        std::memcpy(all + k, hrr, nh);
+        k += nh;
+        std::memcpy(all + k, ch2, second.ext.psk_binders_at);
+        k += second.ext.psk_binders_at;
+        uint8_t th[32];
+        uint8_t key[32];
+        uint8_t want[32];
+        KeySchedule ks(c, Hash::Sha256);
+        check(ks.start(t.psk, 32) && ks.binder_key(true, key) && c.digest(Hash::Sha256, all, k, th) &&
+                  finished_data(c, Hash::Sha256, key, th, want),
+              "the binder computed here");
+        check(ch2[second.ext.psk_binders.off] == 32 &&
+                  std::memcmp(ch2 + second.ext.psk_binders.off + 1, want, 32) == 0,
+              "is the one the client sent");
+        pump(client, server);
+        check_agreed(client, server, nullptr, 0);
+    }
+    {
+        // \~english A second ClientHello bringing a PSK of another hash than the retry's suite: not taken (4.2.11).
+        // \~spanish Un segundo ClientHello que trae una PSK de otro resumen que el del algoritmo del reintento: no se toma (4.2.11).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        Session server(c, with_tickets(e.server, &sealer));
+        server.set_clock(kStart + kSecond);
+        ChSpec first;
+        first.suites[0] = suite::Aes256GcmSha384;
+        first.share_count = 0;
+        uint8_t m[2048];
+        size_t n = client_hello(first, m, sizeof m);
+        server.receive(Space::Initial, m, n);
+        server.output(Space::Initial, n);
+        server.sent(Space::Initial, n);
+        ChSpec second;
+        second.suites[0] = suite::Aes256GcmSha384;
+        second.psk_identity = t.identity;
+        second.psk_identity_len = t.identity_len;
+        n = client_hello(second, m, sizeof m);
+        server.receive(Space::Initial, m, n);
+        expect_ok(server, "a full handshake instead");
+        check(!server.resumed() && server.retried(), "not resumed");
+    }
+    {
+        // \~english A lifetime of ten days is issued as seven (4.6.1).  \~spanish Una vida de diez dias se emite como siete (4.6.1).  \~
+        FakeEnds e(c);
+        SessionConfig sc = with_tickets(e.server, &sealer);
+        sc.ticket_lifetime_s = 10 * 86400;
+        Session client(c, e.client);
+        Session server(c, sc);
+        client.start();
+        pump(client, server);
+        Ticket t;
+        check(client.take_ticket(t) && t.lifetime_s == kMaxTicketLifetime, "capped at 604800 seconds");
+    }
+    {
+        // \~english Resumed, the certificate's scheme is not asked for: there is no certificate (4.4).
+        // \~spanish Al reanudar no se pide el esquema del certificado: no hay certificado (4.4).  \~
+        FakeEnds e(c);
+        Ticket t;
+        first_connection(c, c, e, sealer, kStart, t);
+        SessionConfig sc = with_tickets(e.server, &sealer);
+        sc.scheme = static_cast<Scheme>(scheme::Ed25519);
+        Session client(c, resuming(e.client, &t));
+        Session server(c, sc);
+        resume(client, server, kStart + kSecond);
+        check_agreed(client, server, nullptr, 0);
+    }
+}
+
+/**
+ * @brief
+ * \~english The sealer on its own: what it seals opens, and nothing else does.
+ * \~spanish El sellador por si solo: lo que sella se abre, y nada mas.
+ * \~
+ *
+ * @param keyed \~english the provider's AEAD depends on its key: the fake one's does not
+ *              \~spanish el AEAD del proveedor depende de su clave: el del falso no  \~
+ */
+void test_sealer(Crypto &c, bool keyed, const char *name) {
+    char label[48];
+    std::snprintf(label, sizeof label, "%s: sealer", name);
+    section(label);
+    const TicketSealer sealer(c, kTicketKey);
+    const TicketSealer other(c, kOtherKey);
+    TicketContents t;
+    t.suite = suite::Aes256GcmSha384;
+    t.issued_ms = 0x0102030405060708ull;
+    t.lifetime_s = 3600;
+    t.age_add = 0xdeadbeef;
+    t.psk_len = 48;
+    for (int i = 0; i < 48; ++i) t.psk[i] = static_cast<uint8_t>(i);
+    t.alpn_len = 2;
+    t.alpn[0] = 'h';
+    t.alpn[1] = '3';
+    uint8_t sealed[TicketSealer::kMaxSealed];
+    const size_t n = sealer.seal(t, sealed, sizeof sealed);
+    TicketContents back;
+    check(n != 0 && sealer.open(sealed, n, back), "what is sealed opens");
+    check(back.suite == t.suite && back.issued_ms == t.issued_ms && back.lifetime_s == 3600 &&
+              back.age_add == 0xdeadbeef && back.psk_len == 48 && std::memcmp(back.psk, t.psk, 48) == 0 &&
+              back.alpn_len == 2 && back.alpn[1] == '3',
+          "and gives back every field");
+    uint8_t again[TicketSealer::kMaxSealed];
+    const size_t m = sealer.seal(t, again, sizeof again);
+    check(m == n && std::memcmp(again, sealed, n) != 0, "two seals of the same contents differ: a fresh nonce");
+    if (keyed) check(!other.open(sealed, n, back), "another key does not open it");
+    for (size_t i = 0; i < n; i += 7) {
+        sealed[i] ^= 0x10;
+        check(!sealer.open(sealed, n, back), "a changed byte does not open");
+        sealed[i] ^= 0x10;
+    }
+    check(!sealer.open(sealed, n - 1, back) && !sealer.open(sealed, 20, back), "a short one does not open");
+    check(sealer.seal(t, sealed, n - 1) == 0, "sealing into too little room says so");
+
+    /* \~english
+     * Contents sealed properly but laid out wrong must not open either: a
+     * future layout, or bytes past the end.  Sealed here by hand, the same
+     * way the sealer does -- the control opens, so the layout is right.
+     * \~spanish
+     * Un contenido bien sellado pero mal dispuesto tampoco debe abrirse: una
+     * forma futura, o bytes pasado el final.  Sellado aqui a mano, igual que lo
+     * hace el sellador -- el control se abre, asi que la forma es la correcta.
+     * \~ */
+    const uint8_t aad[] = {'h', 't', 't', 'p', '_', 'v', 'x', ' ', 't', 'i', 'c', 'k', 'e', 't'};
+    void *aead = c.prepare_aead(Aead::Aes128Gcm, kTicketKey);
+    // \~english layout 1, suite, issued, lifetime 60, age_add, a 32-byte PSK, "h3"
+    // \~spanish forma 1, algoritmo, emision, vida 60, age_add, una PSK de 32 bytes, "h3"  \~
+    uint8_t plain[128] = {1, 0x13, 0x01, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 60, 0, 0, 0, 9, 32};
+    size_t len = 20 + 32;
+    plain[len++] = 2;
+    plain[len++] = 'h';
+    plain[len++] = '3';
+    const size_t variants = 3;
+    for (size_t v = 0; v < variants; ++v) {
+        uint8_t p[128];
+        std::memcpy(p, plain, len);
+        size_t l = len;
+        if (v == 1) p[0] = 2;       // \~english a layout this code does not know  \~spanish una forma que este codigo no conoce  \~
+        if (v == 2) p[l++] = 0xee;  // \~english one byte past the protocol  \~spanish un byte pasado el protocolo  \~
+        uint8_t box[160] = {};
+        for (int i = 0; i < 12; ++i) box[i] = static_cast<uint8_t>(0xa0 + i + v);
+        c.seal(aead, box, aad, sizeof aad, p, l, box + 12);
+        TicketContents got;
+        const bool opened = sealer.open(box, 12 + l + 16, got);
+        if (v == 0)
+            check(opened && got.lifetime_s == 60 && got.alpn_len == 2 && got.psk_len == 32, "the control opens");
+        else
+            check(!opened, v == 1 ? "an unknown layout does not open" : "bytes past the end do not open");
+    }
+    c.forget(aead);
+}
+
 /// \~english Handshakes where the key exchange and the signatures are real.  \~spanish Saludos en los que el intercambio de claves y las firmas son de verdad.  \~
 void run_real(Crypto &client_crypto, Crypto &server_crypto, const char *name) {
     const Hex p256_cert(test_keys::kP256Certificate), p256_key(test_keys::kP256Pkcs8);
@@ -1320,6 +1996,28 @@ void run_real(Crypto &client_crypto, Crypto &server_crypto, const char *name) {
         check_agreed(client, server, p256_cert.b, p256_cert.n);
         check(client.retried() && client.group() == group::Secp256r1 && client.aead() == Aead::Aes256Gcm,
               "P-256 after a retry, with AES-256");
+    }
+    {
+        std::snprintf(label, sizeof label, "%s: resumed", name);
+        section(label);
+        Ends e(server_crypto, p256_cert.b, p256_cert.n, p256_key.b, p256_key.n, Scheme::EcdsaSecp256r1Sha256);
+        const TicketSealer sealer(server_crypto, kTicketKey);
+        Ticket t;
+        check(first_connection(client_crypto, server_crypto, e, sealer, kStart, t), "a real ticket");
+        Session client(client_crypto, resuming(e.client, &t));
+        Session server(server_crypto, with_tickets(e.server, &sealer));
+        resume(client, server, kStart + kSecond);
+        check_agreed(client, server, nullptr, 0);
+
+        // \~english A ticket another key sealed is unknown: ignored, a full handshake (4.2.11).
+        // \~spanish Un ticket sellado con otra clave es desconocido: se ignora, saludo completo (4.2.11).  \~
+        const TicketSealer other(server_crypto, kOtherKey);
+        Ticket u;
+        first_connection(client_crypto, server_crypto, e, sealer, kStart, u);
+        Session client2(client_crypto, resuming(e.client, &u));
+        Session server2(server_crypto, with_tickets(e.server, &other));
+        resume(client2, server2, kStart + kSecond);
+        check_agreed(client2, server2, p256_cert.b, p256_cert.n);
     }
     {
         std::snprintf(label, sizeof label, "%s: bad signature", name);
@@ -1372,16 +2070,22 @@ int main() {
     test_client_flight_rules();
     test_server_rules();
     test_client_certificate();
+    test_support::FakeCrypto fake;
+    test_sealer(fake, false, "fake");
+    test_resumption();
+    test_resumption_edges();
     int providers = 0;
 #if HTTP_VX_HAVE_OPENSSL
     http_vx::OpensslCrypto openssl;
     ++providers;
+    test_sealer(openssl, true, "openssl");
     run_real(openssl, openssl, "openssl");
 #endif
 #if HTTP_VX_HAVE_CNG
     http_vx::CngCrypto cng;
     ++providers;
     if (cng.ready()) {
+        test_sealer(cng, true, "cng");
         run_real(cng, cng, "cng");
     } else {
         std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", cng.missing());

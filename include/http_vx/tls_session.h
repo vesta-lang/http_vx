@@ -40,8 +40,13 @@
  * -- 0x0100 plus the alert (RFC 9001, 4.8), or a transport error where RFC
  * 9001 names one -- and a sentence saying which rule was broken.
  *
- * What this does not do yet: resumption and 0-RTT, and deciding whether to
- * trust the server's certificate -- the chain is kept for whoever does.
+ * **Resumption is PSK with (EC)DHE, and nothing else** (4.2.9): a resumed
+ * connection keeps forward secrecy.  The server's tickets are sealed with a
+ * key only it has (tls_ticket.h), so it keeps no state for them; the client
+ * keeps what it received, for its owner to take and use once (C.4).
+ *
+ * What this does not do yet: 0-RTT, and deciding whether to trust the
+ * server's certificate -- the chain is kept for whoever does.
  *
  * \~spanish
  * La pieza que junta las demas: los mensajes de tls_messages.h, el calendario
@@ -71,8 +76,14 @@
  * QUIC -- 0x0100 mas la alerta (RFC 9001, 4.8), o un error de transporte donde
  * el RFC 9001 nombra uno -- y una frase que dice que regla se rompio.
  *
- * Lo que esto aun no hace: reanudacion y 0-RTT, y decidir si fiarse del
- * certificado del servidor -- la cadena se guarda para quien lo haga.
+ * **Reanudar es PSK con (EC)DHE, y nada mas** (4.2.9): una conexion reanudada
+ * conserva el secreto hacia adelante.  Los tickets del servidor van sellados con
+ * una clave que solo tiene el (tls_ticket.h), asi que no guarda estado por
+ * ellos; el cliente guarda lo que recibio, para que su dueno lo tome y lo use
+ * una vez (C.4).
+ *
+ * Lo que esto aun no hace: 0-RTT, y decidir si fiarse del certificado del
+ * servidor -- la cadena se guarda para quien lo haga.
  * \~
  */
 #ifndef HTTP_VX_TLS_SESSION_H
@@ -82,6 +93,7 @@
 #include "http_vx/quic_recovery.h"
 #include "http_vx/tls_messages.h"
 #include "http_vx/tls_schedule.h"
+#include "http_vx/tls_ticket.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -148,6 +160,28 @@ struct SessionConfig {
      * \~
      */
     bool request_certificate = false;
+
+    /* \~english
+     * Resumption (4.6.1, 4.2.11).  A server with a sealer issues
+     * `tickets_to_issue` tickets once the handshake is complete -- new ones
+     * on every connection, so a client never has to reuse one (C.4) -- and
+     * accepts them back.  A client given `resume` offers it, if it is still
+     * alive and for the same host name; the ticket is the caller's, used
+     * once.  Only PSK with (EC)DHE is offered or accepted: resuming keeps
+     * forward secrecy.
+     * \~spanish
+     * Reanudacion (4.6.1, 4.2.11).  Un servidor con un sellador emite
+     * `tickets_to_issue` tickets cuando el saludo esta completo -- nuevos en
+     * cada conexion, para que un cliente nunca tenga que reutilizar uno (C.4) --
+     * y los acepta de vuelta.  Un cliente al que se le da `resume` lo ofrece, si
+     * sigue vivo y es para el mismo nombre de servidor; el ticket es de quien
+     * llama, y se usa una vez.  Solo se ofrece o acepta PSK con (EC)DHE:
+     * reanudar conserva el secreto hacia adelante.
+     * \~ */
+    const TicketSealer *tickets = nullptr;
+    size_t tickets_to_issue = 2;
+    uint32_t ticket_lifetime_s = 86400;
+    const Ticket *resume = nullptr;
 };
 
 /**
@@ -259,8 +293,33 @@ public:
     /// \~english The key exchange group, by its TLS number; 0 before one was chosen.
     /// \~spanish El grupo del intercambio de claves, por su numero de TLS; 0 antes de elegirlo.  \~
     uint16_t group() const noexcept { return group_; }
-    /// \~english NewSessionTickets received; kept for resumption later.  \~spanish NewSessionTicket recibidos; se guardan para la reanudacion.  \~
-    size_t tickets() const noexcept { return tickets_; }
+    /**
+     * @brief
+     * \~english The time now, for tickets: when one is issued, how old one is (4.6.1, 4.2.11.1).
+     * \~spanish La hora de ahora, para los tickets: cuando se emite uno, que edad tiene (4.6.1, 4.2.11.1).
+     * \~
+     *
+     * \~english
+     * The same clock for every session of an end -- and, for a server, one
+     * that keeps meaning the same as long as its ticket key does.
+     * \~spanish
+     * El mismo reloj para todas las sesiones de un extremo -- y, en un servidor,
+     * uno que siga significando lo mismo mientras dure su clave de tickets.
+     * \~
+     */
+    void set_clock(uint64_t now_us) noexcept { clock_us_ = now_us; }
+
+    /// \~english The handshake resumed a session: a PSK, no certificate.  \~spanish El saludo reanudo una sesion: una PSK, sin certificado.  \~
+    bool resumed() const noexcept { return resumed_; }
+
+    /// \~english Client: tickets received and kept, and those that could not be kept.
+    /// \~spanish Cliente: tickets recibidos y guardados, y los que no se pudieron guardar.  \~
+    size_t tickets() const noexcept { return kept_count_; }
+    size_t tickets_dropped() const noexcept { return tickets_dropped_; }
+    /// \~english Client: hands over the oldest ticket kept, and forgets it here.  \~spanish Cliente: entrega el ticket guardado mas antiguo, y lo olvida aqui.  \~
+    bool take_ticket(Ticket &out) noexcept;
+    /// \~english Server: tickets issued.  \~spanish Servidor: tickets emitidos.  \~
+    size_t tickets_issued() const noexcept { return tickets_issued_; }
 
 private:
     enum class State : uint8_t {
@@ -310,6 +369,7 @@ private:
 
     bool server_flight(const uint8_t *m, const ClientHello &ch, size_t share_at, size_t share_len) noexcept;
     bool hello_retry(const ClientHello &ch) noexcept;
+    bool server_certificate() noexcept;
     bool client_finished() noexcept;
 
     bool choose_suite(const uint8_t *m, Span offered, uint16_t &suite) const noexcept;
@@ -317,7 +377,13 @@ private:
     static void keep(size_t msg_at, Span s, Kept &k) noexcept;
     bool add(const uint8_t *m, size_t n) noexcept;
     bool begin(Space s, size_t need, Writer &w) noexcept;
-    bool commit(Space s, Writer &w) noexcept;
+    /// \~english @p in_transcript: false for what comes after the handshake (4.4.1).
+    /// \~spanish @p in_transcript: falso para lo que viene tras el saludo (4.4.1).  \~
+    bool commit(Space s, Writer &w, bool in_transcript = true) noexcept;
+    bool binder(const uint8_t *psk, Hash h, const uint8_t *partial, size_t partial_len, uint8_t *out) noexcept;
+    bool resume_usable() const noexcept;
+    bool accept_psk(const uint8_t *m, const ClientHello &ch, bool check_binder, uint16_t &suite) noexcept;
+    bool issue_tickets() noexcept;
     bool set_suite(uint16_t suite) noexcept;
     bool derive_handshake(const uint8_t *shared, size_t shared_len) noexcept;
     bool finished_for(bool client_side, uint8_t *out) noexcept;
@@ -375,7 +441,19 @@ private:
     size_t alpn_index_ = 0;
     Kept server_name_;
     Kept certificate_;
-    size_t tickets_ = 0;
+
+    /* \~english Resumption: the PSK in use, whether one was offered and taken, and the tickets kept.
+     * \~spanish Reanudacion: la PSK en uso, si se ofrecio y se tomo una, y los tickets guardados.  \~ */
+    uint64_t clock_us_ = 0;
+    uint8_t psk_[kMaxHash] = {};
+    size_t psk_len_ = 0;
+    bool psk_offered_ = false;
+    bool resumed_ = false;
+    static constexpr size_t kKeptTickets = 4;
+    Ticket *kept_ = nullptr;
+    size_t kept_count_ = 0;
+    size_t tickets_dropped_ = 0;
+    size_t tickets_issued_ = 0;
 
     Bytes in_[quic::kSpaces];
     Bytes out_[quic::kSpaces];

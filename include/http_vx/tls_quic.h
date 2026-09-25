@@ -96,6 +96,9 @@ public:
     bool step(uint64_t now_us) noexcept;
 
     const Session &session() const noexcept { return session_; }
+    /// \~english Client: a ticket the server sent, to resume a later connection with (RFC 9001, 4.5).
+    /// \~spanish Cliente: un ticket que mando el servidor, para reanudar una conexion posterior (RFC 9001, 4.5).  \~
+    bool take_ticket(Ticket &out) noexcept { return session_.take_ticket(out); }
     bool complete() const noexcept { return session_.complete(); }
     /// \~english Why it failed, in words; null while nothing failed.  \~spanish Por que fallo, en palabras; nulo mientras nada fallo.  \~
     const char *why() const noexcept { return why_; }
