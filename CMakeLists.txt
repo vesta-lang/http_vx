@@ -165,6 +165,7 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 # darsele bytes torcidos desde una prueba corriente sin abrir ningun puerto.
 # ---------------------------------------------------------------------------
 add_library(http_vx_quic STATIC
+        quic/ack.cpp
         quic/frame.cpp
         quic/packet.cpp
         quic/protection.cpp
@@ -389,6 +390,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_stream tests/test_h2_stream.cpp)
     http_vx_add_test(test_h2_writer tests/test_h2_writer.cpp)
     http_vx_add_test(test_http2_service tests/test_http2_service.cpp)
+    http_vx_add_test(test_quic_ack tests/test_quic_ack.cpp)
     http_vx_add_test(test_quic_frame tests/test_quic_frame.cpp)
     http_vx_add_test(test_quic_packet tests/test_quic_packet.cpp)
     http_vx_add_test(test_quic_protection tests/test_quic_protection.cpp)
