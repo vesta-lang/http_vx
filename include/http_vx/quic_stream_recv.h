@@ -202,6 +202,40 @@ public:
     /// \~english How many chunks hold memory now.  \~spanish Cuantos trozos tienen memoria ahora.  \~
     size_t chunks_held() const noexcept { return held_; }
 
+    /**
+     * @brief
+     * \~english The application stops reading: a STOP_SENDING with @p code is owed (RFC 9000, 3.5).
+     * \~spanish La aplicacion deja de leer: se debe un STOP_SENDING con @p code (RFC 9000, 3.5).
+     * \~
+     *
+     * \~english
+     * Only in "Recv" or "Size Known": past them everything or a reset has
+     * arrived, and asking is pointless.  What still arrives is still counted
+     * for flow control; reading it is up to the application.
+     * \~spanish
+     * Solo en "Recv" o "Size Known": despues ya llego todo o un reinicio, y pedir
+     * no tiene sentido.  Lo que siga llegando cuenta igual para el control de
+     * flujo; leerlo es cosa de la aplicacion.
+     * \~
+     *
+     * @return \~english false if the stream is past those states, or it was already asked
+     *         \~spanish falso si el flujo ya paso esos estados, o ya se pidio  \~
+     */
+    bool stop(uint64_t code) noexcept;
+    /// \~english A STOP_SENDING waits to go out: owed, and still worth sending (3.5).
+    /// \~spanish Un STOP_SENDING espera salir: debido, y aun merece la pena mandarlo (3.5).  \~
+    bool stop_pending() const noexcept {
+        return stop_pending_ && (state_ == RecvState::Recv || state_ == RecvState::SizeKnown);
+    }
+    bool stopped() const noexcept { return stopped_; }
+    uint64_t stop_code() const noexcept { return stop_code_; }
+    void on_stop_sent() noexcept { stop_pending_ = false; }
+    /// \~english The packet with it was lost: owed again, while it still matters.
+    /// \~spanish Se perdio el paquete que lo llevaba: se vuelve a deber, mientras importe.  \~
+    void on_stop_lost() noexcept {
+        if (stopped_) stop_pending_ = true;
+    }
+
 private:
     struct Chunk;
 
@@ -217,6 +251,9 @@ private:
     uint64_t final_ = 0;
     uint64_t buffered_ = 0;
     uint64_t reset_code_ = 0;
+    uint64_t stop_code_ = 0;
+    bool stopped_ = false;
+    bool stop_pending_ = false;
     bool size_known_ = false;
     RecvState state_ = RecvState::Recv;
 

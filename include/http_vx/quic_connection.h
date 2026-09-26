@@ -491,6 +491,7 @@ struct SendCounts {
     uint64_t max_stream_data = 0;
     uint64_t max_streams = 0;
     uint64_t reset_stream = 0;
+    uint64_t stop_sending = 0;
     uint64_t ping = 0;
     uint64_t connection_close = 0;
     uint64_t new_connection_id = 0;

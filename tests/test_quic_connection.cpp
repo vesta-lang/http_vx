@@ -1388,6 +1388,14 @@ void pump(KeyPair &k, int rounds, uint64_t step = 5000) {
     }
 }
 
+/**
+ * @brief
+ * \~english Stopping to read a stream: STOP_SENDING goes out, the peer answers with RESET_STREAM and the same code (3.5).
+ * \~spanish Dejar de leer un flujo: sale STOP_SENDING, el otro contesta con RESET_STREAM y el mismo codigo (3.5).
+ * \~
+ */
+void test_stop_sending(Crypto &cr);
+
 /// \~english Writes @p text on the client's stream 0, opening it the first time.
 /// \~spanish Escribe @p text en el flujo 0 del cliente, abriendolo la primera vez.  \~
 void say(KeyPair &k, const char *text) {
@@ -3040,6 +3048,44 @@ void test_paths(Crypto &cr) {
     }
 }
 
+void test_stop_sending(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/stop-sending", cr.name());
+    const ConnectionConfig cc = key_client();
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    std::vector<uint8_t> lots(20000, 0x42);
+    for (int lose_first = 0; lose_first < 2; ++lose_first) {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        say(k, "hello");
+        pump(k, 3);
+        check(heard(k) == "hello", "the request did not arrive");
+        Stream *srv = k.server.streams().find(0);
+        Stream *cli = k.client.streams().find(0);
+        check(srv != nullptr && cli != nullptr, "stream 0 is not open at both ends");
+        if (srv == nullptr || cli == nullptr) continue;
+        size_t took = 0;
+        srv->send->write(lots.data(), lots.size(), took);
+        pump(k, 1);
+        // \~english The client no longer wants the answer: H3_REQUEST_CANCELLED, as HTTP/3 would say it.
+        // \~spanish El cliente ya no quiere la respuesta: H3_REQUEST_CANCELLED, como lo diria HTTP/3.  \~
+        check(cli->recv->stop(0x10c), "the client could not stop reading");
+        if (lose_first == 1) {
+            uint8_t buf[1500];
+            check(k.client.build_datagram(g_sent, buf, sizeof buf, k.now) != 0, "nothing carried the STOP_SENDING");
+        }
+        pump(k, 60);
+        check(k.client.sent().stop_sending == static_cast<uint64_t>(1 + lose_first),
+              lose_first == 0 ? "not one STOP_SENDING" : "the lost STOP_SENDING was not sent again (3.5)");
+        srv = k.server.streams().find(0);
+        cli = k.client.streams().find(0);
+        check(srv == nullptr || (srv->send->reset_code() == 0x10c), "the server did not reset with the same code (3.5)");
+        check(cli == nullptr || cli->recv->state() == RecvState::ResetRecvd || cli->recv->state() == RecvState::ResetRead,
+              "the client never saw the reset");
+        check(cli == nullptr || cli->recv->reset_code() == 0x10c, "the reset's code is not the one asked for");
+        check(k.server.sent().reset_stream >= 1, "the server sent no RESET_STREAM");
+    }
+}
+
 void run_all(Crypto &cr) {
     std::printf("-- %s --\n", cr.name());
     /* \~english
@@ -3080,6 +3126,7 @@ void run_all(Crypto &cr) {
     test_changed_source(cr);
     test_initial_rules(cr);
     test_key_update_rules(cr, Aead::Aes128Gcm);
+    test_stop_sending(cr);
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
     test_cid_rules(cr);

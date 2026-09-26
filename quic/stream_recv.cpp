@@ -272,6 +272,16 @@ size_t RecvStream::peek(const uint8_t *&p) const noexcept {
     return n;
 }
 
+bool RecvStream::stop(uint64_t code) noexcept {
+    // \~english Only while there is still something to stop (3.5); asked once.
+    // \~spanish Solo mientras aun haya algo que parar (3.5); se pide una vez.  \~
+    if (stopped_ || (state_ != RecvState::Recv && state_ != RecvState::SizeKnown)) return false;
+    stopped_ = true;
+    stop_pending_ = true;
+    stop_code_ = code;
+    return true;
+}
+
 void RecvStream::consume(size_t n) noexcept {
     const uint64_t to = read_ + n;
     release_below(to);

@@ -44,6 +44,7 @@ enum : uint8_t {
     kRecDataBlocked,
     kRecStreamDataBlocked,
     kRecStreamsBlocked,
+    kRecStopSending,
 };
 
 /// \~english The smallest datagram that may carry an Initial (14.1).
@@ -1602,7 +1603,8 @@ void Connection::on_lost(Space space, const SentPacket &p) noexcept {
     for (uint8_t i = 0; i < rec->count; ++i) {
         const FrameRecord &f = rec->frames[i];
         Stream *st = nullptr;
-        if (f.kind == kRecStream || f.kind == kRecResetStream || f.kind == kRecMaxStreamData)
+        if (f.kind == kRecStream || f.kind == kRecResetStream || f.kind == kRecMaxStreamData ||
+            f.kind == kRecStopSending)
             st = streams_.find(f.id);
         switch (f.kind) {
         case kRecStream:
@@ -1613,6 +1615,11 @@ void Connection::on_lost(Space space, const SentPacket &p) noexcept {
             break;
         case kRecResetStream:
             if (st != nullptr && st->send != nullptr) st->send->on_reset_lost();
+            break;
+        case kRecStopSending:
+            // \~english Another one is expected if it was lost (3.5); stop_pending() decides if it still matters.
+            // \~spanish Se espera otro si se perdio (3.5); stop_pending() decide si aun importa.  \~
+            if (st != nullptr && st->recv != nullptr) st->recv->on_stop_lost();
             break;
         case kRecMaxData:
             max_data_owed_ = true;
@@ -2527,6 +2534,18 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
                     st->send->on_reset_sent();
                     ++sent_.reset_stream;
                     add_record(rec, kRecResetStream, st->id, 0, 0, false);
+                }
+            }
+            // \~english The application stopped reading: ask the peer to stop sending (3.5, 19.5).
+            // \~spanish La aplicacion dejo de leer: pedir al otro que deje de mandar (3.5, 19.5).  \~
+            if (st->recv != nullptr && st->recv->stop_pending() && !full(rec)) {
+                n = write_stop_sending(p + used, room - used, st->id, st->recv->stop_code());
+                if (n != 0) {
+                    used += n;
+                    eliciting = true;
+                    st->recv->on_stop_sent();
+                    ++sent_.stop_sending;
+                    add_record(rec, kRecStopSending, st->id, 0, 0, false);
                 }
             }
         }

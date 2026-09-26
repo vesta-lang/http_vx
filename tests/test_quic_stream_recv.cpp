@@ -265,6 +265,45 @@ void test_reset() {
     }
 }
 
+/// \~english Stopping to read: a STOP_SENDING owed while it can still matter (RFC 9000, 3.5).
+/// \~spanish Dejar de leer: un STOP_SENDING debido mientras aun pueda importar (RFC 9000, 3.5).  \~
+void test_stop() {
+    std::vector<uint8_t> b(100, 1);
+    uint64_t fresh = 0;
+    uint64_t released = 0;
+    {
+        RecvStream s(4096);
+        check(!s.stop_pending() && !s.stopped(), "nothing owed before asking");
+        check(s.stop(0x10c), "stopping in \"Recv\" was refused");
+        check(s.stop_pending() && s.stopped() && s.stop_code() == 0x10c, "the STOP_SENDING and its code are not owed");
+        check(!s.stop(0x10b), "asking twice was taken");
+        s.on_stop_sent();
+        check(!s.stop_pending(), "still owed once sent");
+        s.on_stop_lost();
+        check(s.stop_pending(), "not owed again once lost");
+        s.on_data(0, b.data(), 100, false, fresh);
+        check(s.stop_pending(), "data after asking does not change what is owed");
+        s.on_data(100, b.data(), 0, true, fresh);
+        check(s.state() == RecvState::DataRecvd && !s.stop_pending(),
+              "once everything arrived, a STOP_SENDING is pointless and not owed (3.5)");
+    }
+    {
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 10, true, fresh);
+        check(!s.stop(1) && !s.stopped(), "stopping after all data arrived was taken");
+    }
+    {
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 10, false, fresh);
+        s.on_data(50, b.data(), 0, true, fresh);
+        check(s.state() == RecvState::SizeKnown && s.stop(1), "stopping in \"Size Known\" was refused");
+        s.on_stop_sent();
+        s.on_reset(50, 1, fresh, released);
+        s.on_stop_lost();
+        check(!s.stop_pending(), "a reset arrived: a lost STOP_SENDING is not sent again (3.5)");
+    }
+}
+
 /// \~english One-byte fragments across the whole window: no cap to reach, memory bounded.
 /// \~spanish Fragmentos de un byte por toda la ventana: ningun tope que alcanzar, memoria acotada.  \~
 void test_fragments() {
@@ -292,6 +331,7 @@ int main() {
     test_flow_control();
     test_final_size();
     test_reset();
+    test_stop();
     test_fragments();
 
     if (failures != 0) {
