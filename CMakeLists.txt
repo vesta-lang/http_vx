@@ -213,6 +213,20 @@ target_compile_options(http_vx_tls PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_tls PUBLIC http_vx_quic vesta_alloc)
 
 # ---------------------------------------------------------------------------
+# HTTP/3 (RFC 9114): tramas, flujos y conexion sobre `http_vx_quic`.  Aparte de
+# `http_vx_proto` porque necesita los flujos de QUIC, que proto no conoce: lo que
+# HTTP/3 comparte con HTTP/1.1 y HTTP/2 -- la semantica, QPACK -- sigue alli.
+# ---------------------------------------------------------------------------
+add_library(http_vx_h3 STATIC
+        proto/h3/frame.cpp
+)
+target_include_directories(http_vx_h3
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_h3 PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_h3 PUBLIC http_vx_proto http_vx_quic http_vx_core vesta_alloc)
+
+# ---------------------------------------------------------------------------
 # Un proveedor criptografico para QUIC, sobre la libcrypto de OpenSSL.
 #
 # APARTE y OPCIONAL, por la R22: `http_vx_quic` no enlaza ninguna biblioteca de
@@ -534,6 +548,8 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_qpack tests/test_qpack.cpp)
     http_vx_add_test(test_qpack_encoder tests/test_qpack_encoder.cpp)
+    http_vx_add_test(test_h3_frame tests/test_h3_frame.cpp)
+    target_link_libraries(test_h3_frame PRIVATE http_vx_h3)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
