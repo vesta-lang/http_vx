@@ -1724,7 +1724,9 @@ void Connection::on_datagram(const Path &path, uint8_t *data, size_t n, Ecn ecn,
     datagram_len_ = n;
     uint8_t tail[kResetTokenSize];
     if (maybe_reset) util::vesta_memcpy(tail, data + n - kResetTokenSize, kResetTokenSize);
-    const uint64_t failed_before = drops_.bad_header + drops_.wrong_cid + drops_.forged;
+    // \~english Whether the first packet failed -- for any reason: it is what makes the comparison a MUST (10.3.1).
+    // \~spanish Si el primer paquete fallo -- por la razon que sea: es lo que hace de la comparacion un DEBE (10.3.1).  \~
+    bool first_failed = true;
     arrival_us_ = now_us;
 
     size_t pos = 0;
@@ -1757,14 +1759,14 @@ void Connection::on_datagram(const Path &path, uint8_t *data, size_t n, Ecn ecn,
             pos += h.size;
             continue;
         }
-        process_packet(data + pos, h, ecn, now_us);
+        const bool processed = process_packet(data + pos, h, ecn, now_us);
+        if (pos == 0) first_failed = !processed;
         pos += h.size;
     }
 
     // \~english The peer has no such connection: drain, and send nothing more (10.3.1).
     // \~spanish El otro no tiene esta conexion: drenar, y no mandar nada mas (10.3.1).  \~
-    if (maybe_reset && drops_.bad_header + drops_.wrong_cid + drops_.forged != failed_before &&
-        check_stateless_reset(tail, path.peer)) {
+    if (maybe_reset && first_failed && check_stateless_reset(tail, path.peer)) {
         closed_by_reset_ = true;
         state_ = ConnState::Draining;
         close_deadline_ = now_us + 3 * pto_duration();

@@ -2083,6 +2083,50 @@ void test_cid_rules(Crypto &cr) {
             check(k.client.closed_by_reset(), "the token of the ID in use did not end the connection");
         }
     }
+    /* \~english
+     * However the first packet fails, the tail is compared (10.3.1): a long
+     * header with a version nobody speaks is dropped as unsupported, not
+     * as a bad header, and it was a reset all the same.  Random bytes used to
+     * land here now and then.
+     * \~spanish
+     * Falle como falle el primer paquete, la cola se compara (10.3.1): una
+     * cabecera larga con una version que nadie habla se tira por version no
+     * soportada, no por cabecera mala, y era un reinicio igual.  Los bytes
+     * aleatorios caian aqui de vez en cuando.
+     * \~ */
+    {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        pump(k, 10);
+        // \~english An ID whose token came in a NEW_CONNECTION_ID: the one a reset can be checked against.
+        // \~spanish Un identificador cuyo testigo llego en un NEW_CONNECTION_ID: contra el que se puede comprobar un reinicio.  \~
+        k.server.renew_connection_ids();
+        pump(k, 10);
+        const uint64_t in_use = k.client.peer_cid_sequence();
+        uint64_t seq = 0;
+        const uint8_t *cid = nullptr;
+        const uint8_t *token = nullptr;
+        const uint8_t *used_token = nullptr;
+        for (size_t i = 0; k.server.local_cid(i, seq, cid, token); ++i)
+            if (seq == in_use) used_token = token;
+        check(used_token != nullptr, "the ID in use is listed");
+        if (used_token != nullptr) {
+            uint8_t pkt[64];
+            const size_t m = write_stateless_reset(cr, used_token, 60, pkt, sizeof pkt);
+            pkt[0] = 0xc0;
+            pkt[1] = 0x0a;
+            pkt[2] = 0x1a;
+            pkt[3] = 0x2a;
+            pkt[4] = 0x3a;
+            // \~english Empty connection IDs: a header that reads, of a version nobody speaks.
+            // \~spanish Identificadores vacios: una cabecera que se lee, de una version que nadie habla.  \~
+            pkt[5] = 0x00;
+            pkt[6] = 0x00;
+            const uint64_t unsupported_before = k.client.drops().unsupported;
+            k.client.on_datagram(kPath, pkt, m, Ecn::NotEct, k.now);
+            check(k.client.drops().unsupported == unsupported_before + 1, "the packet is dropped as a version this end does not speak");
+            check(k.client.closed_by_reset(), "and still recognised as a reset (10.3.1)");
+        }
+    }
 }
 
 /* \~english
