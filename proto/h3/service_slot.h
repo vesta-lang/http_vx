@@ -81,6 +81,9 @@ struct Http3Service::Slot {
     /// \~english HTTP/3 failed and was counted.  \~spanish HTTP/3 fallo y se conto.  \~
     bool failure_counted = false;
 
+    /// \~english The handshake's decision on 0-RTT was counted.  \~spanish La decision del saludo sobre 0-RTT se conto.  \~
+    bool early_counted = false;
+
     /// \~english The next free slot, while free.  \~spanish La casilla libre siguiente, mientras esta libre.  \~
     uint32_t next_free = kNone;
 };

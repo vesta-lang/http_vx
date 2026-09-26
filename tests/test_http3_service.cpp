@@ -178,7 +178,8 @@ struct Client {
     bool started = false;
     std::vector<std::pair<uint64_t, Seen>> seen;
 
-    Client(Crypto &crypto, uint8_t id, const char *const *alpn) {
+    Client(Crypto &crypto, uint8_t id, const char *const *alpn, uint64_t now = 0,
+           const http_vx::tls::Ticket *resume = nullptr) {
         uint8_t me[6] = {198, 51, 100, id, 0x1f, 0x90};
         make_address(me, sizeof me, path.local);
         make_address(kServerAddr, sizeof kServerAddr, path.peer);
@@ -190,8 +191,11 @@ struct Client {
         tls.alpn_count = 1;
         tls.server_name = "example.com";
         tls.trust_any_certificate = true;
+        // \~english With a ticket: resume, and offer 0-RTT.  \~spanish Con un ticket: reanudar, y ofrecer 0-RTT.  \~
+        tls.resume = resume;
+        tls.early_data = resume != nullptr;
         hs.reset(new QuicHandshake(crypto, *q, tls));
-        check(hs->start(0), "the client's handshake starts");
+        check(hs->start(now), "the client's handshake starts");
         h.reset(new h3::Connection(*q));
     }
 
@@ -285,8 +289,8 @@ struct World {
 
     explicit World(Crypto &c) : crypto(c), service(c, handler) {}
 
-    Client &add(const char *const *alpn = kH3) {
-        clients.emplace_back(new Client(crypto, static_cast<uint8_t>(clients.size() + 1), alpn));
+    Client &add(const char *const *alpn = kH3, const http_vx::tls::Ticket *resume = nullptr) {
+        clients.emplace_back(new Client(crypto, static_cast<uint8_t>(clients.size() + 1), alpn, now, resume));
         return *clients.back();
     }
 
@@ -669,6 +673,37 @@ void test_h3_failure(Crypto &crypto, const Keys &k) {
     check(c.q->state() != ConnState::Active, "and the connection is closed");
 }
 
+void test_early(Crypto &crypto, const Keys &k) {
+    section("0-RTT");
+    World w(crypto);
+    Http3Config cfg = server_config(k);
+    const uint8_t key[http_vx::tls::TicketSealer::kKeySize] = {9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6};
+    const http_vx::tls::TicketSealer sealer(crypto, key);
+    // \~english Started at time zero, with a window of ten seconds (RFC 8446, 8.2).
+    // \~spanish Arrancado en el instante cero, con una ventana de diez segundos (RFC 8446, 8.2).  \~
+    http_vx::tls::ReplayGuard guard(64, 10000, 0);
+    cfg.tls.tickets = &sealer;
+    cfg.tls.early_data = true;
+    cfg.tls.replay = &guard;
+    check(w.service.start(cfg), "the service starts");
+    Client &first = w.add();
+    w.settle();
+    http_vx::tls::Ticket one;
+    http_vx::tls::Ticket two;
+    check(first.started && first.hs->take_ticket(one) && first.hs->take_ticket(two), "the server gave two tickets");
+    Client &early = w.add(kH3, &one);
+    w.settle();
+    check(early.started && early.hs->session().resumed(), "a ticket resumes");
+    check(w.service.counts().early_refused == 1 && w.service.counts().early_accepted == 0 &&
+              w.service.last_early_refused() != nullptr && std::strstr(w.service.last_early_refused(), "replay") != nullptr,
+          "0-RTT inside the guard's first window is refused, and it is said why (RFC 8446, 8.2)");
+    // \~english Past the window: the same offer is taken.  \~spanish Pasada la ventana: la misma oferta se acepta.  \~
+    w.run(11000000);
+    Client &later = w.add(kH3, &two);
+    w.settle();
+    check(later.started && w.service.counts().early_accepted == 1, "past the window, 0-RTT is accepted and counted");
+}
+
 void test_alpn(Crypto &crypto, const Keys &k) {
     section("alpn");
     World w(crypto);
@@ -702,6 +737,7 @@ int main() {
     test_stop_sending(fake, fk);
     test_secret(fake, fk);
     test_h3_failure(fake, fk);
+    test_early(fake, fk);
     fake.forget_key(fk.key);
 
     int providers = 0;

@@ -348,6 +348,7 @@ void Http3Service::free_slot(uint32_t i) noexcept {
     destroy(s.tls);
     destroy(s.quic);
     s.failure_counted = false;
+    s.early_counted = false;
     // \~english Left in the send queue if it is there: the entry is skipped, or serves whoever takes the slot next.
     // \~spanish Se queda en la cola de envio si esta: la entrada se salta, o sirve a quien coja la casilla despues.  \~
     s.next_free = free_;

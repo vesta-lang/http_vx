@@ -60,6 +60,19 @@ void Http3Service::pump(Slot &s, uint64_t now_us) noexcept {
         if (e.kind == h3::EventKind::None) break;
         on_event(s, e);
     }
+    // \~english The handshake's word on 0-RTT, once: accepted, or refused and why (RFC 9001, 4.6.2).
+    // \~spanish Lo que dijo el saludo del 0-RTT, una vez: aceptado, o rechazado y por que (RFC 9001, 4.6.2).  \~
+    const tls::Session &session = s.tls->session();
+    if (!s.early_counted && session.early_offered()) {
+        if (session.early_accepted()) {
+            s.early_counted = true;
+            ++counts_.early_accepted;
+        } else if (session.early_refused() != nullptr) {
+            s.early_counted = true;
+            ++counts_.early_refused;
+            last_early_refused_ = session.early_refused();
+        }
+    }
     if (s.h3->failed() && !s.failure_counted) {
         s.failure_counted = true;
         ++counts_.failed;

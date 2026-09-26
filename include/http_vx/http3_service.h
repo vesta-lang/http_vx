@@ -136,6 +136,10 @@ struct Http3Counts {
     /// \~spanish Conexiones que fallaron en HTTP/3, y conexiones terminadas.  \~
     uint64_t failed = 0;
     uint64_t closed = 0;
+    /// \~english 0-RTT offered by a client and accepted, or refused (RFC 9001, 4.6).
+    /// \~spanish 0-RTT ofrecido por un cliente y aceptado, o rechazado (RFC 9001, 4.6).  \~
+    uint64_t early_accepted = 0;
+    uint64_t early_refused = 0;
     /// \~english Connections gone, by why they ended.  \~spanish Conexiones terminadas, por que acabaron.  \~
     uint64_t ended[static_cast<size_t>(quic::EndReason::kCount)] = {};
 };
@@ -216,6 +220,10 @@ class Http3Service {
 
     /// \~english How the last connection to go ended.  \~spanish Como acabo la ultima conexion que se fue.  \~
     const Http3End &last_end() const noexcept { return last_end_; }
+
+    /// \~english Why the last 0-RTT offered was refused; null if none was.
+    /// \~spanish Por que se rechazo el ultimo 0-RTT ofrecido; nulo si no se rechazo ninguno.  \~
+    const char *last_early_refused() const noexcept { return last_early_refused_; }
 
     /// \~english The acceptor, for its counters.  \~spanish El acceptor, por sus contadores.  \~
     const quic::Acceptor *acceptor() const noexcept { return acceptor_; }
@@ -300,6 +308,7 @@ class Http3Service {
     Buffer names_;
     Http3Counts counts_;
     Http3End last_end_;
+    const char *last_early_refused_ = nullptr;
 };
 
 } // namespace http_vx
