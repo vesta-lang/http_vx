@@ -1295,7 +1295,8 @@ void test_a_header_list_too_large_is_431() {
     n = request_block(block, "POST", "/trailed");
     w.frame(FrameType::Headers, kEndHeaders, 7, block, n);
     w.frame(FrameType::Data, 0, 7, reinterpret_cast<const uint8_t *>("abc"), 3);
-    uint8_t tail[256];
+    // \~english Room for three fields of a hundred-odd bytes each.  \~spanish Sitio para tres campos de un centenar largo de bytes cada uno.  \~
+    uint8_t tail[512];
     size_t t = 0;
     field(tail, t, "x-big", big);
     field(tail, t, "x-big2", big);

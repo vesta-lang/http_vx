@@ -489,7 +489,7 @@ void replace(Flight &f, Handshake type, const uint8_t *msg, size_t len) {
     uint8_t rest[16384];
     const size_t tail = f.n - at - old;
     std::memcpy(rest, f.b + at + old, tail);
-    std::memcpy(f.b + at, msg, len);
+    if (len != 0) std::memcpy(f.b + at, msg, len);
     std::memcpy(f.b + at + len, rest, tail);
     f.n = at + len + tail;
 }

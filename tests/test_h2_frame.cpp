@@ -63,7 +63,7 @@ struct Wire {
     size_t used = 0;
 
     void raw(const void *p, size_t n) {
-        if (used + n > sizeof(bytes)) return;
+        if (used + n > sizeof(bytes) || n == 0) return;
         std::memcpy(bytes + used, p, n);
         used += n;
     }

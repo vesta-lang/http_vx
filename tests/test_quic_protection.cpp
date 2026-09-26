@@ -518,7 +518,8 @@ void test_round_trip_property() {
 
     for (int i = 0; i < 20000; ++i) {
         uint8_t p[400];
-        uint8_t plain[300];
+        // \~english The payload goes up to 3 + 299 bytes.  \~spanish La carga llega a 3 + 299 bytes.  \~
+        uint8_t plain[302];
         const bool is_short = rng() & 1;
         const size_t pn_len = 1 + rng() % 4;
         const size_t payload = (pn_len >= 4 ? 0 : 4 - pn_len) + rng() % 300;
