@@ -258,6 +258,24 @@ public:
 
     /// \~english The open streams, in no particular order.  \~spanish Los flujos abiertos, sin orden particular.  \~
     size_t count() const noexcept { return live_; }
+
+    /**
+     * @brief
+     * \~english How many streams of one direction the peer has opened, implicitly opened ones included (RFC 9000, 3.2).
+     * \~spanish Cuantos flujos de una direccion ha abierto el otro extremo, incluidos los abiertos implicitamente (RFC 9000, 3.2).
+     * \~
+     *
+     * \~english
+     * Streams open in order of their IDs, so the peer's are exactly the
+     * indices below this: what lets an application visit each one once, in
+     * order, without walking the table.
+     * \~spanish
+     * Los flujos se abren en el orden de sus identificadores, asi que los del
+     * otro son exactamente los indices por debajo de esto: lo que deja a una
+     * aplicacion visitar cada uno una vez, en orden, sin recorrer la tabla.
+     * \~
+     */
+    uint64_t peer_opened(bool bidirectional) const noexcept;
     Stream *find(uint64_t id) noexcept;
 
     /// \~english The i-th slot, possibly empty (id kNever): for walking every stream.

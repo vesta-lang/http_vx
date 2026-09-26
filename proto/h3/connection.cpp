@@ -270,6 +270,27 @@ void Connection::cancel(uint64_t stream, uint64_t code) noexcept {
     if (m != nullptr) stream_error(*m, code, "cancelled by the application");
 }
 
+bool Connection::stop_reading(uint64_t stream) noexcept {
+    Message *m = message(stream);
+    // \~english Only a request already reported: nothing can stop what it has not been told of.
+    // \~spanish Solo una peticion ya informada: nadie puede parar aquello de lo que no se le ha dicho nada.  \~
+    if (!cfg_.server || m == nullptr || failed() || m->phase == Phase::Headers || m->phase == Phase::Done) return false;
+    quic::Stream *s = q_.streams().find(stream);
+    if (s == nullptr || s->recv == nullptr) return false;
+    // \~english A trailer section waiting for QPACK, or any still to come, will not be read (RFC 9204, 4.4.2).
+    // \~spanish Una seccion de remolques esperando a QPACK, o las que falten, no se leeran (RFC 9204, 4.4.2).  \~
+    m->is_blocked = false;
+    m->blocked.clear();
+    decoder_.cancel_stream(m->id);
+    // \~english Done and reported: read_message throws away what still arrives, and says nothing more.
+    // \~spanish Acabado e informado: read_message tira lo que siga llegando, y no dice nada mas.  \~
+    m->phase = Phase::Done;
+    m->end_reported = true;
+    s->recv->stop(kNoError);
+    flush();
+    return !failed();
+}
+
 bool Connection::flush_one(Buffer &out, bool fin, uint64_t id) noexcept {
     quic::Stream *s = q_.streams().find(id);
     if (s == nullptr || s->send == nullptr) return true;
@@ -775,49 +796,68 @@ Event Connection::poll(uint64_t now_us) noexcept {
         return e;
     }
     // \~english Sections QPACK can read now.  \~spanish Secciones que QPACK ya puede leer.  \~
-    uint64_t ids[16];
-    size_t k = 0;
-    while (!failed() && (k = decoder_.take_unblocked(ids, 16)) != 0) {
-        for (size_t i = 0; i < k; ++i) {
-            Message *m = message(ids[i]);
-            if (m == nullptr || !m->is_blocked) continue;
-            Buffer kept;
-            kept.clear();
-            const size_t n = m->blocked.size();
-            uint8_t *d = kept.reserve(n);
-            if (d == nullptr) {
-                fail(kInternalError, "out of memory rereading a header section");
-                break;
-            }
-            util::vesta_memcpy(d, m->blocked.data(), n);
-            kept.commit(n);
-            m->blocked.clear();
-            m->is_blocked = false;
-            Event e = m->phase == Phase::Headers ? on_headers(*m, kept.data(), n) : on_trailers(*m, kept.data(), n);
-            if (e.kind != EventKind::None) {
-                flush();
-                return e;
-            }
+    for (;;) {
+        if (failed()) break;
+        if (unblocked_at_ == unblocked_count_) {
+            unblocked_at_ = 0;
+            unblocked_count_ = decoder_.take_unblocked(unblocked_, kUnblockedBatch);
+            if (unblocked_count_ == 0) break;
+        }
+        Message *m = message(unblocked_[unblocked_at_++]);
+        if (m == nullptr || !m->is_blocked) continue;
+        Buffer kept;
+        kept.clear();
+        const size_t n = m->blocked.size();
+        uint8_t *d = kept.reserve(n);
+        if (d == nullptr) {
+            fail(kInternalError, "out of memory rereading a header section");
+            break;
+        }
+        util::vesta_memcpy(d, m->blocked.data(), n);
+        kept.commit(n);
+        m->blocked.clear();
+        m->is_blocked = false;
+        Event e = m->phase == Phase::Headers ? on_headers(*m, kept.data(), n) : on_trailers(*m, kept.data(), n);
+        if (e.kind != EventKind::None) {
+            e.slot = static_cast<size_t>(m - messages_);
+            flush();
+            return e;
         }
     }
     if (failed()) return poll(now_us);
-    // \~english Server: every client request stream it has not seen yet (6.1).
-    // \~spanish Servidor: cada flujo de peticion del cliente que aun no ha visto (6.1).  \~
-    for (size_t i = 0; i < t.capacity() && !failed(); ++i) {
-        quic::Stream *s = t.slot(i);
-        if (s == nullptr || is_uni(s->id)) continue;
-        if (!cfg_.server) {
-            if (!by_client(s->id)) fail(kStreamCreationError, "a server-initiated bidirectional stream (6.1)");
-            continue;
-        }
-        if (!by_client(s->id) || message(s->id) != nullptr || s->id < next_request_) continue;
-        next_request_ = s->id + 4;
-        // \~english After GOAWAY, and past what this end follows, a request is refused before it is read (5.2, 4.1.1).
-        // \~spanish Tras GOAWAY, y pasado lo que sigue este extremo, una peticion se rechaza antes de leerla (5.2, 4.1.1).  \~
-        Message *m = (goaway_sent_ != kNone && s->id >= goaway_sent_) ? nullptr : adopt(s->id);
-        if (m == nullptr) {
-            if (s->send != nullptr) s->send->reset(kRequestRejected);
-            if (s->recv != nullptr) s->recv->stop(kRequestRejected);
+    /* \~english
+     * Server: every client request stream not seen yet, in order of ID (6.1).
+     * QUIC opens a peer's streams in order, implicitly the lower ones first
+     * (RFC 9000, 3.2), so the new ones are exactly the indices from
+     * next_request_ to what the peer opened -- each visited once.  Walking
+     * the table instead visited them in the order of its slots, and a stream
+     * found before a lower one moved next_request_ past the lower one, which
+     * was then never read.
+     * \~spanish
+     * Servidor: cada flujo de peticion del cliente aun sin ver, en orden de ID
+     * (6.1).  QUIC abre los flujos del otro en orden, implicitamente los
+     * menores primero (RFC 9000, 3.2), asi que los nuevos son exactamente los
+     * indices desde next_request_ hasta lo que abrio el otro -- cada uno
+     * visitado una vez.  Recorrer la tabla en su lugar los visitaba en el orden
+     * de sus casillas, y un flujo encontrado antes que otro menor adelantaba
+     * next_request_ por encima del menor, que ya no se leia nunca.
+     * \~ */
+    const uint64_t opened = t.peer_opened(true);
+    if (!cfg_.server) {
+        if (opened != 0) fail(kStreamCreationError, "a server-initiated bidirectional stream (6.1)");
+    } else {
+        for (; next_request_ / 4 < opened && !failed(); next_request_ += 4) {
+            quic::Stream *s = t.find(next_request_);
+            // \~english Gone before it was seen: there is nothing left of it to read.
+            // \~spanish Ido antes de verlo: no queda nada de el que leer.  \~
+            if (s == nullptr) continue;
+            // \~english After GOAWAY, and past what this end follows, a request is refused before it is read (5.2, 4.1.1).
+            // \~spanish Tras GOAWAY, y pasado lo que sigue este extremo, una peticion se rechaza antes de leerla (5.2, 4.1.1).  \~
+            Message *m = (goaway_sent_ != kNone && s->id >= goaway_sent_) ? nullptr : adopt(s->id);
+            if (m == nullptr) {
+                if (s->send != nullptr) s->send->reset(kRequestRejected);
+                if (s->recv != nullptr) s->recv->stop(kRequestRejected);
+            }
         }
     }
     if (failed()) return poll(now_us);
@@ -829,9 +869,10 @@ Event Connection::poll(uint64_t now_us) noexcept {
             drop(m);
             continue;
         }
-        const Event e = read_message(*s, m);
+        Event e = read_message(*s, m);
         if (failed()) return poll(now_us);
         if (e.kind != EventKind::None) {
+            e.slot = static_cast<size_t>(&m - messages_);
             cursor_ = (cursor_ + step + 1) % cfg_.max_requests;
             flush();
             return e;

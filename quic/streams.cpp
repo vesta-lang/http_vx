@@ -433,6 +433,10 @@ uint64_t StreamTable::peer_limit(bool bidirectional) const noexcept {
     return limit_[local_type(cfg_.is_server, bidirectional)];
 }
 
+uint64_t StreamTable::peer_opened(bool bidirectional) const noexcept {
+    return opened_[peer_type(cfg_.is_server, bidirectional)];
+}
+
 uint64_t StreamTable::max_streams(bool bidirectional) const noexcept {
     return limit_[peer_type(cfg_.is_server, bidirectional)];
 }

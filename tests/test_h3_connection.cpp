@@ -916,6 +916,138 @@ void test_blocked() {
         check(q != nullptr && q->fields.size() == 1, "with its field from the dynamic table");
         check(k.find(k.server_events, h3::EventKind::End, id) != nullptr && !k.hs.failed(), "and its end");
     }
+
+    // \~english Several sections let go of in one batch: each is reread, not only the first.
+    // \~spanish Varias secciones soltadas en una tanda: se relee cada una, no solo la primera.  \~
+    section("blocked, several at once");
+    Link k;
+    k.start(false);
+    k.pump(3, false);
+    qpack::Encoder e;
+    e.reset(qpack::EncoderConfig{});
+    e.on_peer_settings(4096, 16);
+    uint64_t ids[3];
+    const char *values[3] = {"one", "two", "three"};
+    for (int i = 0; i < 3; ++i) {
+        std::vector<qpack::Line> req = get();
+        req.push_back(line("x-custom", values[i]));
+        Buffer block;
+        e.encode(static_cast<uint64_t>(i) * 4, req.data(), req.size(), block, 1 << 20);
+        std::vector<uint8_t> v;
+        add_frame(v, h3::kHeaders, std::vector<uint8_t>(block.data(), block.data() + block.size()));
+        ids[i] = raw(k, true, v, true);
+    }
+    k.pump(3, false);
+    check(k.hs.decoder().blocked() == 3, "three requests wait for their inserts");
+    std::vector<uint8_t> enc;
+    add_varint(enc, qpack::kEncoderStreamType);
+    size_t n = 0;
+    const uint8_t *p = e.output(n);
+    enc.insert(enc.end(), p, p + n);
+    raw(k, false, enc, false);
+    k.pump(3, false);
+    for (int i = 0; i < 3; ++i)
+        check(k.find(k.server_events, h3::EventKind::Request, ids[i]) != nullptr &&
+                  k.find(k.server_events, h3::EventKind::End, ids[i]) != nullptr,
+              "every request let go of in the batch is read");
+    check(!k.hs.failed(), "nothing failed");
+}
+
+void test_stop_reading() {
+    section("stop reading");
+    Link k;
+    k.start();
+    k.pump();
+    const std::vector<qpack::Line> req = {line(":method", "POST"), line(":scheme", "https"),
+                                          line(":authority", "example.com"), line(":path", "/up")};
+    const uint64_t id = k.hc.send_request(req.data(), req.size(), false);
+    k.hc.send_body(id, reinterpret_cast<const uint8_t *>("abc"), 3, false);
+    k.pump();
+    check(k.find(k.server_events, h3::EventKind::Request, id) != nullptr && k.body(k.server_events, id) == "abc",
+          "the request and the first of its body");
+    check(!k.hc.stop_reading(id), "a client does not stop reading a request");
+    check(k.hs.stop_reading(id), "the server stops reading it");
+    check(!k.hs.stop_reading(id), "once");
+    k.pump();
+    Stream *cs = k.qc.streams().find(id);
+    check(cs != nullptr && cs->send->reset_code() == h3::kNoError,
+          "the client is asked to stop with H3_NO_ERROR (RFC 9114, 4.1.1)");
+    check(k.hs.respond(id, 413, nullptr, 0, true), "the response still goes");
+    k.hc.send_body(id, reinterpret_cast<const uint8_t *>("def"), 3, true);
+    k.pump();
+    check(k.body(k.server_events, id) == "abc" && k.find(k.server_events, h3::EventKind::End, id) == nullptr,
+          "nothing more of the request is reported");
+    const Rec *r = k.find(k.client_events, h3::EventKind::Response, id);
+    check(r != nullptr && r->status == 413 && k.find(k.client_events, h3::EventKind::End, id) != nullptr,
+          "the client has the whole response");
+    check(!k.hs.failed() && !k.hc.failed(), "nothing failed");
+
+    // \~english Trailers still waiting for QPACK: QPACK is told they will not be read (RFC 9204, 4.4.2).
+    // \~spanish Remolques aun esperando a QPACK: se le dice a QPACK que no se leeran (RFC 9204, 4.4.2).  \~
+    section("stop reading with blocked trailers");
+    Link b;
+    b.start(false);
+    b.pump(3, false);
+    std::vector<uint8_t> v;
+    add_frame(v, h3::kHeaders, section_of(req));
+    qpack::Encoder e;
+    e.reset(qpack::EncoderConfig{});
+    e.on_peer_settings(4096, 16);
+    const std::vector<qpack::Line> trailers = {line("x-checksum", "abc123")};
+    Buffer block;
+    e.encode(0, trailers.data(), trailers.size(), block, 1 << 20);
+    add_frame(v, h3::kHeaders, std::vector<uint8_t>(block.data(), block.data() + block.size()));
+    const uint64_t bid = raw(b, true, v, false);
+    b.pump(3, false);
+    check(b.find(b.server_events, h3::EventKind::Request, bid) != nullptr && b.hs.decoder().blocked() == 1,
+          "the request is read, its trailers wait for their inserts");
+    check(b.hs.stop_reading(bid), "the server stops reading it");
+    check(b.hs.decoder().blocked() == 0, "and QPACK no longer holds the trailers as blocked");
+    b.pump(3, false);
+    check(b.find(b.server_events, h3::EventKind::Reset, bid) == nullptr,
+          "the reset the client answers with is not reported: the stream was already left");
+    check(!b.hs.failed(), "nothing failed");
+
+    section("stop reading, a client");
+    Link c;
+    c.start();
+    c.pump();
+    const std::vector<qpack::Line> g = get();
+    const uint64_t cid = c.hc.send_request(g.data(), g.size(), true);
+    c.pump();
+    check(c.hs.respond(cid, 200, nullptr, 0, false), "a response with more to come");
+    c.pump();
+    check(c.find(c.client_events, h3::EventKind::Response, cid) != nullptr, "the client has its header section");
+    check(!c.hc.stop_reading(cid), "and cannot use what is a server's");
+}
+
+void test_stream_order() {
+    /* \~english
+     * Streams that finish give their slots back, and the next ones take them
+     * in the other order: a higher ID in a lower slot.  Each must still be
+     * read -- the server visits them by ID, not by slot.
+     * \~spanish
+     * Los flujos que acaban devuelven sus casillas, y los siguientes las cogen
+     * en el orden contrario: un ID mayor en una casilla menor.  Cada uno se
+     * tiene que leer igual -- el servidor los visita por ID, no por casilla.
+     * \~ */
+    section("request streams in slots out of order");
+    Link k;
+    k.start();
+    k.pump();
+    const std::vector<qpack::Line> req = get();
+    for (int i = 0; i < 2; ++i) {
+        const uint64_t id = k.hc.send_request(req.data(), req.size(), true);
+        k.pump();
+        k.hs.respond(id, 204, nullptr, 0, true);
+        k.pump();
+        check(k.find(k.client_events, h3::EventKind::End, id) != nullptr, "an exchange finishes");
+    }
+    const uint64_t a = k.hc.send_request(req.data(), req.size(), true);
+    const uint64_t b = k.hc.send_request(req.data(), req.size(), true);
+    k.pump();
+    check(k.find(k.server_events, h3::EventKind::Request, a) != nullptr, "the lower stream is read");
+    check(k.find(k.server_events, h3::EventKind::Request, b) != nullptr, "and the higher one");
 }
 
 } // namespace
@@ -930,6 +1062,8 @@ int main() {
     test_response_rules();
     test_more_rules();
     test_blocked();
+    test_stream_order();
+    test_stop_reading();
     if (failures != 0) {
         std::fprintf(stderr, "h3 connection: %d failure(s)\n", failures);
         return 1;

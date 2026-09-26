@@ -107,6 +107,7 @@ endif ()
 # que se pueda probar sin abrir un puerto no tiene por que depender de el.
 add_library(http_vx_core STATIC
         core/buffer.cpp
+        core/deadline_heap.cpp
         reactor/buffer_pool.cpp
         reactor/conn_table.cpp
         reactor/memory_backend.cpp
@@ -187,6 +188,7 @@ add_library(http_vx_quic STATIC
         quic/protection.cpp
         quic/recovery.cpp
         quic/reset.cpp
+        quic/routes.cpp
         quic/stream_recv.cpp
         quic/stream_send.cpp
         quic/streams.cpp
@@ -235,6 +237,20 @@ target_include_directories(http_vx_h3
         PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
 target_compile_options(http_vx_h3 PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_h3 PUBLIC http_vx_proto http_vx_quic http_vx_core vesta_alloc)
+
+# El servicio HTTP/3: datagramas dentro y fuera, conexiones QUIC con su saludo
+# TLS, y el mismo manejador que HTTP/1.1 y HTTP/2.  Aparte de `http_vx_h3`
+# porque es lo unico de HTTP/3 que necesita TLS: la conexion se prueba sin el.
+add_library(http_vx_h3_service STATIC
+        proto/h3/service.cpp
+        proto/h3/service_requests.cpp
+        proto/h3/service_route.cpp
+)
+target_include_directories(http_vx_h3_service
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_h3_service PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_h3_service PUBLIC http_vx_h3 http_vx_tls vesta_alloc)
 
 # ---------------------------------------------------------------------------
 # Un proveedor criptografico para QUIC, sobre la libcrypto de OpenSSL.
@@ -563,6 +579,18 @@ if (HTTP_VX_BUILD_TESTS)
     target_link_libraries(test_h3_frame PRIVATE http_vx_h3)
     http_vx_add_test(test_h3_connection tests/test_h3_connection.cpp)
     target_link_libraries(test_h3_connection PRIVATE http_vx_h3)
+    http_vx_add_test(test_quic_routes tests/test_quic_routes.cpp)
+    http_vx_add_test(test_deadline_heap tests/test_deadline_heap.cpp)
+    http_vx_add_test(test_http3_service tests/test_http3_service.cpp)
+    target_link_libraries(test_http3_service PRIVATE http_vx_h3_service)
+    if (TARGET http_vx_crypto_openssl)
+        target_link_libraries(test_http3_service PRIVATE http_vx_crypto_openssl)
+        target_compile_definitions(test_http3_service PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    endif ()
+    if (TARGET http_vx_crypto_cng)
+        target_link_libraries(test_http3_service PRIVATE http_vx_crypto_cng)
+        target_compile_definitions(test_http3_service PRIVATE HTTP_VX_HAVE_CNG=1)
+    endif ()
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)

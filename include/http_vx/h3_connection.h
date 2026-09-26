@@ -131,6 +131,24 @@ struct Event {
     uint64_t code = 0;
     const uint8_t *data = nullptr;
     size_t len = 0;
+    /**
+     * \~english
+     * For an event of a request stream, which of the Config::max_requests
+     * places holds it -- the same one from its Request or Response to its End
+     * or Reset, and reused after.  What lets the application keep its own
+     * state per request in an array of the same size, reached without a
+     * search.  kNoSlot for an event of the connection.
+     * \~spanish
+     * Para un evento de un flujo de peticion, cual de los Config::max_requests
+     * sitios lo guarda -- el mismo desde su Request o Response hasta su End o
+     * Reset, y reutilizado despues.  Lo que deja a la aplicacion guardar su
+     * propio estado por peticion en un array del mismo tamano, alcanzado sin
+     * buscar.  kNoSlot para un evento de la conexion.
+     * \~
+     */
+    size_t slot = kNoSlot;
+
+    static constexpr size_t kNoSlot = ~size_t{0};
 };
 
 /**
@@ -206,6 +224,30 @@ public:
      * \~
      */
     void cancel(uint64_t stream, uint64_t code) noexcept;
+
+    /**
+     * @brief
+     * \~english Server: stops reading @p stream's request, keeping the response (4.1.1).
+     * \~spanish Servidor: deja de leer la peticion de @p stream, conservando la respuesta (4.1.1).
+     * \~
+     *
+     * \~english
+     * For a response that does not need the rest of the request -- a 413, say.
+     * The client is asked to stop sending with H3_NO_ERROR, QPACK is told the
+     * stream's sections will not be read (RFC 9204, 4.4.2), and nothing more
+     * of the request is reported; what still arrives, a reset included, is
+     * thrown away.  The response is sent whole: a client MUST NOT discard it
+     * for having had its request cut short.
+     * \~spanish
+     * Para una respuesta que no necesita el resto de la peticion -- un 413, por
+     * ejemplo.  Se le pide al cliente que deje de mandar con H3_NO_ERROR, se le
+     * dice a QPACK que las secciones del flujo no se leeran (RFC 9204, 4.4.2), y
+     * no se informa de nada mas de la peticion; lo que siga llegando, un
+     * reinicio incluido, se tira.  La respuesta se manda entera: un cliente NO
+     * DEBE tirarla por haberse cortado su peticion.
+     * \~
+     */
+    bool stop_reading(uint64_t stream) noexcept;
 
     /// \~english Server: a graceful shutdown -- requests from here on are refused (5.2).
     /// \~spanish Servidor: un cierre ordenado -- las peticiones desde aqui se rechazan (5.2).  \~
@@ -320,6 +362,21 @@ private:
     uint64_t next_request_ = 0;
     /// \~english The time of the last poll, for closing.  \~spanish La hora del ultimo poll, para cerrar.  \~
     uint64_t now_ = 0;
+    /* \~english
+     * Streams QPACK has let go of and that are not reread yet.  Taking them
+     * removes them from QPACK, and a poll returns at the first event -- so
+     * the rest of a batch has to be kept here, or those streams stay blocked
+     * for good.
+     * \~spanish
+     * Flujos que QPACK ha soltado y que aun no se han releido.  Cogerlos los
+     * quita de QPACK, y un poll vuelve en el primer evento -- asi que el resto
+     * de una tanda tiene que guardarse aqui, o esos flujos se quedan
+     * bloqueados para siempre.
+     * \~ */
+    static constexpr size_t kUnblockedBatch = 16;
+    uint64_t unblocked_[kUnblockedBatch] = {};
+    size_t unblocked_count_ = 0;
+    size_t unblocked_at_ = 0;
 };
 
 } // namespace h3
