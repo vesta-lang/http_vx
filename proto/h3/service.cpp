@@ -320,6 +320,19 @@ void Http3Service::on_timer(uint64_t now_us) noexcept {
 
 void Http3Service::free_slot(uint32_t i) noexcept {
     Slot &s = slots_[i];
+    // \~english Why it ended, read before the layers go: counted, and kept for whoever asks.
+    // \~spanish Por que acabo, leido antes de que se vayan las capas: contado, y guardado para quien pregunte.  \~
+    if (s.quic != nullptr) {
+        last_end_.reason = s.quic->end_reason();
+        last_end_.code = s.quic->close_code();
+        last_end_.application = s.quic->close_is_application();
+        last_end_.why = nullptr;
+        if (s.h3 != nullptr && s.h3->failed())
+            last_end_.why = s.h3->failure().why;
+        else if (s.tls != nullptr)
+            last_end_.why = s.tls->why();
+        ++counts_.ended[static_cast<size_t>(last_end_.reason)];
+    }
     for (size_t r = 0; r < s.route_count; ++r) routes_.remove(s.routes[r].bytes, s.routes[r].len);
     s.route_count = 0;
     s.first.len = 0;

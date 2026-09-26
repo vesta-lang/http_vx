@@ -502,6 +502,9 @@ void test_many(Crypto &crypto, const Keys &k, const char *name) {
     w.air.clear();
     w.run(w.now + 60000000);
     check(w.service.connections() == 0 && w.service.counts().closed == 3, "idle connections are gone");
+    check(w.service.counts().ended[static_cast<size_t>(EndReason::IdleTimeout)] == 3 &&
+              w.service.last_end().reason == EndReason::IdleTimeout,
+          "and it is said why: the idle timeout");
     check(w.service.timer() == kNever, "and no timer is left");
     Client &e = w.add();
     w.settle();
@@ -659,6 +662,10 @@ void test_h3_failure(Crypto &crypto, const Keys &k) {
     }
     w.settle();
     check(w.service.counts().failed == 1, "the failure is counted");
+    w.run(w.now + 10000000);
+    const http_vx::Http3End &end = w.service.last_end();
+    check(end.reason == EndReason::Closed && end.application && end.code == h3::kFrameUnexpected && end.why != nullptr,
+          "the end says HTTP/3 closed it, with its code and its reason");
     check(c.q->state() != ConnState::Active, "and the connection is closed");
 }
 
@@ -669,6 +676,10 @@ void test_alpn(Crypto &crypto, const Keys &k) {
     Client &c = w.add(kH2);
     w.settle();
     check(!c.started && c.q->state() != ConnState::Active, "a client that does not offer h3 is turned away");
+    w.run(w.now + 10000000);
+    const http_vx::Http3End &end = w.service.last_end();
+    check(end.reason == EndReason::Closed && !end.application && end.why != nullptr,
+          "the end says the handshake closed it, and why");
 }
 
 void run_all(Crypto &crypto, const Keys &k, const char *name) {

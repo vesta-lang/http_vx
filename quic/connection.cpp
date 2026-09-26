@@ -247,6 +247,22 @@ const char *migration_name(Migration m) noexcept {
     return "unknown";
 }
 
+const char *end_reason_name(EndReason r) noexcept {
+    switch (r) {
+    case EndReason::None:                 return "none";
+    case EndReason::Closed:               return "closed";
+    case EndReason::PeerClosed:           return "peer-closed";
+    case EndReason::StatelessReset:       return "stateless-reset";
+    case EndReason::IdleTimeout:          return "idle-timeout";
+    case EndReason::VersionNegotiation:   return "version-negotiation";
+    case EndReason::PacketNumbers:        return "packet-numbers";
+    case EndReason::ConfidentialityLimit: return "confidentiality-limit";
+    case EndReason::NoValidatedPath:      return "no-validated-path";
+    case EndReason::kCount:               break;
+    }
+    return "unknown";
+}
+
 size_t Connection::offered_versions(uint32_t *out, size_t room) const noexcept {
     const size_t kept = offered_count_ < kOfferedVersions ? offered_count_ : kOfferedVersions;
     for (size_t i = 0; i < kept && i < room; ++i) out[i] = offered_[i];
@@ -1463,6 +1479,7 @@ void Connection::run_path_timers(uint64_t now_us) noexcept {
              * hay ninguna, cerrar en silencio, tirando todo el estado.
              * \~ */
             if (fallback_ == kNoPath || !paths_[fallback_].validated) {
+                ended(EndReason::NoValidatedPath);
                 state_ = ConnState::Closed;
                 return;
             }
@@ -1527,6 +1544,7 @@ Migration Connection::migrate(const Path &path, uint64_t now_us) noexcept {
 void Connection::close(uint64_t code, bool application, uint64_t trigger_frame,
                        uint64_t now_us) noexcept {
     if (state_ != ConnState::Active) return;
+    ended(EndReason::Closed);
     state_ = ConnState::Closing;
     close_code_ = code;
     close_app_ = application;
@@ -1775,6 +1793,7 @@ void Connection::on_datagram(const Path &path, uint8_t *data, size_t n, Ecn ecn,
     // \~spanish El otro no tiene esta conexion: drenar, y no mandar nada mas (10.3.1).  \~
     if (maybe_reset && first_failed && check_stateless_reset(tail, path.peer)) {
         closed_by_reset_ = true;
+        ended(EndReason::StatelessReset);
         state_ = ConnState::Draining;
         close_deadline_ = now_us + 3 * pto_duration();
         return;
@@ -2135,6 +2154,7 @@ void Connection::process_version_negotiation(const uint8_t *p, const PacketHeade
     // \~english No version in common: the attempt is abandoned, without a word (6.2).
     // \~spanish Ninguna version en comun: se abandona el intento, sin decir nada (6.2).  \~
     vn_received_ = true;
+    ended(EndReason::VersionNegotiation);
     state_ = ConnState::Closed;
 }
 
@@ -2365,6 +2385,7 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
             // \~english The peer closed: drain, send nothing (10.2.2).
             // \~spanish El otro extremo cerro: drenar, no mandar nada (10.2.2).  \~
             closed_by_peer_ = true;
+            ended(EndReason::PeerClosed);
             close_code_ = f.error_code;
             close_app_ = f.application;
             close_frame_ = f.trigger_type;
@@ -2801,6 +2822,7 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
     // \~english 12.3: at 2^62-1 the sender MUST close without a CONNECTION_CLOSE or anything else.
     // \~spanish 12.3: en 2^62-1 el emisor DEBE cerrar sin CONNECTION_CLOSE ni nada mas.  \~
     if (pn >= (uint64_t{1} << 62) - 1) {
+        ended(EndReason::PacketNumbers);
         state_ = ConnState::Closed;
         return 0;
     }
@@ -2853,6 +2875,7 @@ size_t Connection::build_packet(Space s, uint8_t *out, size_t room, Pad pad, boo
          * CONNECTION_CLOSE, que seria un paquete mas con la misma clave.
          * \~ */
         if (one_rtt_.sealed >= confidentiality_limit()) {
+            ended(EndReason::ConfidentialityLimit);
             state_ = ConnState::Closed;
             close_code_ = static_cast<uint64_t>(TransportError::AeadLimitReached);
             close_app_ = false;
@@ -3180,6 +3203,7 @@ void Connection::on_timer(uint64_t now_us) noexcept {
     // \~english Silence past the idle timeout: the connection is gone, without a word (10.1).
     // \~spanish Silencio pasado el plazo de inactividad: la conexion desaparece, sin decir nada (10.1).  \~
     if (idle_deadline_ != kNever && now_us >= idle_deadline_) {
+        ended(EndReason::IdleTimeout);
         state_ = ConnState::Closed;
         return;
     }

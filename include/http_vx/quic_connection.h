@@ -432,6 +432,51 @@ enum class ConnState : uint8_t {
 
 /**
  * @brief
+ * \~english Why a connection ended: the first cause, kept.
+ * \~spanish Por que acabo una conexion: la primera causa, guardada.
+ * \~
+ *
+ * \~english
+ * Several ways out send nothing at all -- the idle timeout, running out of
+ * packet numbers, a key used to its limit -- and from outside they looked
+ * the same as any other close.  Each has its name, so whoever runs the
+ * connection can count them and say which.
+ * \~spanish
+ * Varias salidas no mandan nada -- el plazo de inactividad, quedarse sin
+ * numeros de paquete, una clave usada hasta su limite -- y desde fuera
+ * parecian iguales que cualquier otro cierre.  Cada una tiene su nombre, para
+ * que quien lleve la conexion pueda contarlas y decir cual.
+ * \~
+ */
+enum class EndReason : uint8_t {
+    /// \~english Not ended.  \~spanish No acabo.  \~
+    None,
+    /// \~english This end closed, with close_code() (10.2).  \~spanish Este extremo cerro, con close_code() (10.2).  \~
+    Closed,
+    /// \~english The peer sent CONNECTION_CLOSE (10.2.2).  \~spanish El otro mando CONNECTION_CLOSE (10.2.2).  \~
+    PeerClosed,
+    /// \~english A stateless reset from the peer (10.3.1).  \~spanish Un reinicio sin estado del otro (10.3.1).  \~
+    StatelessReset,
+    /// \~english Silence past the idle timeout (10.1).  \~spanish Silencio pasado el plazo de inactividad (10.1).  \~
+    IdleTimeout,
+    /// \~english No version in common (6.2).  \~spanish Ninguna version en comun (6.2).  \~
+    VersionNegotiation,
+    /// \~english Packet numbers used up (12.3).  \~spanish Numeros de paquete agotados (12.3).  \~
+    PacketNumbers,
+    /// \~english A key sealed its limit of packets and could not be updated (RFC 9001, 6.6).
+    /// \~spanish Una clave sello su limite de paquetes y no se pudo actualizar (RFC 9001, 6.6).  \~
+    ConfidentialityLimit,
+    /// \~english A failed path with no validated one to fall back to (9.3.2).
+    /// \~spanish Un camino fallido sin otro validado al que volver (9.3.2).  \~
+    NoValidatedPath,
+    kCount,
+};
+
+/// \~english A short name for @p r.  \~spanish Un nombre corto para @p r.  \~
+const char *end_reason_name(EndReason r) noexcept;
+
+/**
+ * @brief
  * \~english Why packets were dropped: counted, never silent.
  * \~spanish Por que se tiraron paquetes: contado, nunca en silencio.
  * \~
@@ -915,6 +960,8 @@ public:
     uint64_t close_code() const noexcept { return close_code_; }
     bool close_is_application() const noexcept { return close_app_; }
     uint64_t close_frame() const noexcept { return close_frame_; }
+    /// \~english Why it ended, or None.  \~spanish Por que acabo, o None.  \~
+    EndReason end_reason() const noexcept { return end_; }
 
     StreamTable &streams() noexcept { return streams_; }
 
@@ -1403,6 +1450,12 @@ private:
     uint64_t close_code_ = 0;
     bool close_app_ = false;
     uint64_t close_frame_ = 0;
+    EndReason end_ = EndReason::None;
+    /// \~english Keeps @p r as the reason, unless one was kept already.
+    /// \~spanish Guarda @p r como motivo, salvo que ya hubiera uno.  \~
+    void ended(EndReason r) noexcept {
+        if (end_ == EndReason::None) end_ = r;
+    }
 
     DropCounts drops_;
     SendCounts sent_;

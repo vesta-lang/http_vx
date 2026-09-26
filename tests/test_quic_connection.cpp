@@ -809,6 +809,8 @@ void test_violation(Crypto &cr) {
     check(client.state() == ConnState::Draining && client.closed_by_peer() &&
               client.close_code() == static_cast<uint64_t>(TransportError::StreamLimitError),
           "the client did not hear the server's STREAM_LIMIT_ERROR");
+    check(server.end_reason() == EndReason::Closed && client.end_reason() == EndReason::PeerClosed,
+          "each end says who closed");
 }
 
 /// \~english A connection nobody talks on is gone after the idle timeout, silently (10.1).
@@ -836,6 +838,9 @@ void test_idle(Crypto &cr) {
     }
     check(client.state() == ConnState::Closed && now >= 5000000 && now <= 5000000 + 3000000,
           "a silent connection did not end at its idle timeout");
+    check(client.end_reason() == EndReason::IdleTimeout &&
+              std::strcmp(end_reason_name(client.end_reason()), "idle-timeout") == 0,
+          "and it says so: silent on the wire, not to whoever runs it");
     check(client.recovery().pto_events() > 0, "no probe went out while waiting");
 }
 
@@ -1013,7 +1018,8 @@ void test_version_negotiation(Crypto &cr) {
         client.on_datagram(kPath,pkt, ad.reply_len, Ecn::NotEct, 1000);
         uint32_t offered[4] = {};
         const size_t count = client.offered_versions(offered, 4);
-        check(client.state() == ConnState::Closed && client.ended_in_version_negotiation(),
+        check(client.state() == ConnState::Closed && client.ended_in_version_negotiation() &&
+                  client.end_reason() == EndReason::VersionNegotiation,
               "a VN with no version in common did not end the attempt");
         check(count == 2 && offered[0] == kVersion1 && (offered[1] & 0x0f0f0f0fu) == 0x0a0a0a0au,
               "the offered versions are not what the server listed");
@@ -1696,6 +1702,9 @@ void test_key_update_rules(Crypto &cr, Aead a) {
         check(sent == 6 && v.client.state() == ConnState::Closed &&
                   v.client.close_code() == static_cast<uint64_t>(TransportError::AeadLimitReached),
               "the confidentiality limit did not stop the connection at exactly its value");
+        // \~english It closed with AEAD_LIMIT_REACHED first: that is the reason kept, not the stop that followed.
+        // \~spanish Cerro antes con AEAD_LIMIT_REACHED: ese es el motivo guardado, no la parada que siguio.  \~
+        check(v.client.end_reason() == EndReason::Closed, "the first cause is the one kept");
         // \~english The last packet the key allowed carried the reason (6.6: close before, RECOMMENDED).
         // \~spanish El ultimo paquete que permitia la clave llevo el motivo (6.6: cerrar antes, RECOMENDADO).  \~
         check(v.client.sent().connection_close == 1,
@@ -2055,7 +2064,8 @@ void test_cid_rules(Crypto &cr) {
                                               sizeof reply);
         check(ad.reason == AdmitReason::SentStatelessReset, "the acceptor did not answer with a reset");
         k.client.on_datagram(kPath,reply, ad.reply_len, Ecn::NotEct, k.now);
-        check(k.client.closed_by_reset() && k.client.state() == ConnState::Draining,
+        check(k.client.closed_by_reset() && k.client.state() == ConnState::Draining &&
+                  k.client.end_reason() == EndReason::StatelessReset,
               "the client did not recognise the reset for its server");
         check(k.client.build_datagram(g_sent,out, sizeof out, k.now) == 0, "a reset connection still sends");
     }
@@ -2800,6 +2810,7 @@ void test_paths(Crypto &cr) {
         }
         check(m.k.server.state() == ConnState::Closed && !closing && m.k.server.sent().connection_close == closes,
               "with no validated address left the connection did not close silently");
+        check(m.k.server.end_reason() == EndReason::NoValidatedPath, "silently on the wire, but it says why");
     }
 
     // \~english 9: no new address before the handshake is confirmed, nor when migration is disabled.

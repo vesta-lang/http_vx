@@ -136,6 +136,23 @@ struct Http3Counts {
     /// \~spanish Conexiones que fallaron en HTTP/3, y conexiones terminadas.  \~
     uint64_t failed = 0;
     uint64_t closed = 0;
+    /// \~english Connections gone, by why they ended.  \~spanish Conexiones terminadas, por que acabaron.  \~
+    uint64_t ended[static_cast<size_t>(quic::EndReason::kCount)] = {};
+};
+
+/**
+ * @brief
+ * \~english How one connection ended: the transport's reason and code, and the words of the layer that closed it.
+ * \~spanish Como acabo una conexion: el motivo y el codigo del transporte, y las palabras de la capa que la cerro.
+ * \~
+ */
+struct Http3End {
+    quic::EndReason reason = quic::EndReason::None;
+    uint64_t code = 0;
+    bool application = false;
+    /// \~english HTTP/3's or the handshake's reason, if either closed it; null otherwise.
+    /// \~spanish La razon de HTTP/3 o del saludo, si alguno la cerro; nulo si no.  \~
+    const char *why = nullptr;
 };
 
 /**
@@ -196,6 +213,9 @@ class Http3Service {
     size_t connections() const noexcept { return live_; }
 
     const Http3Counts &counts() const noexcept { return counts_; }
+
+    /// \~english How the last connection to go ended.  \~spanish Como acabo la ultima conexion que se fue.  \~
+    const Http3End &last_end() const noexcept { return last_end_; }
 
     /// \~english The acceptor, for its counters.  \~spanish El acceptor, por sus contadores.  \~
     const quic::Acceptor *acceptor() const noexcept { return acceptor_; }
@@ -279,6 +299,7 @@ class Http3Service {
     Buffer said_;
     Buffer names_;
     Http3Counts counts_;
+    Http3End last_end_;
 };
 
 } // namespace http_vx
