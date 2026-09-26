@@ -148,6 +148,10 @@ add_library(http_vx_proto STATIC
         proto/h2/settings.cpp
         proto/h2/stream.cpp
         proto/h2/writer.cpp
+
+        proto/h3/qpack.cpp
+        proto/h3/qpack_decoder.cpp
+        proto/h3/qpack_table.cpp
 )
 target_include_directories(http_vx_proto
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -527,6 +531,7 @@ if (HTTP_VX_BUILD_TESTS)
         target_compile_definitions(test_quic_tls PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
+    http_vx_add_test(test_qpack tests/test_qpack.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
