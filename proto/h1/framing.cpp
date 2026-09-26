@@ -55,15 +55,7 @@ namespace {
  *
  * \~
  */
-bool is_chunked(const uint8_t *p, size_t len) noexcept {
-    static const char kChunked[] = "chunked";
-    if (len != sizeof(kChunked) - 1) return false;
-    for (size_t i = 0; i < len; ++i) {
-        const uint8_t c = static_cast<uint8_t>(static_cast<unsigned>(p[i]) | 0x20u);
-        if (c != static_cast<uint8_t>(kChunked[i])) return false;
-    }
-    return true;
-}
+bool is_chunked(const uint8_t *p, size_t len) noexcept { return token_equals(p, len, "chunked"); }
 
 /**
  * @brief
@@ -108,20 +100,11 @@ Codings walk_codings(const Fields &fields, const uint8_t *base) noexcept {
     out.present = true;
 
     for (; f != nullptr; f = fields.find_next(f)) {
-        const uint8_t *v = base + f->value_off;
-        size_t left = f->value_len;
-
-        for (;;) {
-            size_t n = 0;
-            while (n < left && v[n] != ',') ++n;
-
-            const uint8_t *p = v;
-            size_t len = n;
-            while (len != 0 && is_ows(*p)) {
-                ++p;
-                --len;
-            }
-            while (len != 0 && is_ows(p[len - 1])) --len;
+        ListReader list(base + f->value_off, f->value_len);
+        ListItem item;
+        while (list.next(item)) {
+            const uint8_t *p = item.p;
+            const size_t len = item.len;
 
             /* \~english
              * A coding may carry parameters after a semicolon.  They do not
@@ -157,16 +140,28 @@ Codings walk_codings(const Fields &fields, const uint8_t *base) noexcept {
                 out.last_is_chunked = chunked;
                 if (chunked) ++out.chunked_count;
             }
-
-            if (n == left) break;
-            v += n + 1;
-            left -= n + 1;
         }
     }
     return out;
 }
 
 } // namespace
+
+bool connection_persists(const Request &req, const uint8_t *base) noexcept {
+    bool close = false;
+    bool keep_alive = false;
+    for (const Field *f = req.fields.find(FieldId::Connection); f != nullptr; f = req.fields.find_next(f)) {
+        ListReader list(base + f->value_off, f->value_len);
+        ListItem item;
+        while (list.next(item)) {
+            if (token_equals(item.p, item.len, "close")) close = true;
+            if (token_equals(item.p, item.len, "keep-alive")) keep_alive = true;
+        }
+    }
+    if (close) return false;
+    if (req.version == Version::Http10) return keep_alive;
+    return true;
+}
 
 StatusCode framing_status(FramingError e) noexcept {
     switch (e) {

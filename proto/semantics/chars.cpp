@@ -132,4 +132,36 @@ bool field_value_is_valid(const char *s, size_t len) noexcept {
     return true;
 }
 
+bool token_equals(const uint8_t *p, size_t len, const char *lower) noexcept {
+    size_t i = 0;
+    for (; i < len && lower[i] != '\0'; ++i) {
+        const uint8_t c = p[i] >= 'A' && p[i] <= 'Z' ? static_cast<uint8_t>(p[i] + ('a' - 'A')) : p[i];
+        if (c != static_cast<uint8_t>(lower[i])) return false;
+    }
+    return i == len && lower[i] == '\0';
+}
+
+bool ListReader::next(ListItem &out) noexcept {
+    if (done_) return false;
+    size_t n = 0;
+    while (n < left_ && v_[n] != ',') ++n;
+    const uint8_t *p = v_;
+    size_t len = n;
+    while (len != 0 && is_ows(*p)) {
+        ++p;
+        --len;
+    }
+    while (len != 0 && is_ows(p[len - 1])) --len;
+    out.p = p;
+    out.len = len;
+    // \~english The last element is the one no comma follows.  \~spanish El ultimo elemento es el que no sigue ninguna coma.  \~
+    if (n == left_) {
+        done_ = true;
+    } else {
+        v_ += n + 1;
+        left_ -= n + 1;
+    }
+    return true;
+}
+
 } // namespace http_vx

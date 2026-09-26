@@ -50,6 +50,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -459,7 +460,62 @@ void test_a_smuggled_message_is_refused() {
 
 } // namespace
 
+/**
+ * @brief
+ * \~english The version and the Connection field decide whether the connection goes on (RFC 9112, 9.3, 9.6).
+ * \~spanish La version y la cabecera Connection deciden si la conexion sigue (RFC 9112, 9.3, 9.6).
+ * \~
+ *
+ * \~english
+ * Each case sends a second request behind the first: when the first said
+ * "close", the server MUST NOT process the second -- the client promised
+ * not to send it, and anything that follows is not its to answer.
+ * \~spanish
+ * Cada caso manda una segunda peticion detras de la primera: cuando la
+ * primera dijo "close", el servidor NO DEBE procesar la segunda -- el cliente
+ * prometio no mandarla, y lo que venga detras no le toca contestarlo.
+ * \~
+ */
+void test_the_connection_options() {
+    struct Case {
+        const char *head;
+        bool persists;
+        const char *said;
+        const char *what;
+    };
+    const Case cases[] = {
+        {"GET /c HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", false, "onnection: close",
+         "HTTP/1.1 with close: the connection ends after the answer"},
+        {"GET /c HTTP/1.1\r\nHost: a\r\nConnection: Keep-Alive, CLOSE\r\n\r\n", false, "onnection: close",
+         "close in any case, anywhere in the list"},
+        {"GET /c HTTP/1.1\r\nHost: a\r\nConnection: foo\r\nConnection: , ,close\r\n\r\n", false, "onnection: close",
+         "close in a second Connection field, after empty elements"},
+        {"GET /c HTTP/1.1\r\nHost: a\r\nConnection: closed\r\n\r\n", true, "HTTP/1.1 200",
+         "an option that only starts like close is another option"},
+        {"GET /c HTTP/1.1\r\nHost: a\r\n\r\n", true, "HTTP/1.1 200", "HTTP/1.1 alone persists"},
+        {"GET /c HTTP/1.0\r\nHost: a\r\n\r\n", false, "onnection: close", "HTTP/1.0 alone does not persist"},
+        {"GET /c HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n", true, "onnection: keep-alive",
+         "HTTP/1.0 with keep-alive persists, and says so"},
+        {"GET /c HTTP/1.0\r\nHost: a\r\nConnection: keep-alive, close\r\n\r\n", false, "onnection: close",
+         "close wins over keep-alive"},
+    };
+    for (const Case &k : cases) {
+        Server s;
+        check(s.start(), "the server would not start");
+        const ConnHandle c = s.shard.adopt(7, 0);
+        std::string both = std::string(k.head) + "GET /after HTTP/1.1\r\nHost: a\r\n\r\n";
+        s.send(both.c_str());
+        s.run();
+        if (s.shard.conns().alive(c) != k.persists || s.handler.calls != (k.persists ? 2 : 1) || !s.out_has(k.said)) {
+            std::fprintf(stderr, "FAIL: %s (alive %d, calls %d)\n", k.what, static_cast<int>(s.shard.conns().alive(c)),
+                         s.handler.calls);
+            ++failures;
+        }
+    }
+}
+
 int main() {
+    test_the_connection_options();
     test_a_request_is_answered();
     test_a_request_in_pieces();
     test_two_requests_in_one_read();

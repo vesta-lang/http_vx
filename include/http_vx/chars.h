@@ -244,6 +244,65 @@ bool token_is_valid(const char *s, size_t len) noexcept;
  */
 bool field_value_is_valid(const char *s, size_t len) noexcept;
 
+/**
+ * @brief
+ * \~english Whether the token @p p / @p len is @p lower, without regard to case.
+ * \~spanish Si el token @p p / @p len es @p lower, sin atender a mayusculas.
+ * \~
+ *
+ * \~english
+ * For the tokens HTTP compares that way: transfer codings (RFC 9110,
+ * 10.1.4), connection options (7.6.1).  Only A to Z are lowered, and nothing
+ * else: a trick that sets a bit on every byte would also turn a CR into a
+ * hyphen.  @p lower is written in lower case.
+ * \~spanish
+ * Para los tokens que HTTP compara asi: codificaciones de transferencia (RFC
+ * 9110, 10.1.4), opciones de conexion (7.6.1).  Solo se bajan de la A a la Z,
+ * y nada mas: un truco que pusiera un bit en cada byte convertiria tambien un
+ * CR en un guion.  @p lower va escrito en minusculas.
+ * \~
+ */
+bool token_equals(const uint8_t *p, size_t len, const char *lower) noexcept;
+
+/**
+ * @brief
+ * \~english One element of a comma-separated list, without the whitespace around it.
+ * \~spanish Un elemento de una lista separada por comas, sin el espacio de alrededor.
+ * \~
+ */
+struct ListItem {
+    const uint8_t *p = nullptr;
+    size_t len = 0;
+};
+
+/**
+ * @brief
+ * \~english Walks a field value that is a list (RFC 9110, 5.6.1), one element at a time.
+ * \~spanish Recorre un valor de cabecera que es una lista (RFC 9110, 5.6.1), un elemento cada vez.
+ * \~
+ *
+ * \~english
+ * Every element comes out, the empty ones too -- `a,,b` is three -- because
+ * what an empty element means is the caller's rule, not the list's: some
+ * fields ignore it, as 5.6.1 asks, and some take it as malformed.
+ * \~spanish
+ * Sale cada elemento, tambien los vacios -- `a,,b` son tres --, porque que
+ * signifique un elemento vacio es regla de quien llama, no de la lista: unas
+ * cabeceras lo ignoran, como pide 5.6.1, y otras lo toman por mal formado.
+ * \~
+ */
+class ListReader {
+  public:
+    ListReader(const uint8_t *v, size_t n) noexcept : v_(v), left_(n) {}
+    /// \~english The next element; false once there is none.  \~spanish El siguiente elemento; falso cuando no queda ninguno.  \~
+    bool next(ListItem &out) noexcept;
+
+  private:
+    const uint8_t *v_;
+    size_t left_;
+    bool done_ = false;
+};
+
 } // namespace http_vx
 
 #endif // HTTP_VX_CHARS_H

@@ -257,6 +257,33 @@ Framing frame_request_body(const Request &req, const uint8_t *base) noexcept;
  */
 [[gnu::cold]] StatusCode framing_status(FramingError e) noexcept;
 
+/**
+ * @brief
+ * \~english Whether the connection goes on after the answer to @p req (RFC 9112, 9.3).
+ * \~spanish Si la conexion sigue tras la respuesta a @p req (RFC 9112, 9.3).
+ * \~
+ *
+ * \~english
+ * The version and the Connection field decide it together: the "close"
+ * option ends it whatever the version -- a server that receives it MUST
+ * close after its final response (9.6) --; otherwise HTTP/1.1 persists, and
+ * HTTP/1.0 only with the "keep-alive" option.  Options are compared without
+ * regard to case (RFC 9110, 7.6.1), in every Connection field and every
+ * element of each.
+ *
+ * \~spanish
+ * Lo deciden juntos la version y la cabecera Connection: la opcion "close" la
+ * acaba sea cual sea la version -- un servidor que la recibe DEBE cerrar tras
+ * su respuesta final (9.6) --; si no, HTTP/1.1 persiste, y HTTP/1.0 solo con la
+ * opcion "keep-alive".  Las opciones se comparan sin atender a mayusculas (RFC
+ * 9110, 7.6.1), en cada cabecera Connection y en cada elemento de cada una.
+ * \~
+ * @param req  \~english the request  \~spanish la peticion  \~
+ * @param base \~english the bytes its spans point into  \~spanish los bytes a los que apuntan sus trozos  \~
+ * @return     \~english true if the connection persists  \~spanish true si la conexion persiste  \~
+ */
+bool connection_persists(const Request &req, const uint8_t *base) noexcept;
+
 } // namespace h1
 } // namespace http_vx
 

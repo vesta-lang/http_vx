@@ -251,7 +251,9 @@ bool Http1Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
             if (f.error != h1::FramingError::None)
                 return refuse(h1::framing_status(f.error), out);
 
-            s.keep_alive = s.req.version != Version::Http10;
+            // \~english The version and the Connection field, together (RFC 9112, 9.3).
+            // \~spanish La version y la cabecera Connection, juntas (RFC 9112, 9.3).  \~
+            s.keep_alive = h1::connection_persists(s.req, in.data());
 
             if (f.kind == h1::BodyKind::Chunked) {
                 s.phase = Phase::Chunks;

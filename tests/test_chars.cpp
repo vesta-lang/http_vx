@@ -255,7 +255,57 @@ void test_field_value_is_valid() {
 
 } // namespace
 
+/**
+ * @brief
+ * \~english Comparing a token without regard to case: only A to Z are lowered.
+ * \~spanish Comparar un token sin atender a mayusculas: solo se bajan de la A a la Z.
+ * \~
+ */
+void test_token_equals() {
+    const uint8_t close[] = {'C', 'l', 'O', 's', 'E'};
+    check(http_vx::token_equals(close, 5, "close"), "case does not matter");
+    check(!http_vx::token_equals(close, 4, "close"), "a prefix is another token");
+    const uint8_t closed[] = {'c', 'l', 'o', 's', 'e', 'd'};
+    check(!http_vx::token_equals(closed, 6, "close"), "a longer token is another token");
+    // \~english CR set with bit 5 would be a hyphen: it must not pass for one.
+    // \~spanish CR con el bit 5 puesto seria un guion: no puede pasar por uno.  \~
+    const uint8_t cr[] = {'k', 'e', 'e', 'p', '\r', 'a', 'l', 'i', 'v', 'e'};
+    check(!http_vx::token_equals(cr, 10, "keep-alive"), "a CR is not a hyphen");
+    const uint8_t at[] = {'@'};
+    check(!http_vx::token_equals(at, 1, "`"), "only letters are lowered");
+    check(http_vx::token_equals(close, 0, ""), "empty equals empty");
+}
+
+/**
+ * @brief
+ * \~english A list walked element by element: trimmed, empty ones included, the last one without a comma.
+ * \~spanish Una lista recorrida elemento a elemento: sin espacios, con los vacios, el ultimo sin coma.
+ * \~
+ */
+void test_list_reader() {
+    const char *v = " a ,\tb,,  c\t ";
+    http_vx::ListReader list(reinterpret_cast<const uint8_t *>(v), std::strlen(v));
+    http_vx::ListItem item;
+    const char *want[] = {"a", "b", "", "c"};
+    int n = 0;
+    while (list.next(item)) {
+        const bool same = n < 4 && item.len == std::strlen(want[n]) &&
+                          std::memcmp(item.p, want[n], item.len) == 0;
+        check(same, "each element, trimmed, empty ones kept");
+        ++n;
+    }
+    check(n == 4, "four elements");
+    http_vx::ListReader empty(reinterpret_cast<const uint8_t *>(""), 0);
+    check(empty.next(item) && item.len == 0 && !empty.next(item), "an empty value is one empty element");
+    http_vx::ListReader trailing(reinterpret_cast<const uint8_t *>("a,"), 2);
+    n = 0;
+    while (trailing.next(item)) ++n;
+    check(n == 2, "a trailing comma leaves an empty last element");
+}
+
 int main() {
+    test_token_equals();
+    test_list_reader();
     test_the_three_forbidden();
     test_separators();
     test_token_characters();
