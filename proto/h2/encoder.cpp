@@ -133,35 +133,6 @@ bool put_bytes(Buffer &out, const void *p, size_t n) noexcept {
 
 } // namespace
 
-bool must_never_be_indexed(FieldId id) noexcept {
-    /* \~english
-     * Four, and each is a thing somebody IS rather than a thing somebody asked
-     * for.  Remembering one puts it in a table whose size somebody else can
-     * measure by watching how long the messages come out -- which is CRIME, and
-     * which is why the protocol has a representation that asks the whole path
-     * not to keep it.
-     *
-     * A set rather than a rule, because there is no property of the bytes that
-     * tells a secret from anything else.  Which also means the set is a
-     * FLOOR: a caller with a header of its own that carries a credential has to
-     * say so, and the way to say so is `Indexing::Never`.
-     *
-     * \~spanish
-     * Cuatro, y cada una es algo que alguien ES en vez de algo que alguien ha
-     * pedido.  Recordar una la mete en una tabla cuyo tamano puede medir otro
-     * mirando cuanto salen midiendo los mensajes -- que es CRIME, y que es la
-     * razon de que el protocolo tenga una representacion que le pide a todo el
-     * camino que no la guarde.
-     *
-     * Un conjunto y no una regla, porque no hay ninguna propiedad de los bytes
-     * que distinga un secreto de lo demas.  Lo que quiere decir ademas que el
-     * conjunto es un SUELO: quien tenga una cabecera propia que lleve una
-     * credencial tiene que decirlo, y la forma de decirlo es `Indexing::Never`.
-     * \~ */
-    return id == FieldId::Authorization || id == FieldId::ProxyAuthorization ||
-           id == FieldId::Cookie || id == FieldId::SetCookie;
-}
-
 void Encoder::reset(uint32_t peer_table_size) noexcept {
     table_.reset(peer_table_size);
     pending_size_ = kNoSizeUpdate;
@@ -352,7 +323,7 @@ WriteStatus Encoder::write_pair(Buffer &out, FieldId id, const uint8_t *name,
      * credencial, y quien lo leyera despues se lo creeria -- y lo copiaria a una
      * cabecera donde no lo para nada.
      * \~ */
-    if (how == Indexing::Incremental && must_never_be_indexed(id))
+    if (how == Indexing::Incremental && field_is_secret(id))
         return WriteStatus::MustNotBeIndexed;
 
     /* \~english

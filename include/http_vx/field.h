@@ -249,6 +249,69 @@ uint8_t field_name_len(FieldId id) noexcept;
  */
 FieldId field_id_of(const char *name, size_t len) noexcept;
 
+/**
+ * @brief
+ * \~english Whether @p id is a connection-specific field (RFC 9113, 8.2.2; RFC 9114, 4.2).
+ * \~spanish Si @p id es un campo propio de la conexion (RFC 9113, 8.2.2; RFC 9114, 4.2).
+ * \~
+ *
+ * \~english
+ * Connection and the fields with connection-specific semantics --
+ * Proxy-Connection, Keep-Alive, Transfer-Encoding, Upgrade.  HTTP/2 and
+ * HTTP/3 carry that metadata by other means, so a message that has one is
+ * malformed, and an endpoint MUST NOT generate one.  One list for both
+ * directions: the rule that refuses a request's and the one that keeps a
+ * response from carrying one are the same sentence of the RFC.
+ *
+ * \~spanish
+ * Connection y los campos con semantica de conexion -- Proxy-Connection,
+ * Keep-Alive, Transfer-Encoding, Upgrade --.  HTTP/2 y HTTP/3 llevan eso por
+ * otros medios, asi que un mensaje que tenga uno esta mal formado, y un extremo
+ * NO DEBE generarlo.  Una lista para los dos sentidos: la regla que rechaza el
+ * de una peticion y la que impide que una respuesta lleve uno son la misma
+ * frase del RFC.
+ * \~
+ * @param id \~english the identifier  \~spanish el identificador  \~
+ * @return   \~english true if it names one  \~spanish true si nombra uno  \~
+ */
+bool field_is_connection_specific(FieldId id) noexcept;
+
+/**
+ * @brief
+ * \~english Whether @p id is a field that must never be remembered by a compressor (RFC 7541, 7.1.3; RFC 9204, 7.1.3).
+ * \~spanish Si @p id es una cabecera que un compresor no puede recordar nunca (RFC 7541, 7.1.3; RFC 9204, 7.1.3).
+ * \~
+ *
+ * \~english
+ * The fields that carry what somebody is, rather than what they asked for.  A
+ * remembered credential is a credential whose length can be measured by
+ * somebody who can make the server send it again -- which is the whole of
+ * CRIME in one sentence.
+ *
+ * A fact about HTTP fields and not about one compressor: HPACK and QPACK both
+ * have a representation that asks every hop never to index a field, and both
+ * must use it for the same fields.  Here because it is a question with one
+ * answer, and a caller that worked it out for itself would be a second list of
+ * what is a secret.
+ *
+ * \~spanish
+ * Las cabeceras que llevan quien es alguien, en vez de que ha pedido.  Una
+ * credencial recordada es una credencial cuya longitud puede medir alguien que
+ * consiga que el servidor la mande otra vez -- que es todo CRIME en una frase.
+ *
+ * Un hecho de las cabeceras HTTP y no de un compresor: HPACK y QPACK tienen los
+ * dos una representacion que le pide a cada salto no indexar nunca una
+ * cabecera, y los dos tienen que usarla para las mismas.  Aqui porque es una
+ * pregunta con una sola respuesta, y quien la resolviera por su cuenta seria
+ * una segunda lista de lo que es un secreto.
+ *
+ * \~
+ * @param id \~english the identifier  \~spanish el identificador  \~
+ * @return   \~english true if it must never be remembered
+ *           \~spanish true si no se puede recordar nunca  \~
+ */
+bool field_is_secret(FieldId id) noexcept;
+
 } // namespace http_vx
 
 #endif // HTTP_VX_FIELD_H

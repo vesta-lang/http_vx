@@ -16,6 +16,7 @@
 #include "http_vx/h1_writer.h"
 
 #include "http_vx/chars.h"
+#include "http_vx/content_length.h"
 
 #include "util/mem/vesta_memcpy.h"
 
@@ -56,40 +57,6 @@ inline bool is_framing_field(FieldId id) noexcept {
     return id == FieldId::ContentLength || id == FieldId::TransferEncoding;
 }
 
-/**
- * @brief
- * \~english Writes @p v as decimal into @p out, backwards then reversed.
- * \~spanish Escribe @p v en decimal en @p out, al reves y luego dado la vuelta.
- * \~
- *
- * \~english
- * Written out rather than handed to the C library.  `snprintf` would look at
- * the locale, and a locale that groups digits would put a separator inside a
- * content length -- which is a number the peer parses, not text a person
- * reads.  It has happened, and it is the kind of bug that only appears on the
- * machines configured a certain way.
- *
- * \~spanish
- * Escrito a mano y no entregado a la biblioteca de C.  `snprintf` miraria la
- * configuracion regional, y una que agrupe digitos pondria un separador dentro
- * de una longitud de contenido -- que es un numero que analiza el otro extremo,
- * no texto que lea una persona --.  Ha pasado, y es de los errores que solo
- * aparecen en las maquinas configuradas de cierta forma.
- *
- * \~
- */
-size_t decimal(uint8_t *out, uint64_t v) noexcept {
-    uint8_t tmp[20];
-    size_t n = 0;
-    do {
-        tmp[n++] = static_cast<uint8_t>('0' + (v % 10));
-        v /= 10;
-    } while (v != 0);
-
-    for (size_t i = 0; i < n; ++i) out[i] = tmp[n - 1 - i];
-    return n;
-}
-
 } // namespace
 
 size_t write_chunk_header(uint8_t *out, uint64_t size) noexcept {
@@ -123,8 +90,8 @@ bool ResponseWriter::put(const void *p, size_t n) noexcept {
 }
 
 bool ResponseWriter::put_u64(uint64_t v) noexcept {
-    uint8_t digits[20];
-    const size_t n = decimal(digits, v);
+    uint8_t digits[kContentLengthDigits];
+    const size_t n = write_content_length(digits, v);
     return put(digits, n);
 }
 

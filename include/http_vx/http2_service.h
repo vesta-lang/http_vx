@@ -63,6 +63,7 @@
 #include "http_vx/h2_connection.h"
 #include "http_vx/h2_writer.h"
 #include "http_vx/http1_service.h"
+#include "http_vx/response_lines.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -149,6 +150,34 @@ class Http2Service final : public Service {
     /// \~english How many requests are in hand right now.
     /// \~spanish Cuantas peticiones hay en mano ahora mismo.  \~
     size_t in_hand() const noexcept { return in_hand_; }
+
+    /**
+     * @brief
+     * \~english How many handler answers could not travel as written, and went out as 500.
+     * \~spanish Cuantas respuestas de un manejador no podian viajar tal como se escribieron, y salieron como 500.
+     * \~
+     *
+     * \~english
+     * A handler that failed to build its answer, or one whose fields HTTP/2
+     * may not carry: a connection-specific field, a name that is not a token,
+     * a value with a character HTTP forbids (RFC 9113, 8.2.1, 8.2.2), or more
+     * fields than @c kMostFields.  Counted because the 500 alone says this
+     * server failed and not where; the count is what tells a handler bug from
+     * a network one.
+     * \~spanish
+     * Un manejador que no consiguio construir su respuesta, o uno cuyas
+     * cabeceras no puede llevar HTTP/2: un campo propio de la conexion, un
+     * nombre que no es un token, un valor con un caracter que HTTP prohibe
+     * (RFC 9113, 8.2.1, 8.2.2), o mas cabeceras que @c kMostFields.  Se cuenta
+     * porque el 500 solo dice que este servidor fallo y no donde; la cuenta es
+     * lo que distingue un fallo del manejador de uno de la red.
+     * \~
+     */
+    size_t bad_answers() const noexcept { return bad_answers_; }
+
+    /// \~english The rule the last bad answer broke, or null if there has been none.
+    /// \~spanish La regla que rompio la ultima respuesta mala, o nulo si no ha habido ninguna.  \~
+    const char *last_bad_answer() const noexcept { return last_bad_answer_; }
 
     /// \~english Gives the memory back.  \~spanish Devuelve la memoria.  \~
     void release() noexcept;
@@ -287,10 +316,52 @@ class Http2Service final : public Service {
     /// \~spanish Muda la seccion de remolques recien leida a @p w: sus bytes detras del cuerpo, sus campos a la peticion.  \~
     bool add_trailers(State &s, Work &w, Buffer &keep) noexcept;
 
-    /// \~english Writes @p res as HTTP/2, keeping what does not fit.
-    /// \~spanish Escribe @p res como HTTP/2, guardando lo que no quepa.  \~
+    /**
+     * @brief
+     * \~english Writes @p res as HTTP/2, keeping what does not fit.
+     * \~spanish Escribe @p res como HTTP/2, guardando lo que no quepa.
+     * \~
+     *
+     * @param s      \~english the connection  \~spanish la conexion  \~
+     * @param stream \~english which stream  \~spanish que flujo  \~
+     * @param res    \~english the answer  \~spanish la respuesta  \~
+     * @param count  \~english how many of @c lines_ are its fields, checked by @c wire_fields
+     *               \~spanish cuantas de @c lines_ son sus cabeceras, comprobadas por @c wire_fields  \~
+     * @param head   \~english whether it answers a HEAD: the fields and no content (RFC 9110, 9.3.2)
+     *               \~spanish si contesta a un HEAD: las cabeceras y ningun contenido (RFC 9110, 9.3.2)  \~
+     * @param w      \~english the stream's work, or null  \~spanish el trabajo del flujo, o nulo  \~
+     * @param out    \~english where the frames go  \~spanish donde van las tramas  \~
+     * @return       \~english false if the connection must end
+     *               \~spanish false si la conexion tiene que acabar  \~
+     */
     bool deliver(State &s, uint32_t stream, const ResponseBuilder &res,
-                 Work *w, Buffer &out) noexcept;
+                 size_t count, bool head, Work *w, Buffer &out) noexcept;
+
+    /**
+     * @brief
+     * \~english Ends @p stream with @p code, making room for the RST_STREAM if there is none.
+     * \~spanish Acaba @p stream con @p code, haciendo sitio para el RST_STREAM si no lo hay.
+     * \~
+     *
+     * \~english
+     * The room is made by moving what the connection owes into @p out --
+     * sending it now instead of later -- because a reset that is not written
+     * is a stream the table forgot and the peer did not: it keeps the stream
+     * open, and waits.  If even @p out cannot take it, false, and the
+     * connection ends like any other that cannot be answered.
+     * \~spanish
+     * El sitio se hace pasando a @p out lo que debe la conexion -- mandandolo
+     * ahora en vez de despues --, porque un reinicio que no se escribe es un
+     * flujo que la tabla olvido y el otro extremo no: lo sigue teniendo abierto,
+     * y espera.  Si ni @p out lo acepta, false, y la conexion se acaba como
+     * cualquier otra a la que no se puede contestar.
+     * \~
+     */
+    bool send_reset(State &s, uint32_t stream, h2::ErrorCode code, Buffer &out) noexcept;
+
+    /// \~english Gives back @p n bytes of window on @p stream, making room the way @c send_reset does.
+    /// \~spanish Devuelve @p n bytes de ventana en @p stream, haciendo sitio como @c send_reset.  \~
+    bool give_window(State &s, uint32_t stream, size_t n, Buffer &out) noexcept;
 
     /// \~english Sends what the windows allow of a waiting answer.
     /// \~spanish Manda lo que dejen las ventanas de una respuesta que espera.  \~
@@ -309,10 +380,33 @@ class Http2Service final : public Service {
     /// \~spanish Vuelve a intentar cada respuesta que espera.  \~
     bool drain(State &s, Buffer &out) noexcept;
 
-    /// \~english Answers @p status with nothing else to say.
-    /// \~spanish Contesta @p status sin nada mas que decir.  \~
+    /// \~english Answers @p status with nothing else to say, and asks a peer still sending to stop.
+    /// \~spanish Contesta @p status sin nada mas que decir, y le pide a un extremo que sigue mandando que pare.  \~
     bool refuse(State &s, uint32_t stream, StatusCode status, Work *w,
                 Buffer &out) noexcept;
+
+    /**
+     * \~english
+     * The most fields an answer carries.  HTTP/2 itself has no count, only the
+     * peer's advisory SETTINGS_MAX_HEADER_LIST_SIZE; this is the room
+     * @c wire_fields gets, and an answer with more is a 500 counted in
+     * @c bad_answers -- never one with some of its fields dropped.
+     * \~spanish
+     * Las cabeceras mas que lleva una respuesta.  HTTP/2 no tiene cuenta, solo
+     * el SETTINGS_MAX_HEADER_LIST_SIZE orientativo del otro extremo; este es el
+     * sitio que recibe @c wire_fields, y una respuesta con mas es un 500 contado
+     * en @c bad_answers -- nunca una a la que se le quitan cabeceras.
+     * \~
+     */
+    static constexpr size_t kMostFields = 64;
+
+    /// \~english The fields of the answer being written, lowered and checked.
+    /// \~spanish Las cabeceras de la respuesta que se escribe, en minusculas y comprobadas.  \~
+    WireField lines_[kMostFields];
+
+    /// \~english Where the unknown names of @c lines_ are lowered.
+    /// \~spanish Donde se bajan a minusculas los nombres desconocidos de @c lines_.  \~
+    Buffer names_;
 
     State *state_ = nullptr;
     uint32_t capacity_ = 0;
@@ -347,6 +441,8 @@ class Http2Service final : public Service {
     h2::Limits limits_;
     size_t max_body_ = 0;
     size_t served_ = 0;
+    size_t bad_answers_ = 0;
+    const char *last_bad_answer_ = nullptr;
 };
 
 } // namespace http_vx

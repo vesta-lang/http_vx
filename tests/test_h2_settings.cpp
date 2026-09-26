@@ -120,7 +120,7 @@ void test_a_fresh_connection_is_already_right() {
  * \~
  */
 void test_a_bad_value_says_which_kind_it_is() {
-    uint8_t buf[6];
+    uint8_t buf[6] = {};
     Settings s;
 
     /* \~english

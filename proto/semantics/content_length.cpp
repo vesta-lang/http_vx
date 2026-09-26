@@ -160,4 +160,18 @@ ContentLength parse_content_length(const Fields &fields,
     return ContentLength{ContentLengthStatus::Present, agreed};
 }
 
+size_t write_content_length(uint8_t *out, uint64_t v) noexcept {
+    // \~english Backwards into a scratch, then turned round: the digits are known last-first.
+    // \~spanish Al reves en un borrador, y luego dado la vuelta: los digitos se saben del ultimo al primero.  \~
+    uint8_t tmp[kContentLengthDigits];
+    size_t n = 0;
+    do {
+        tmp[n++] = static_cast<uint8_t>('0' + (v % 10));
+        v /= 10;
+    } while (v != 0);
+
+    for (size_t i = 0; i < n; ++i) out[i] = tmp[n - 1 - i];
+    return n;
+}
+
 } // namespace http_vx

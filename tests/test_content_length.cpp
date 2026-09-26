@@ -335,6 +335,35 @@ void test_repeats_and_lists() {
     }
 }
 
+/**
+ * @brief
+ * \~english What is written reads back as the same number, at both ends of the range.
+ * \~spanish Lo que se escribe se lee como el mismo numero, en los dos extremos del rango.
+ * \~
+ */
+void test_written() {
+    using http_vx::kContentLengthDigits;
+    using http_vx::write_content_length;
+
+    const uint64_t values[] = {0, 5, 10, 1234567890, 18446744073709551615ull};
+    const char *texts[] = {"0", "5", "10", "1234567890", "18446744073709551615"};
+
+    for (size_t i = 0; i < sizeof values / sizeof values[0]; ++i) {
+        uint8_t out[kContentLengthDigits] = {};
+        const size_t n = write_content_length(out, values[i]);
+        check(n == std::strlen(texts[i]) && std::memcmp(out, texts[i], n) == 0,
+              "a length was not written as its decimal digits");
+
+        Msg m;
+        char text[kContentLengthDigits + 1] = {};
+        std::memcpy(text, out, n);
+        m.add(text);
+        const http_vx::ContentLength cl = m.parse();
+        check(cl.status == http_vx::ContentLengthStatus::Present && cl.value == values[i],
+              "a written length did not read back as itself");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -343,6 +372,7 @@ int main() {
     test_malformed();
     test_too_large();
     test_repeats_and_lists();
+    test_written();
 
     if (failures != 0) {
         std::fprintf(stderr, "test_content_length: %d failures\n", failures);

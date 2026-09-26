@@ -165,6 +165,43 @@ enum class EventKind : uint8_t {
 
     /**
      * \~english
+     * A header block larger than SETTINGS_MAX_HEADER_LIST_SIZE, head or
+     * trailers, on a stream that is otherwise fine.  The block went through
+     * the table to its end (RFC 9113, 10.5.1: "The field block MUST be
+     * processed to ensure a consistent connection state"), and what the
+     * @c Request and header buffer hold of it is a prefix that must not be
+     * read as a request.
+     *
+     * The stream is NOT reset: a server "can send an HTTP 431 (Request Header
+     * Fields Too Large) status code" (RFC 9113, 10.5.1), and a 431 is an
+     * answer the client can show, where RST_STREAM(ENHANCE_YOUR_CALM) is one
+     * it can only log.  So the caller answers 431 on the stream -- or resets
+     * it itself; answering nothing leaves the stream open.  @c ends says
+     * whether the peer is still sending, which decides whether the answer
+     * should be followed by RST_STREAM(NO_ERROR) (RFC 9113, 8.1).
+     * @c why names the limit.
+     * \~spanish
+     * Un bloque de cabeceras mayor que SETTINGS_MAX_HEADER_LIST_SIZE, cabecera
+     * o remolques, en un flujo que por lo demas esta bien.  El bloque paso por
+     * la tabla hasta el final (RFC 9113, 10.5.1: "The field block MUST be
+     * processed to ensure a consistent connection state"), y lo que tienen de
+     * el el @c Request y el buffer de cabeceras es un principio que no se puede
+     * leer como una peticion.
+     *
+     * El flujo NO se reinicia: un servidor "can send an HTTP 431 (Request
+     * Header Fields Too Large) status code" (RFC 9113, 10.5.1), y un 431 es una
+     * respuesta que el cliente puede ensenar, donde RST_STREAM(ENHANCE_YOUR_CALM)
+     * es una que solo puede anotar.  Asi que quien llama contesta 431 en el
+     * flujo -- o lo reinicia el mismo; no contestar nada deja el flujo abierto.
+     * @c ends dice si el otro sigue mandando, que decide si detras de la
+     * respuesta va un RST_STREAM(NO_ERROR) (RFC 9113, 8.1).  @c why nombra el
+     * limite.
+     * \~
+     */
+    HeadersTooLarge,
+
+    /**
+     * \~english
      * One stream is over and the connection carries on.  Whatever was being
      * done for it should stop.
      * \~spanish
@@ -380,7 +417,9 @@ class Connection {
      * Two WINDOW_UPDATEs go out, one for the stream and one for the
      * connection, because the peer keeps two counts and giving back only one
      * of them stops the connection just as surely -- only later, and for no
-     * reason anybody can see.
+     * reason anybody can see.  Except when the stream has closed in the
+     * meantime: then only the connection's goes, because nothing but PRIORITY
+     * may be sent on a closed stream (RFC 9113, 5.1).
      *
      * \~spanish
      * Lo llama quien consumio el cuerpo, y NO cuando el cuerpo llego.  Esa
@@ -392,6 +431,9 @@ class Connection {
      * Salen dos WINDOW_UPDATE, uno del flujo y otro de la conexion, porque el
      * otro extremo lleva dos cuentas y devolverle solo una detiene la conexion
      * igual de seguro -- solo que mas tarde, y sin que nadie pueda ver por que.
+     * Salvo que el flujo se haya cerrado entretanto: entonces solo sale el de
+     * la conexion, porque por un flujo cerrado no se puede mandar nada mas que
+     * PRIORITY (RFC 9113, 5.1).
      *
      * \~
      * @param id \~english which stream  \~spanish que flujo  \~
@@ -407,6 +449,16 @@ class Connection {
      * \~spanish Acaba el flujo @p id con @p code.
      * \~
      *
+     * \~english
+     * The stream table is told it was THIS end, so that what the peer sent
+     * before reading the reset is dropped rather than taken as an error
+     * (RFC 9113, 5.1; see @c RecentStreams).
+     * \~spanish
+     * A la tabla de flujos se le dice que fue ESTE extremo, para que lo que el
+     * otro mando antes de leer el reinicio se tire en vez de tomarse por un
+     * error (RFC 9113, 5.1; ver @c RecentStreams).
+     * \~
+     *
      * @param id   \~english which stream  \~spanish que flujo  \~
      * @param code \~english why  \~spanish por que  \~
      * @return     \~english false if there was no room to say so yet
@@ -416,18 +468,26 @@ class Connection {
 
     /**
      * @brief
-     * \~english Why the event just returned refused its stream as malformed.
-     * \~spanish Por que el suceso recien devuelto rechazo su flujo por mal formado.
+     * \~english Which rule the event just returned was a refusal for.
+     * \~spanish Por que regla fue un rechazo el suceso recien devuelto.
      * \~
      *
      * \~english
-     * A @c StreamEnded carries the code the peer is sent, and PROTOCOL_ERROR
-     * alone says nothing about which rule was broken.  This is the rule, for
-     * logging; null when the last event was not such a refusal.
+     * A @c StreamEnded or a @c Closed carries the code the peer is sent, and
+     * PROTOCOL_ERROR alone says nothing about which rule was broken.  This is
+     * the rule, for logging: set for every stream this end refuses and every
+     * connection it ends, except when the frame layer itself refused a frame
+     * (@c FrameReader keeps only the code).  Null when the last event was not
+     * a refusal by this end -- a request, a body, or the PEER resetting or
+     * leaving.
      * \~spanish
-     * Un @c StreamEnded lleva el codigo que se le manda al otro extremo, y
-     * PROTOCOL_ERROR solo no dice que regla se rompio.  Esto es la regla, para
-     * anotarla; nulo cuando el ultimo suceso no fue un rechazo asi.
+     * Un @c StreamEnded o un @c Closed lleva el codigo que se le manda al otro
+     * extremo, y PROTOCOL_ERROR solo no dice que regla se rompio.  Esto es la
+     * regla, para anotarla: puesta en cada flujo que rechaza este extremo y en
+     * cada conexion que acaba, salvo cuando fue la capa de tramas la que
+     * rechazo una trama (@c FrameReader solo guarda el codigo).  Nulo cuando el
+     * ultimo suceso no fue un rechazo de este extremo -- una peticion, un
+     * cuerpo, o el OTRO reiniciando o yendose.
      * \~
      * @return \~english the reason, or null  \~spanish el motivo, o nulo  \~
      */
@@ -517,11 +577,35 @@ class Connection {
      */
     bool credit_connection(uint32_t n) noexcept;
 
-    Event fail(ErrorCode code) noexcept;
+    /// \~english Ends the connection with @p code, keeps @p why for @c why, and writes the GOAWAY.
+    /// \~spanish Acaba la conexion con @p code, guarda @p why para @c why, y escribe el GOAWAY.  \~
+    Event fail(ErrorCode code, const char *why) noexcept;
 
     /// \~english Ends stream @p id with @p code, keeps @p why for @c why, and says so.
     /// \~spanish Acaba el flujo @p id con @p code, guarda @p why para @c why, y lo dice.  \~
     Event refuse(uint32_t id, ErrorCode code, const char *why) noexcept;
+
+    /**
+     * @brief
+     * \~english Ends the connection because an answer did not fit the room kept for it.
+     * \~spanish Acaba la conexion porque una respuesta no cupo en el sitio guardado para ella.
+     * \~
+     *
+     * \~english
+     * Unreachable while @c kLargestAnswer is right: @c read keeps that much
+     * room before every frame.  It exists so that the day it is wrong is a
+     * connection ended with a reason, and not an answer the peer was owed and
+     * never sent -- a RST_STREAM it never saw, or window it never got back.
+     * \~spanish
+     * Inalcanzable mientras @c kLargestAnswer este bien: @c read guarda ese
+     * sitio antes de cada trama.  Existe para que el dia que este mal sea una
+     * conexion acabada con un motivo, y no una respuesta que se le debia al otro
+     * extremo y no salio nunca -- un RST_STREAM que no vio, o ventana que no le
+     * volvio.
+     * \~
+     * @return \~english the @c Closed event  \~spanish el suceso @c Closed  \~
+     */
+    Event no_room() noexcept;
 
     /// \~english What the content-length of a request just read says about its stream; null if nothing is wrong.
     /// \~spanish Lo que dice del flujo la content-length de una peticion recien leida; nulo si no hay nada mal.  \~
@@ -532,6 +616,16 @@ class Connection {
     Event on_window_update(const View &v) noexcept;
     Event on_headers(const View &v, Buffer &headers,
                      http_vx::Request &req) noexcept;
+
+    /// \~english A DATA frame: the windows charged, the stream asked, the padding given back.
+    /// \~spanish Una trama DATA: las ventanas cobradas, el flujo preguntado, el relleno devuelto.  \~
+    Event on_data(const View &v) noexcept;
+
+    /// \~english The peer ending one stream.  \~spanish El otro extremo acabando un flujo.  \~
+    Event on_rst_stream() noexcept;
+
+    /// \~english The peer leaving.  \~spanish El otro extremo yendose.  \~
+    Event on_goaway(const View &v) noexcept;
 
     FrameReader reader_;
     hpack::Decoder decoder_;
@@ -610,6 +704,19 @@ class Connection {
     /// \~english And the rule behind it, when there is one to name.
     /// \~spanish Y la regla detras, cuando hay una que nombrar.  \~
     const char *block_why_ = nullptr;
+
+    /**
+     * \~english
+     * Whether the open block is for a stream this end already reset: it is
+     * decoded for the table's sake and then nothing is said about it (RFC
+     * 9113, 5.1).  Decided on the HEADERS, like the fields above.
+     * \~spanish
+     * Si el bloque abierto es de un flujo que este extremo ya reinicio: se
+     * descodifica por la tabla y luego no se dice nada de el (RFC 9113, 5.1).
+     * Se decide en el HEADERS, como los campos de arriba.
+     * \~
+     */
+    bool block_dropped_ = false;
 
     /// \~english What @c why answers.  \~spanish Lo que contesta @c why.  \~
     const char *why_ = nullptr;

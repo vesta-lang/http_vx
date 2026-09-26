@@ -207,6 +207,26 @@ void test_unknown() {
           "a name without a terminator did not resolve");
 }
 
+/**
+ * @brief
+ * \~english Exactly the four credentials are secrets, whatever compressor asks (RFC 7541, 7.1.3).
+ * \~spanish Exactamente las cuatro credenciales son secretos, pregunte el compresor que pregunte (RFC 7541, 7.1.3).
+ * \~
+ */
+void test_secrets() {
+    using http_vx::FieldId;
+    check(http_vx::field_is_secret(FieldId::Authorization), "authorization is not a secret");
+    check(http_vx::field_is_secret(FieldId::ProxyAuthorization), "proxy-authorization is not a secret");
+    check(http_vx::field_is_secret(FieldId::Cookie), "cookie is not a secret");
+    check(http_vx::field_is_secret(FieldId::SetCookie), "set-cookie is not a secret");
+    check(!http_vx::field_is_secret(FieldId::Unknown), "an unknown field was taken for a secret");
+
+    size_t secrets = 0;
+    for (uint16_t i = 1; i < static_cast<uint16_t>(FieldId::Count); ++i)
+        if (http_vx::field_is_secret(static_cast<FieldId>(i))) ++secrets;
+    check(secrets == 4, "the secrets are not exactly the four credentials");
+}
+
 } // namespace
 
 int main() {
@@ -215,6 +235,7 @@ int main() {
     test_no_duplicates();
     test_case_insensitive();
     test_unknown();
+    test_secrets();
 
     if (failures != 0) {
         std::fprintf(stderr, "test_field: %d failures\n", failures);

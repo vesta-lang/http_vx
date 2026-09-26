@@ -41,6 +41,12 @@
  * what @c Verdict::Discard is for, and it is the reason a verdict is not just
  * "yes or no".
  *
+ * Which finished streams get that treatment depends on who ended them, and
+ * that is the one thing the highest identifier cannot say: frames on a
+ * stream THIS end reset are late, frames on one that closed any other way
+ * were sent by a peer that knew (RFC 9113, 5.1).  @c RecentStreams keeps that
+ * much for the last few hundred identifiers, in a fixed ring.
+ *
  * \~spanish
  * Aqui es donde un bloque de cabeceras deja de ser una cosa suelta y pasa a ser
  * una peticion dentro de una conexion que lleva otras cientos.
@@ -70,6 +76,12 @@
  * para siempre sin que ninguno de los dos supiera decir por que.  Para eso esta
  * @c Verdict::Discard, y es la razon de que un veredicto no sea solo "si o no".
  *
+ * Que flujos terminados reciben ese trato depende de quien los acabo, y eso es
+ * lo unico que no puede decir el identificador mayor: las tramas de un flujo
+ * que reinicio ESTE extremo llegan tarde, las de uno que se cerro de otra forma
+ * las mando un extremo que lo sabia (RFC 9113, 5.1).  @c RecentStreams guarda
+ * eso de los ultimos cientos de identificadores, en un anillo fijo.
+ *
  * \~
  */
 #ifndef HTTP_VX_H2_STREAM_H
@@ -77,6 +89,7 @@
 
 #include "http_vx/h2_flow.h"
 #include "http_vx/h2_limits.h"
+#include "http_vx/h2_recent.h"
 #include "http_vx/h2_settings.h"
 
 #include <cstddef>
@@ -147,10 +160,12 @@ enum class StreamState : uint8_t {
     /**
      * \~english
      * Over.  A stream in this state is not kept: it is forgotten, and what
-     * remembers it is the highest identifier seen.
+     * remembers it is the highest identifier seen -- and, for the recent
+     * ones, how it ended (@c RecentStreams).
      * \~spanish
      * Terminado.  Un flujo en este estado no se guarda: se olvida, y lo que se
-     * acuerda de el es el identificador mayor visto.
+     * acuerda de el es el identificador mayor visto -- y, de los recientes,
+     * como acabo (@c RecentStreams).
      * \~
      */
     Closed,
@@ -209,8 +224,8 @@ struct Outcome {
     Verdict verdict = Verdict::Accept;
     ErrorCode error = ErrorCode::NoError;
 
-    /// \~english Why a stream was refused as malformed, where the code alone cannot say it; null otherwise.
-    /// \~spanish Por que se rechazo un flujo mal formado, donde el codigo solo no lo dice; nulo si no.  \~
+    /// \~english Which rule a @c StreamError or @c ConnectionError broke; null for @c Accept and @c Discard.
+    /// \~spanish Que regla rompio un @c StreamError o un @c ConnectionError; nulo para @c Accept y @c Discard.  \~
     const char *why = nullptr;
 };
 
@@ -387,6 +402,14 @@ class StreamSet {
      *    with a connection error would turn a busy moment into a dropped
      *    connection.
      *
+     * The second one has three exceptions, because an identifier at or below
+     * the highest that is not in the table belongs to a stream that is over,
+     * and how it ended decides (RFC 9113, 5.1): one THIS end reset is
+     * @c Discard -- the peer sent the HEADERS before it read the reset, and
+     * the block is still decoded by the caller; one that closed any other way
+     * is a connection error, @c StreamClosed; one never opened at all is the
+     * reuse above, @c ProtocolError (5.1.1).
+     *
      * \~spanish
      * Tres rechazos, y cada uno dice algo distinto del otro extremo:
      *
@@ -403,6 +426,14 @@ class StreamSet {
      *    codigo que le dice a un cliente que puede volver a mandar la peticion
      *    tal cual.  Contestarlo con un error de conexion convertiria un momento
      *    de mucho trabajo en una conexion caida.
+     *
+     * El segundo tiene tres excepciones, porque un identificador igual o por
+     * debajo del mayor que no esta en la tabla es de un flujo que se acabo, y
+     * decide como acabo (RFC 9113, 5.1): uno que reinicio ESTE extremo es
+     * @c Discard -- el otro mando el HEADERS antes de leer el reinicio, y quien
+     * llama descodifica el bloque igual --; uno que se cerro de otra forma es
+     * un error de conexion, @c StreamClosed; uno que no se abrio nunca es la
+     * reutilizacion de arriba, @c ProtocolError (5.1.1).
      *
      * \~
      * @param id         \~english the identifier  \~spanish el identificador  \~
@@ -429,6 +460,11 @@ class StreamSet {
      * it -- which is the point of @c Verdict::Discard and would be lost if the
      * two were spent in the same place.
      *
+     * A DATA on a stream that is over is @c Discard only when THIS end reset
+     * the stream (or it is too old to know): the peer sent it before it could
+     * have known.  On a stream that closed any other way the peer DID know,
+     * and it is a connection error, @c StreamClosed (RFC 9113, 5.1).
+     *
      * \~spanish
      * La longitud es la carga ENTERA, relleno incluido.  El relleno no es
      * gratis: el otro extremo gasto ventana en el, asi que este tiene que gastar
@@ -439,6 +475,12 @@ class StreamSet {
      * conjunto, y una trama que esto rechace se la debe igual -- que es de lo
      * que va @c Verdict::Discard y se perderia si las dos se gastaran en el
      * mismo sitio.
+     *
+     * Un DATA de un flujo terminado es @c Discard solo cuando el flujo lo
+     * reinicio ESTE extremo (o es demasiado viejo para saberlo): el otro lo
+     * mando antes de poder saberlo.  En un flujo que se cerro de otra forma el
+     * otro SI lo sabia, y es un error de conexion, @c StreamClosed (RFC 9113,
+     * 5.1).
      *
      * \~english
      * The CONTENT is a different number, and it is the one a declared
@@ -568,6 +610,51 @@ class StreamSet {
 
     /**
      * @brief
+     * \~english Says THIS end sent RST_STREAM on @p id.
+     * \~spanish Dice que ESTE extremo mando RST_STREAM por @p id.
+     * \~
+     *
+     * \~english
+     * Not the same as @c on_reset, and the difference is the whole of RFC
+     * 9113, 5.1 on closed streams: after the peer's reset, it knows the stream
+     * is over; after this end's, it may still send anything, and whatever it
+     * sends is late rather than wrong.  So the stream is forgotten here as
+     * there, and the fact that this end ended it is kept.
+     *
+     * \~spanish
+     * No es lo mismo que @c on_reset, y la diferencia es todo el RFC 9113, 5.1
+     * sobre flujos cerrados: despues del reinicio del otro, el otro sabe que el
+     * flujo se acabo; despues del de este, puede seguir mandando cualquier
+     * cosa, y lo que mande llega tarde y no mal.  Asi que el flujo se olvida
+     * aqui igual que alli, y se guarda que lo acabo este extremo.
+     *
+     * \~
+     * @param id \~english the identifier  \~spanish el identificador  \~
+     */
+    void on_reset_sent(uint32_t id) noexcept;
+
+    /**
+     * @brief
+     * \~english Whether @p id names a stream the peer never opened: above the highest, or even.
+     * \~spanish Si @p id nombra un flujo que el otro no abrio nunca: por encima del mayor, o par.
+     * \~
+     *
+     * \~english
+     * An even identifier is the server's to open, and this server opens none,
+     * so it is idle whatever the highest is (RFC 9113, 5.1.1).
+     * \~spanish
+     * Un identificador par lo abre el servidor, y este no abre ninguno, asi que
+     * esta inactivo sea cual sea el mayor (RFC 9113, 5.1.1).
+     * \~
+     * @param id \~english a nonzero identifier  \~spanish un identificador distinto de cero  \~
+     * @return   \~english whether it is idle  \~spanish si esta inactivo  \~
+     */
+    bool never_opened(uint32_t id) const noexcept {
+        return id > highest_ || (id & 1) == 0;
+    }
+
+    /**
+     * @brief
      * \~english Says this end has finished answering on @p id.
      * \~spanish Dice que este extremo ha acabado de contestar por @p id.
      * \~
@@ -637,6 +724,10 @@ class StreamSet {
     /// \~spanish El otro extremo acabo en @p s: medio cerrado, u olvidado si este tambien.  \~
     void end_remote(Stream *s) noexcept;
 
+    /// \~english What a HEADERS on @p id, at or below the highest and not in the table, means.
+    /// \~spanish Que significa un HEADERS sobre @p id, igual o por debajo del mayor y fuera de la tabla.  \~
+    Outcome headers_on_closed(uint32_t id) noexcept;
+
     Stream *streams_ = nullptr;
     size_t cap_ = 0;
     size_t count_ = 0;
@@ -645,6 +736,9 @@ class StreamSet {
     uint32_t max_streams_ = 128;
     uint32_t own_initial_ = 65535;
     uint32_t peer_initial_ = 65535;
+
+    /// \~english How the recent streams ended.  \~spanish Como acabaron los flujos recientes.  \~
+    RecentStreams recent_;
 };
 
 } // namespace h2

@@ -760,7 +760,187 @@ void test_trailers() {
               "a trailer section under the limit was measured with the ones before it");
 }
 
+/**
+ * @brief
+ * \~english A block refused for its message is still read to the end, and the table hears all of it (RFC 9113, 4.3, 10.5.1).
+ * \~spanish Un bloque rechazado por su mensaje se lee igual hasta el final, y la tabla se entera de todo (RFC 9113, 4.3, 10.5.1).
+ * \~
+ *
+ * \~english
+ * The peer's encoder added the last field of each of these blocks to ITS
+ * table.  A decoder that stopped at the first broken rule would not, and
+ * from then on every index would name a different field on each side.
+ * \~spanish
+ * El codificador del otro extremo anadio la ultima cabecera de cada uno de
+ * estos bloques a SU tabla.  Un descodificador que parara en la primera regla
+ * rota no lo haria, y desde ahi cada indice nombraria una cabecera distinta en
+ * cada lado.
+ * \~
+ */
+void test_a_refused_block_still_reaches_the_table() {
+    http_vx::h2::Limits limits;
+    http_vx::Buffer out;
+    http_vx::Request req;
+
+    const uint8_t again[] = {0x82, 0x87, 0x84, 0xbe};
+
+    {
+        // \~english An uppercase name, then x-k: v remembered.  \~spanish Un nombre en mayusculas, y luego x-k: v recordada.  \~
+        Decoder d;
+        d.reset(limits);
+        const uint8_t block[] = {0x82, 0x87, 0x84, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1',
+                                 0x40, 0x03, 'x', '-', 'k', 0x01, 'v'};
+        check(d.decode(block, sizeof block, out, req) == ErrorCode::ProtocolError,
+              "an uppercase name was accepted (8.2.1)");
+        check(d.why() != nullptr && std::strstr(d.why(), "uppercase") != nullptr,
+              "the refusal does not say the first rule broken");
+        check(d.table().count() == 1, "the field after the broken rule did not reach the table");
+
+        out.clear();
+        check(d.decode(again, sizeof again, out, req) == ErrorCode::NoError && field_is(req, out, 0, "x-k", "v"),
+              "the remembered field does not come back by index");
+    }
+    {
+        /* \~english
+         * A pseudo-header after a field, then :authority remembered by an
+         * indexed name with a Huffman value (RFC 7541, C.4.1) -- the discarded
+         * part of a block goes through the same string and name paths.
+         * \~spanish
+         * Una pseudo-cabecera detras de una cabecera, y luego :authority
+         * recordada con nombre indexado y valor en Huffman (RFC 7541, C.4.1) --
+         * la parte descartada de un bloque pasa por los mismos caminos de cadena
+         * y de nombre.
+         * \~ */
+        Decoder d;
+        d.reset(limits);
+        const uint8_t block[] = {0x82, 0x87, 0x00, 0x01, 'a', 0x01, '1', 0x84, 0x41, 0x8c, 0xf1,
+                                 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff};
+        check(d.decode(block, sizeof block, out, req) == ErrorCode::ProtocolError,
+              "a pseudo-header field after a field was accepted (8.3)");
+        check(d.table().count() == 1, "a Huffman field after the broken rule did not reach the table");
+
+        out.clear();
+        check(d.decode(again, sizeof again, out, req) == ErrorCode::NoError &&
+                  span_is(req.authority, out, "www.example.com"),
+              "the remembered Huffman field does not come back by index");
+    }
+    {
+        // \~english Over the list limit, then x-k: v remembered (10.5.1).  \~spanish Pasado el limite de la lista, y luego x-k: v recordada (10.5.1).  \~
+        http_vx::h2::Limits small;
+        small.max_header_list_size = 64;
+        Decoder d;
+        d.reset(small);
+        out.clear();
+        uint8_t block[128];
+        size_t n = 0;
+        block[n++] = 0x82;
+        block[n++] = 0x87;
+        block[n++] = 0x84;
+        // \~english x-k: eighty bytes, remembered.  \~spanish x-k: ochenta bytes, recordada.  \~
+        block[n++] = 0x40;
+        block[n++] = 0x03;
+        block[n++] = 'x';
+        block[n++] = '-';
+        block[n++] = 'k';
+        block[n++] = 80;
+        for (int i = 0; i < 80; ++i) block[n++] = 'v';
+        check(d.decode(block, n, out, req) == ErrorCode::EnhanceYourCalm,
+              "a header list over the limit was accepted");
+        check(d.why() != nullptr && std::strstr(d.why(), "SETTINGS_MAX_HEADER_LIST_SIZE") != nullptr,
+              "an oversized header list does not say why");
+        check(d.table().count() == 1, "the field after the limit did not reach the table (10.5.1)");
+        check(out.size() <= 64, "fields past the limit were still written out");
+    }
+    {
+        // \~english The first rule broken is the one reported.  \~spanish La primera regla rota es la que se cuenta.  \~
+        http_vx::h2::Limits small;
+        small.max_header_list_size = 80;
+        Decoder d;
+        d.reset(small);
+        // \~english 0xbd is the last static entry, 61: still a name after a refusal.
+        // \~spanish 0xbd es la ultima entrada estatica, 61: sigue siendo un nombre tras un rechazo.  \~
+        const uint8_t block[] = {0x82, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1', 0x87, 0x84, 0xbd};
+        check(d.decode(block, sizeof block, out, req) == ErrorCode::ProtocolError &&
+                  std::strstr(d.why(), "uppercase") != nullptr,
+              "a later rule replaced the first one broken");
+    }
+    {
+        // \~english But a compression error after it is still the connection's.  \~spanish Pero un error de compresion detras sigue siendo de la conexion.  \~
+        Decoder d;
+        d.reset(limits);
+        const uint8_t zero[] = {0x82, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1', 0x80};
+        check(d.decode(zero, sizeof zero, out, req) == ErrorCode::CompressionError,
+              "index zero after a refusal was not a compression error");
+        check(d.why() != nullptr && std::strstr(d.why(), "HPACK") != nullptr,
+              "a compression error does not say why, over the refusal before it");
+
+        d.reset(limits);
+        const uint8_t past[] = {0x82, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1', 0xFF, 0x00};
+        check(d.decode(past, sizeof past, out, req) == ErrorCode::CompressionError,
+              "an index past the table after a refusal was not a compression error");
+
+        d.reset(limits);
+        const uint8_t name[] = {0x82, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1', 0x0F, 0x30, 0x01, 'v'};
+        check(d.decode(name, sizeof name, out, req) == ErrorCode::CompressionError,
+              "a name index past the table after a refusal was not a compression error");
+
+        d.reset(limits);
+        const uint8_t cut[] = {0x82, 0x00, 0x04, 'X', '-', 'u', 'p', 0x01, '1', 0x40, 0x05, 'x'};
+        check(d.decode(cut, sizeof cut, out, req) == ErrorCode::CompressionError,
+              "a string cut short after a refusal was not a compression error");
+    }
+}
+
+/**
+ * @brief
+ * \~english Running out of room halfway through a block loses the table: the connection's error, not the message's.
+ * \~spanish Quedarse sin sitio a mitad de un bloque pierde la tabla: error de la conexion, no del mensaje.
+ * \~
+ *
+ * \~english
+ * A remembered field of thirty thousand bytes, then a block naming it
+ * twenty-three hundred times: seventy megabytes written out, past what a
+ * buffer may hold.  The fields after the failure never reach the table, so
+ * no message-level answer is right.
+ * \~spanish
+ * Una cabecera recordada de treinta mil bytes, y luego un bloque que la
+ * nombra dos mil trescientas veces: setenta megabytes escritos, mas de lo que
+ * puede guardar un buffer.  Las cabeceras de detras del fallo no llegan nunca a
+ * la tabla, asi que ninguna respuesta del mensaje es correcta.
+ * \~
+ */
+void test_no_room_loses_the_table() {
+    http_vx::h2::Limits big;
+    big.header_table_size = 65536;
+    big.max_header_list_size = 0xFFFFFFFFu;
+    Decoder d;
+    d.reset(big);
+
+    http_vx::Buffer out;
+    http_vx::Request req;
+
+    // \~english x: thirty thousand v, remembered; 30000 = 127 + 0x31 + 0x69 * 128 + 1 * 16384.
+    // \~spanish x: treinta mil v, recordada; 30000 = 127 + 0x31 + 0x69 * 128 + 1 * 16384.  \~
+    static uint8_t head[30010];
+    const uint8_t lead[] = {0x82, 0x87, 0x84, 0x40, 0x01, 'x', 0x7F, 0xB1, 0xE9, 0x01};
+    std::memcpy(head, lead, sizeof lead);
+    std::memset(head + sizeof lead, 'v', 30000);
+    check(d.decode(head, sizeof head, out, req) == ErrorCode::NoError && d.table().count() == 1,
+          "a thirty-thousand-byte field was refused");
+
+    static uint8_t refs[2300];
+    std::memset(refs, 0xbe, sizeof refs);
+    out.clear();
+    check(d.decode(refs, sizeof refs, out, req) == ErrorCode::InternalError,
+          "running out of room was not the connection's error");
+    check(d.why() != nullptr && std::strstr(d.why(), "memory") != nullptr,
+          "running out of room does not say why");
+    out.release();
+}
+
 int main() {
+    test_a_refused_block_still_reaches_the_table();
+    test_no_room_loses_the_table();
     test_request_rules();
     test_trailers();
     test_the_specification_sequence();

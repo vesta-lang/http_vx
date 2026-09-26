@@ -155,14 +155,37 @@ class Decoder {
      *              los trozos de @p req apuntan a su @c data  \~
      * @param req   \~english where the request goes; it is emptied first
      *              \~spanish donde va la peticion; se vacia antes  \~
-     * @return      \~english @c NoError, or why not.  @c CompressionError
-     *              means the CONNECTION cannot go on, because the table is now
-     *              in a state the peer does not share; anything else is about
-     *              this message only
-     *              \~spanish @c NoError, o por que no.  @c CompressionError
-     *              quiere decir que la CONEXION no puede seguir, porque la
-     *              tabla esta en un estado que el otro extremo no comparte;
-     *              cualquier otro es solo de este mensaje  \~
+     * \~english
+     * **And the block is read to its end whatever the message turns out to
+     * be.**  A field that breaks a rule of the message -- malformed, or one
+     * too many for `SETTINGS_MAX_HEADER_LIST_SIZE` -- refuses the MESSAGE,
+     * and the fields after it still go through the table and are thrown
+     * away, because the peer's encoder put them in its table too (RFC 9113,
+     * 4.3 and 10.5.1).  The first rule broken is the one reported.  Only the
+     * two errors that already end the connection stop the reading early.
+     *
+     * \~spanish
+     * **Y el bloque se lee hasta el final resulte lo que resulte el mensaje.**
+     * Una cabecera que rompe una regla del mensaje -- mal formada, o una de
+     * mas para `SETTINGS_MAX_HEADER_LIST_SIZE` -- rechaza el MENSAJE, y las
+     * cabeceras de detras pasan igual por la tabla y se tiran, porque el
+     * codificador del otro extremo tambien las metio en la suya (RFC 9113, 4.3
+     * y 10.5.1).  La primera regla rota es la que se cuenta.  Solo los dos
+     * errores que ya acaban la conexion paran antes la lectura.
+     *
+     * \~
+     * @return      \~english @c NoError, or why not.  @c CompressionError and
+     *              @c InternalError mean the CONNECTION cannot go on, because
+     *              the table is now in a state the peer does not share --
+     *              the block could not be decoded, or there was no memory to
+     *              decode the rest of it; anything else is about this message
+     *              only, and the table is intact
+     *              \~spanish @c NoError, o por que no.  @c CompressionError e
+     *              @c InternalError quieren decir que la CONEXION no puede
+     *              seguir, porque la tabla esta en un estado que el otro
+     *              extremo no comparte -- el bloque no se pudo descodificar, o
+     *              no hubo memoria para descodificar el resto; cualquier otro
+     *              es solo de este mensaje, y la tabla esta intacta  \~
      */
     ErrorCode decode(const uint8_t *block, size_t n, Buffer &out,
                      Request &req) noexcept;
@@ -206,12 +229,15 @@ class Decoder {
     /// \~english What the connection remembers.  \~spanish Lo que recuerda la conexion.  \~
     DynamicTable &table() noexcept { return table_; }
 
-    /// \~english Why the last block made its message malformed; null otherwise.
-    /// \~spanish Por que el ultimo bloque dejo su mensaje mal formado; nulo si no.  \~
+    /// \~english Why the last block was refused, for the message or for the connection; null otherwise.
+    /// \~spanish Por que se rechazo el ultimo bloque, por el mensaje o por la conexion; nulo si no.  \~
     const char *why() const noexcept { return why_; }
 
     /// \~english Gives the memory back.  \~spanish Devuelve la memoria.  \~
-    void release() noexcept { table_.release(); }
+    void release() noexcept {
+        table_.release();
+        scratch_.release();
+    }
 
   private:
     /**
@@ -238,12 +264,36 @@ class Decoder {
                                 Reading &f) noexcept;
     ErrorCode keep(const Buffer &out, const Reading &f, Request &req) noexcept;
 
-    /// \~english The block itself, once the builder knows whether it is a head or trailers.
-    /// \~spanish El bloque en si, una vez el constructor sabe si es cabecera o remolques.  \~
+    /// \~english Whether @p index names an entry of either table.
+    /// \~spanish Si @p index nombra una entrada de alguna de las dos tablas.  \~
+    bool names_something(uint64_t index) const noexcept;
+
+    /// \~english The block itself, once the builder knows whether it is a head or trailers; says why the connection ends, if it does.
+    /// \~spanish El bloque en si, una vez el constructor sabe si es cabecera o remolques; dice por que acaba la conexion, si acaba.  \~
     ErrorCode read_block(const uint8_t *block, size_t n, Buffer &out,
                          Request &req) noexcept;
 
+    /// \~english Every field of the block, the ones after a refusal included.
+    /// \~spanish Todas las cabeceras del bloque, tambien las de detras de un rechazo.  \~
+    ErrorCode read_fields(const uint8_t *block, size_t n, Buffer &out,
+                          Request &req) noexcept;
+
     DynamicTable table_;
+
+    /**
+     * \~english
+     * Where the fields of a refused block are decoded, one at a time, so
+     * they can reach the table without reaching the caller's buffer.  Empty
+     * until a block is refused, and emptied before each field, so it never
+     * holds more than the largest single field.
+     * \~spanish
+     * Donde se descodifican, de una en una, las cabeceras de un bloque
+     * rechazado, para que lleguen a la tabla sin llegar al buffer de quien
+     * llama.  Vacio hasta que se rechaza un bloque, y vaciado antes de cada
+     * cabecera, asi que nunca guarda mas que la cabecera suelta mas grande.
+     * \~
+     */
+    Buffer scratch_;
     Limits limits_;
 
     /// \~english How much the fields of this block are worth so far.

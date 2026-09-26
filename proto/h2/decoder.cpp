@@ -204,6 +204,12 @@ ErrorCode Decoder::take_indexed_name(uint64_t index, Buffer &out,
     return ErrorCode::NoError;
 }
 
+bool Decoder::names_something(uint64_t index) const noexcept {
+    if (index == 0) return false;
+    if (index <= kStaticEntries) return true;
+    return table_.at(static_cast<size_t>(index - kStaticEntries - 1)) != nullptr;
+}
+
 ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
                         Request &req) noexcept {
     (void)req;
@@ -219,8 +225,11 @@ ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
      * recordada son mil bytes en el cable y mil veces la cabecera aqui.
      * \~ */
     list_size_ += static_cast<uint64_t>(f.name.len) + f.value.len + 32;
-    if (list_size_ > limits_.max_header_list_size)
+    if (list_size_ > limits_.max_header_list_size) {
+        why_ = "a header list larger than SETTINGS_MAX_HEADER_LIST_SIZE (RFC "
+               "9113, 6.5.2, 10.5.1)";
         return ErrorCode::EnhanceYourCalm;
+    }
 
     /* \~english
      * What the line means for the message is judged where HTTP/3's is judged
@@ -270,6 +279,56 @@ ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
     why_ = nullptr;
     list_size_ = 0;
 
+    const ErrorCode e = read_fields(block, n, out, req);
+
+    /* \~english
+     * The two answers that end the connection say why too, over whatever
+     * reason an earlier field had left: once the table is lost, which field
+     * broke a message rule no longer matters to anyone.
+     * \~spanish
+     * Las dos respuestas que acaban la conexion dicen por que tambien, por
+     * encima del motivo que hubiera dejado una cabecera anterior: perdida la
+     * tabla, que cabecera rompio una regla del mensaje ya no le importa a nadie.
+     * \~ */
+    if (e == ErrorCode::CompressionError)
+        why_ = "a field block HPACK cannot decode (RFC 7541; RFC 9113, 4.3)";
+    else if (e == ErrorCode::InternalError)
+        why_ = "no memory to decode a field block, so the table is lost (RFC "
+               "9113, 4.3)";
+    return e;
+}
+
+ErrorCode Decoder::read_fields(const uint8_t *block, size_t n, Buffer &out,
+                               Request &req) noexcept {
+    /* \~english
+     * The first message rule broken, if one has been.  From then on the
+     * block is still read to its end -- every field, every insertion into the
+     * table -- because the peer's encoder made those insertions in ITS table
+     * and a decoder that stopped here would be a field short from now on
+     * (RFC 9113, 4.3: "A receiver MUST terminate the connection ... if it does
+     * not decompress a field block"; 10.5.1: "The field block MUST be
+     * processed to ensure a consistent connection state").  What changes is
+     * where the fields go: nowhere.  They are decoded into @c scratch_, which
+     * is emptied field by field, so a refused block costs one field of memory
+     * however long it is -- and an indexed field, which changes nothing in the
+     * table, is only checked and not copied at all.
+     *
+     * \~spanish
+     * La primera regla del mensaje rota, si se ha roto alguna.  Desde ahi el
+     * bloque se sigue leyendo hasta el final -- cada cabecera, cada insercion
+     * en la tabla -- porque el codificador del otro extremo hizo esas
+     * inserciones en SU tabla y un descodificador que parara aqui iria una
+     * cabecera por detras desde ahora (RFC 9113, 4.3: "A receiver MUST
+     * terminate the connection ... if it does not decompress a field block";
+     * 10.5.1: "The field block MUST be processed to ensure a consistent
+     * connection state").  Lo que cambia es adonde van las cabeceras: a
+     * ninguna parte.  Se descodifican en @c scratch_, que se vacia cabecera a
+     * cabecera, asi que un bloque rechazado cuesta la memoria de una cabecera
+     * por largo que sea -- y una cabecera indexada, que no cambia nada de la
+     * tabla, solo se comprueba y no se copia.
+     * \~ */
+    ErrorCode refused = ErrorCode::NoError;
+
     /* \~english
      * A size update may only come at the front of a block.  Once a field has
      * been read, the table has changed underneath, and a limit arriving then
@@ -285,6 +344,10 @@ ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
 
     size_t at = 0;
     while (at < n) {
+        const bool discarding = refused != ErrorCode::NoError;
+        Buffer &sink = discarding ? scratch_ : out;
+        if (discarding) scratch_.clear();
+
         const uint8_t lead = block[at];
 
         if ((lead & 0x80) != 0) {
@@ -293,6 +356,21 @@ ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
             if (idx.status != Status::Ok) return ErrorCode::CompressionError;
             at += idx.used;
             updates_still_allowed = false;
+
+            /* \~english
+             * Discarded, an indexed field changes nothing: it only has to name
+             * something.  Copying it would let a refused block of one-byte
+             * references cost a copy of the table per byte.
+             * \~spanish
+             * Descartada, una cabecera indexada no cambia nada: solo tiene que
+             * nombrar algo.  Copiarla dejaria que un bloque rechazado de
+             * referencias de un byte costara una copia de la tabla por byte.
+             * \~ */
+            if (discarding) {
+                if (!names_something(idx.value))
+                    return ErrorCode::CompressionError;
+                continue;
+            }
 
             Reading f{};
             const ErrorCode e = take_indexed_name(idx.value, out, f);
@@ -317,8 +395,7 @@ ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
                                static_cast<uint32_t>(got)};
             }
 
-            const ErrorCode k = keep(out, f, req);
-            if (k != ErrorCode::NoError) return k;
+            refused = keep(out, f, req);
             continue;
         }
 
@@ -358,32 +435,48 @@ ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
         f.pseudo = Pseudo::None;
 
         if (idx.value != 0) {
-            const ErrorCode e = take_indexed_name(idx.value, out, f);
-            if (e != ErrorCode::NoError) return e;
+            /* \~english
+             * A name the table will not be given back is only checked, for
+             * the same reason as an indexed field; one that is remembered has
+             * to be copied, since adding it may evict the entry it came from.
+             * \~spanish
+             * Un nombre que no se le va a devolver a la tabla solo se
+             * comprueba, por lo mismo que una cabecera indexada; uno que se
+             * recuerda hay que copiarlo, porque anadirlo puede desalojar la
+             * entrada de la que salio.
+             * \~ */
+            if (discarding && !remember) {
+                if (!names_something(idx.value))
+                    return ErrorCode::CompressionError;
+            } else {
+                const ErrorCode e = take_indexed_name(idx.value, sink, f);
+                if (e != ErrorCode::NoError) return e;
+            }
         } else {
-            const ErrorCode e = take_string(block, n, at, out, f.name);
+            const ErrorCode e = take_string(block, n, at, sink, f.name);
             if (e != ErrorCode::NoError) return e;
 
-            const uint8_t *nm = out.data() + f.name.off;
+            const uint8_t *nm = sink.data() + f.name.off;
             f.id = field_id_of(reinterpret_cast<const char *>(nm), f.name.len);
             f.pseudo = f.name.len != 0 && nm[0] == ':'
                            ? pseudo_of(nm, f.name.len)
                            : Pseudo::None;
         }
 
-        const ErrorCode e = take_string(block, n, at, out, f.value);
+        const ErrorCode e = take_string(block, n, at, sink, f.value);
         if (e != ErrorCode::NoError) return e;
 
         if (remember) {
-            const uint8_t *base = out.data();
+            const uint8_t *base = sink.data();
             if (!table_.add(base + f.name.off, f.name.len, base + f.value.off,
                             f.value.len, f.id, f.pseudo))
                 return ErrorCode::InternalError;
         }
 
-        const ErrorCode k = keep(out, f, req);
-        if (k != ErrorCode::NoError) return k;
+        if (!discarding) refused = keep(out, f, req);
     }
+
+    if (refused != ErrorCode::NoError) return refused;
 
     // \~english The block is whole: what the request must carry, and CONNECT's form (RFC 9113, 8.3.1, 8.5).
     // \~spanish El bloque esta entero: lo que debe llevar la peticion, y la forma de CONNECT (RFC 9113, 8.3.1, 8.5).  \~

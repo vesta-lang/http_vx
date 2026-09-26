@@ -581,6 +581,8 @@ void test_a_broken_connection_says_why() {
     check(e.kind == EventKind::Closed, "an even identifier did not end the connection");
     check(e.error == ErrorCode::ProtocolError,
           "the connection did not end with a protocol error");
+    check(c.why() != nullptr && std::strstr(c.why(), "even") != nullptr,
+          "the connection did not say which rule the identifier broke");
     check(count_answers(c, FrameType::Goaway, 0) == 1,
           "the connection ended without saying why");
 
@@ -686,6 +688,44 @@ uint32_t reset_code(const Connection &c, uint32_t id) {
 /// \~english Whether @p why says @p what.  \~spanish Si @p why dice @p what.  \~
 bool says(const char *why, const char *what) {
     return why != nullptr && std::strstr(why, what) != nullptr;
+}
+
+/**
+ * @brief
+ * \~english The window the WINDOW_UPDATEs waiting for @p id give back, added up.
+ * \~spanish La ventana que devuelven, sumados, los WINDOW_UPDATE que esperan para @p id.
+ * \~
+ */
+uint32_t window_given(const Connection &c, uint32_t id) {
+    uint32_t sum = 0;
+    size_t at = 0;
+    while (at + 9 <= c.pending_size()) {
+        FrameHeader h;
+        http_vx::h2::decode_frame_header(c.pending() + at, h);
+        if (h.type == static_cast<uint8_t>(FrameType::WindowUpdate) && h.stream_id == id)
+            sum += http_vx::h2::be32(c.pending() + at + 9) & 0x7fffffffu;
+        at += 9 + h.length;
+    }
+    return sum;
+}
+
+/**
+ * @brief
+ * \~english Reads until the connection ends or nothing more comes, and says how it ended.
+ * \~spanish Lee hasta que la conexion acaba o no sale nada mas, y dice como acabo.
+ * \~
+ */
+Event drain(Session &s) {
+    Event e = s.next();
+    while (e.kind != EventKind::Closed && e.kind != EventKind::None) e = s.next();
+    return e;
+}
+
+/// \~english A connection error with @p code, a GOAWAY, and a reason that says @p what.
+/// \~spanish Un error de conexion con @p code, un GOAWAY, y un motivo que dice @p what.  \~
+bool closed_with(const Session &s, const Event &e, ErrorCode code, const char *what) {
+    return e.kind == EventKind::Closed && e.error == code &&
+           count_answers(s.c, FrameType::Goaway, 0) == 1 && says(s.c.why(), what);
 }
 
 /**
@@ -1050,6 +1090,475 @@ void test_what_trailers_may_not_be() {
     }
 }
 
+/**
+ * @brief
+ * \~english What the peer sent before it read this end's RST_STREAM is processed minimally and dropped (RFC 9113, 5.1).
+ * \~spanish Lo que el otro extremo mando antes de leer el RST_STREAM de este se procesa lo minimo y se tira (RFC 9113, 5.1).
+ * \~
+ *
+ * \~english
+ * The peer cannot take back what it queued before the reset reached it, so
+ * a HEADERS for the stream may still come -- the trailers of the upload
+ * that was refused -- and it is not an error.  It must not end the
+ * connection, and its block must still reach the table: the next request
+ * names the field it remembered by index.  A DATA may come too, and it is
+ * charged to the connection window and given back.
+ *
+ * \~spanish
+ * El otro extremo no puede retirar lo que encolo antes de que le llegara el
+ * reinicio, asi que puede llegar todavia un HEADERS del flujo -- los remolques
+ * de la subida que se rechazo -- y no es un error.  No puede acabar la
+ * conexion, y su bloque tiene que llegar igual a la tabla: la peticion
+ * siguiente nombra por indice la cabecera que recordo.  Puede llegar tambien un
+ * DATA, que se cobra a la ventana de la conexion y se devuelve.
+ *
+ * \~
+ */
+void test_frames_on_a_stream_this_end_reset_are_dropped() {
+    uint8_t block[128];
+    uint8_t tail[64];
+    const uint8_t again[] = {0x82, 0x87, 0x84, 0xbe};
+
+    {
+        // \~english Reset as malformed on its body.  \~spanish Reiniciado por mal formado en su cuerpo.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "abcdef", false);
+        s.data(1, "late!", false);
+        size_t t = 0;
+        literal(tail, t, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, again,
+                  sizeof again);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(malformed(s, s.next(), 1, "more DATA"), "the stream was not reset");
+
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3,
+              "a frame on a stream this end reset ended the connection (5.1)");
+        check(count_answers(s.c, FrameType::Goaway, 0) == 0, "a frame on a stream this end reset sent a GOAWAY");
+        check(reset_code(s.c, 1) == ~uint32_t{0}, "a stream this end reset was reset again");
+        check(s.req.fields.size() == 1 && span_is(s.req.fields.begin()[0].name_off,
+                                                  s.req.fields.begin()[0].name_len, s.headers, "x-k"),
+              "the block of a stream this end reset did not reach the table");
+        check(window_given(s.c, 0) == 5, "DATA on a stream this end reset was not given back to the connection");
+        check(window_given(s.c, 1) == 0, "DATA on a stream this end reset was credited to the stream");
+    }
+    {
+        // \~english The same, the block split over a CONTINUATION.  \~spanish Lo mismo, con el bloque partido en una CONTINUATION.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "abcdef", false);
+        size_t t = 0;
+        literal(tail, t, "x-a", "1");
+        const size_t half = t;
+        literal(tail, t, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndStream, 1, tail, half);
+        s.p.frame(FrameType::Continuation, http_vx::h2::kEndHeaders, 1, tail + half, t - half);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, again,
+                  sizeof again);
+
+        s.next();
+        s.next();
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3 && s.req.fields.size() == 1,
+              "a split block on a stream this end reset was not read and dropped");
+    }
+    {
+        /* \~english
+         * Refused at the door, one stream too many: the peer's trailers and
+         * body for it are still on their way.
+         * \~spanish
+         * Rechazado en la puerta, un flujo de mas: los remolques y el cuerpo
+         * que mando el otro siguen de camino.
+         * \~ */
+        Session s;
+        s.limits.max_concurrent_streams = 1;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 3, block, post_head(block, nullptr));
+        s.data(3, "body", false);
+        size_t t = 0;
+        literal(tail, t, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, tail, t);
+        s.data(1, "x", true);
+
+        check(s.next().kind == EventKind::Request, "the first request did not come out");
+        const Event r = s.next();
+        check(r.kind == EventKind::StreamEnded && r.stream_id == 3 && r.error == ErrorCode::RefusedStream,
+              "one stream too many was not refused");
+        check(says(s.c.why(), "SETTINGS_MAX_CONCURRENT_STREAMS"), "a refused stream does not say why");
+
+        const Event b = s.next();
+        check(b.kind == EventKind::Body && b.stream_id == 1 && b.ends,
+              "the frames of a refused stream ended the connection");
+        check(window_given(s.c, 0) == 4, "the body of a refused stream was not given back");
+
+        s.c.streams().finish(1);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 5, again,
+                  sizeof again);
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 5 && s.req.fields.size() == 1,
+              "the trailers of a refused stream did not reach the table");
+    }
+}
+
+/**
+ * @brief
+ * \~english A stream that closed any other way: the peer knew, and a frame on it is an error (RFC 9113, 5.1, 5.1.1).
+ * \~spanish Un flujo que se cerro de otra forma: el otro lo sabia, y una trama en el es un error (RFC 9113, 5.1, 5.1.1).
+ * \~
+ */
+void test_frames_on_a_stream_that_closed_are_errors() {
+    {
+        // \~english Both ends finished, then DATA.  \~spanish Acabaron los dos, y luego DATA.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, kRequestBlock,
+                  sizeof kRequestBlock);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        s.c.streams().finish(1);
+        s.data(1, "more", false);
+        check(closed_with(s, drain(s), ErrorCode::StreamClosed, "closed"),
+              "DATA on a stream both ends had finished was not STREAM_CLOSED (5.1)");
+    }
+    {
+        // \~english Both ends finished, then HEADERS.  \~spanish Acabaron los dos, y luego HEADERS.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, kRequestBlock,
+                  sizeof kRequestBlock);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        s.c.streams().finish(1);
+        const uint8_t get[] = {0x82, 0x87, 0x84};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, get, sizeof get);
+        check(closed_with(s, drain(s), ErrorCode::StreamClosed, "closed"),
+              "HEADERS on a stream both ends had finished was not STREAM_CLOSED (5.1)");
+    }
+    {
+        // \~english The PEER reset it, then sent DATA.  \~spanish Lo reinicio el OTRO, y luego mando DATA.  \~
+        Session s;
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        const uint8_t cancel[4] = {0, 0, 0, 8};
+        s.p.frame(FrameType::RstStream, 0, 1, cancel, sizeof cancel);
+        s.data(1, "more", false);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        const Event r = s.next();
+        check(r.kind == EventKind::StreamEnded && r.stream_id == 1, "the peer's reset was not reported");
+        check(closed_with(s, drain(s), ErrorCode::StreamClosed, "closed"),
+              "DATA after the peer's own RST_STREAM was not STREAM_CLOSED (5.1)");
+    }
+    {
+        // \~english A skipped identifier is not a closed stream to reuse (5.1.1).  \~spanish Un identificador saltado no es un flujo cerrado que reutilizar (5.1.1).  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 5, kRequestBlock,
+                  sizeof kRequestBlock);
+        const uint8_t get[] = {0x82, 0x87, 0x84};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, get, sizeof get);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "5.1.1"),
+              "HEADERS on a skipped identifier was not a PROTOCOL_ERROR (5.1.1)");
+    }
+    {
+        // \~english An even identifier is never opened by a client: idle, whatever the highest is.
+        // \~spanish Un identificador par no lo abre nunca un cliente: inactivo, sea cual sea el mayor.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 5, kRequestBlock,
+                  sizeof kRequestBlock);
+        s.data(2, "x", false);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "idle"),
+              "DATA on an even identifier was not a PROTOCOL_ERROR (5.1)");
+    }
+    {
+        // \~english A WINDOW_UPDATE after the end is allowed (6.9).  \~spanish Un WINDOW_UPDATE despues del final se permite (6.9).  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, kRequestBlock,
+                  sizeof kRequestBlock);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        s.c.streams().finish(1);
+        const uint8_t more[4] = {0, 0, 1, 0};
+        s.p.frame(FrameType::WindowUpdate, 0, 1, more, sizeof more);
+        const uint8_t get[] = {0x82, 0x87, 0x84};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, get, sizeof get);
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3,
+              "a WINDOW_UPDATE on a finished stream was treated as an error (6.9)");
+    }
+}
+
+/**
+ * @brief
+ * \~english A refused header block still goes through the table, all of it (RFC 9113, 4.3, 10.5.1).
+ * \~spanish Un bloque de cabeceras rechazado pasa igual por la tabla, entero (RFC 9113, 4.3, 10.5.1).
+ * \~
+ */
+void test_a_refused_block_is_read_to_the_end() {
+    const uint8_t again[] = {0x82, 0x87, 0x84, 0xbe};
+    {
+        // \~english Malformed on its first field, remembering on its last.  \~spanish Mal formado en su primera cabecera, recordando en la ultima.  \~
+        Session s;
+        uint8_t block[64];
+        size_t n = post_head(block, nullptr);
+        literal(block, n, "X-Upper", "1");
+        literal(block, n, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, block, n);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, again,
+                  sizeof again);
+
+        const Event r = s.next();
+        check(r.kind == EventKind::StreamEnded && r.stream_id == 1 && r.error == ErrorCode::ProtocolError &&
+                  s.c.why() != nullptr,
+              "a malformed field was not refused, or not said why");
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3 && s.req.fields.size() == 1 &&
+                  span_is(s.req.fields.begin()[0].name_off, s.req.fields.begin()[0].name_len, s.headers,
+                          "x-k"),
+              "the rest of a malformed block did not reach the table (4.3)");
+    }
+    {
+        // \~english Larger than the list allows, remembering at the end.  \~spanish Mayor de lo que deja la lista, recordando al final.  \~
+        Session s;
+        s.limits.max_header_list_size = 200;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        uint8_t block[256];
+        size_t n = post_head(block, nullptr);
+        literal(block, n, "x-a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        literal(block, n, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, block, n);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, again,
+                  sizeof again);
+
+        const Event r = s.next();
+        check(r.kind == EventKind::HeadersTooLarge && r.stream_id == 1 && r.ends &&
+                  says(s.c.why(), "SETTINGS_MAX_HEADER_LIST_SIZE"),
+              "a header list over the limit was not reported for a 431, or not said why (10.5.1)");
+        check(reset_code(s.c, 1) == ~uint32_t{0}, "a header list over the limit was reset instead of left for a 431");
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3 && s.req.fields.size() == 1,
+              "the rest of an oversized block did not reach the table (10.5.1)");
+    }
+    {
+        /* \~english
+         * Oversized on a request still sending, and on one too many streams: the
+         * first is left for a 431 and says the peer is still sending; the
+         * second was never opened, so there is nothing to answer on and it is
+         * reset -- with the size, which a retry would not fix either.
+         * \~spanish
+         * Demasiado grande en una peticion que sigue mandando, y en un flujo de
+         * mas: el primero se deja para un 431 y dice que el otro sigue
+         * mandando; el segundo no se llego a abrir, asi que no hay donde
+         * contestar y se reinicia -- por el tamano, que tampoco arreglaria
+         * volver a intentarlo.
+         * \~ */
+        Session s;
+        s.limits.max_header_list_size = 200;
+        s.limits.max_concurrent_streams = 1;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        const char *big = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        uint8_t block[256];
+        size_t n = post_head(block, nullptr);
+        literal(block, n, "x-a", big);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, n);
+        n = post_head(block, nullptr);
+        literal(block, n, "x-a", big);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 3, block, n);
+
+        const Event r = s.next();
+        check(r.kind == EventKind::HeadersTooLarge && r.stream_id == 1 && !r.ends,
+              "an oversized request still sending was not left for a 431, or said it had ended");
+        check(reset_code(s.c, 1) == ~uint32_t{0}, "an oversized request still sending was reset");
+        s.c.flushed(s.c.pending_size());
+        const Event t = s.next();
+        check(t.kind == EventKind::StreamEnded && t.stream_id == 3 && t.error == ErrorCode::EnhanceYourCalm &&
+                  reset_code(s.c, 3) == static_cast<uint32_t>(ErrorCode::EnhanceYourCalm),
+              "an oversized block on a stream refused at the door was left for a 431 on a stream never opened");
+    }
+}
+
+/**
+ * @brief
+ * \~english Every refusal says which rule it broke, flow control included.
+ * \~spanish Todo rechazo dice que regla rompio, el control de flujo incluido.
+ * \~
+ */
+void test_flow_control_refusals_say_why() {
+    {
+        // \~english Past the stream's window.  \~spanish Mas alla de la ventana del flujo.  \~
+        Session s;
+        s.limits.initial_window_size = 4;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        s.data(1, "abcde", false);
+        s.next();
+        const Event e = s.next();
+        check(e.kind == EventKind::StreamEnded && e.error == ErrorCode::FlowControlError &&
+                  says(s.c.why(), "flow-control"),
+              "DATA past the stream window did not say why");
+    }
+    {
+        // \~english Past the connection's window.  \~spanish Mas alla de la ventana de la conexion.  \~
+        Session s;
+        s.limits.initial_window_size = 1u << 20;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        static uint8_t big[16384];
+        for (int i = 0; i < 5; ++i) s.p.frame(FrameType::Data, 0, 1, big, sizeof big);
+        check(closed_with(s, drain(s), ErrorCode::FlowControlError, "flow-control"),
+              "DATA past the connection window did not say why");
+    }
+    {
+        // \~english A WINDOW_UPDATE that overflows a stream.  \~spanish Un WINDOW_UPDATE que desborda un flujo.  \~
+        Session s;
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        const uint8_t huge[4] = {0x7f, 0xff, 0xff, 0xff};
+        s.p.frame(FrameType::WindowUpdate, 0, 1, huge, sizeof huge);
+        s.next();
+        const Event e = s.next();
+        check(e.kind == EventKind::StreamEnded && e.error == ErrorCode::FlowControlError &&
+                  says(s.c.why(), "6.9.1"),
+              "a WINDOW_UPDATE past the ceiling did not say why");
+    }
+    {
+        // \~english A WINDOW_UPDATE of zero on a stream (6.9).  \~spanish Un WINDOW_UPDATE de cero en un flujo (6.9).  \~
+        Session s;
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        const uint8_t zero[4] = {0, 0, 0, 0};
+        s.p.frame(FrameType::WindowUpdate, 0, 1, zero, sizeof zero);
+        s.next();
+        const Event e = s.next();
+        check(e.kind == EventKind::StreamEnded && e.error == ErrorCode::ProtocolError && says(s.c.why(), "zero"),
+              "a WINDOW_UPDATE of zero did not say why");
+    }
+    {
+        // \~english A WINDOW_UPDATE on an even identifier below the highest: idle (5.1).
+        // \~spanish Un WINDOW_UPDATE en un identificador par por debajo del mayor: inactivo (5.1).  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 5, kRequestBlock,
+                  sizeof kRequestBlock);
+        const uint8_t more[4] = {0, 0, 1, 0};
+        s.p.frame(FrameType::WindowUpdate, 0, 2, more, sizeof more);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "idle"),
+              "a WINDOW_UPDATE on an even identifier was accepted");
+    }
+    {
+        // \~english A SETTINGS value out of its range, and an initial window too large.
+        // \~spanish Un valor de SETTINGS fuera de su rango, y una ventana inicial demasiado grande.  \~
+        Session s;
+        const uint8_t push[6] = {0, 2, 0, 0, 0, 2};
+        s.p.frame(FrameType::Settings, 0, 0, push, sizeof push);
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "range"),
+              "ENABLE_PUSH of 2 did not say why");
+
+        Session t;
+        const uint8_t window[6] = {0, 4, 0x80, 0, 0, 0};
+        t.p.frame(FrameType::Settings, 0, 0, window, sizeof window);
+        check(closed_with(t, drain(t), ErrorCode::FlowControlError, "SETTINGS_INITIAL_WINDOW_SIZE"),
+              "an initial window past 2^31-1 did not say why");
+    }
+    {
+        // \~english A new initial window that pushes an open stream past the ceiling (6.9.2).
+        // \~spanish Una ventana inicial nueva que pasa un flujo abierto del techo (6.9.2).  \~
+        Session s;
+        uint8_t block[64];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        const uint8_t most[4] = {0x7f, 0xff, 0x00, 0x00};
+        s.p.frame(FrameType::WindowUpdate, 0, 1, most, sizeof most);
+        const uint8_t window[6] = {0, 4, 0x00, 0x10, 0x00, 0x00};
+        s.p.frame(FrameType::Settings, 0, 0, window, sizeof window);
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(closed_with(s, drain(s), ErrorCode::FlowControlError, "6.9.2"),
+              "an initial window overflowing an open stream did not say why");
+    }
+}
+
+/**
+ * @brief
+ * \~english The connection errors the stream rules and the decoder decide say which rule too.
+ * \~spanish Los errores de conexion que deciden las reglas de flujo y el descodificador dicen que regla tambien.
+ * \~
+ */
+void test_connection_errors_say_why() {
+    {
+        // \~english A block HPACK cannot decode.  \~spanish Un bloque que HPACK no puede descodificar.  \~
+        Session s;
+        const uint8_t zero[] = {0x80};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, zero, sizeof zero);
+        check(closed_with(s, drain(s), ErrorCode::CompressionError, "HPACK"),
+              "a compression error did not say why");
+    }
+    {
+        // \~english A RST_STREAM on a stream never opened.  \~spanish Un RST_STREAM de un flujo que no se abrio.  \~
+        Session s;
+        const uint8_t cancel[4] = {0, 0, 0, 8};
+        s.p.frame(FrameType::RstStream, 0, 3, cancel, sizeof cancel);
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "idle"),
+              "a RST_STREAM on an idle stream did not say why");
+    }
+    {
+        // \~english A WINDOW_UPDATE of zero on the connection.  \~spanish Un WINDOW_UPDATE de cero en la conexion.  \~
+        Session s;
+        const uint8_t zero[4] = {0, 0, 0, 0};
+        s.p.frame(FrameType::WindowUpdate, 0, 0, zero, sizeof zero);
+        check(closed_with(s, drain(s), ErrorCode::ProtocolError, "zero"),
+              "a WINDOW_UPDATE of zero on the connection did not say why");
+    }
+    {
+        /* \~english
+         * No room to decode the rest of a block: the fields after the
+         * failure never reach the table, so it is the CONNECTION that ends,
+         * not the stream.  A remembered field of thirty thousand bytes, split
+         * over a CONTINUATION, and then a block naming it twenty-three hundred
+         * times -- more than a buffer may hold.
+         * \~spanish
+         * Sin sitio para descodificar el resto de un bloque: las cabeceras de
+         * detras del fallo no llegan a la tabla, asi que lo que acaba es la
+         * CONEXION, no el flujo.  Una cabecera recordada de treinta mil bytes,
+         * partida en una CONTINUATION, y luego un bloque que la nombra dos mil
+         * trescientas veces -- mas de lo que puede guardar un buffer.
+         * \~ */
+        Session s;
+        s.limits.header_table_size = 65536;
+        s.limits.max_header_list_size = 0xFFFFFFFFu;
+        s.c.reset(s.limits);
+        s.c.flushed(s.c.pending_size());
+
+        static uint8_t head[30010];
+        const uint8_t lead[] = {0x82, 0x87, 0x84, 0x40, 0x01, 'x', 0x7F, 0xB1, 0xE9, 0x01};
+        std::memcpy(head, lead, sizeof lead);
+        std::memset(head + sizeof lead, 'v', 30000);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndStream, 1, head, 16000);
+        s.p.frame(FrameType::Continuation, http_vx::h2::kEndHeaders, 1, head + 16000, sizeof head - 16000);
+
+        static uint8_t refs[2303];
+        std::memset(refs, 0xbe, sizeof refs);
+        refs[0] = 0x82;
+        refs[1] = 0x87;
+        refs[2] = 0x84;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, refs, sizeof refs);
+
+        check(s.next().kind == EventKind::Request, "the request with a big field did not come out");
+        check(closed_with(s, drain(s), ErrorCode::InternalError, "memory"),
+              "running out of room halfway through a block did not end the connection");
+        s.headers.release();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1062,6 +1571,11 @@ int main() {
     test_a_content_length_that_cannot_be();
     test_trailers_are_added_to_the_request();
     test_what_trailers_may_not_be();
+    test_frames_on_a_stream_this_end_reset_are_dropped();
+    test_frames_on_a_stream_that_closed_are_errors();
+    test_a_refused_block_is_read_to_the_end();
+    test_flow_control_refusals_say_why();
+    test_connection_errors_say_why();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

@@ -8,64 +8,28 @@
 /**
  * @file proto/h2/stream.cpp
  * @brief
- * \~english Keeping track of the requests in flight on one connection.
- * \~spanish Llevar la cuenta de las peticiones en vuelo de una conexion.
+ * \~english Keeping track of the requests in flight on one connection: the table itself, and how streams leave it.
+ * \~spanish Llevar la cuenta de las peticiones en vuelo de una conexion: la tabla misma, y como salen de ella los flujos.
+ * \~
+ *
+ * \~english
+ * What the table says about each frame of a request -- the opening HEADERS,
+ * DATA, trailers -- is in stream_frames.cpp.
+ * \~spanish
+ * Lo que dice la tabla de cada trama de una peticion -- el HEADERS que abre,
+ * los DATA, los remolques -- esta en stream_frames.cpp.
  * \~
  */
 
 #include "http_vx/h2_stream.h"
+
+#include "stream_verdicts.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
 
 namespace http_vx {
 namespace h2 {
-
-namespace {
-
-/**
- * @brief
- * \~english The verdict for a frame that is simply late.
- * \~spanish El veredicto de una trama que solo llega tarde.
- * \~
- *
- * \~english
- * Written once because it is said from three places and it is the one that is
- * easy to write as an error by mistake.  A frame for a stream that finished is
- * not the peer misbehaving: it left before the peer could know, and the only
- * thing owed for it is the connection window.
- *
- * \~spanish
- * Escrito una vez porque se dice desde tres sitios y es el que es facil poner
- * como error por equivocacion.  Una trama de un flujo terminado no es el otro
- * extremo portandose mal: salio antes de que el otro pudiera saberlo, y lo
- * unico que se debe por ella es la ventana de la conexion.
- *
- * \~
- */
-constexpr Outcome late() noexcept {
-    return Outcome{Verdict::Discard, ErrorCode::NoError, nullptr};
-}
-
-constexpr Outcome ok() noexcept {
-    return Outcome{Verdict::Accept, ErrorCode::NoError, nullptr};
-}
-
-constexpr Outcome stream_error(ErrorCode e) noexcept {
-    return Outcome{Verdict::StreamError, e, nullptr};
-}
-
-/// \~english A malformed request: a stream error, PROTOCOL_ERROR, and why (RFC 9113, 8.1.1).
-/// \~spanish Una peticion mal formada: error de flujo, PROTOCOL_ERROR, y por que (RFC 9113, 8.1.1).  \~
-constexpr Outcome malformed(const char *why) noexcept {
-    return Outcome{Verdict::StreamError, ErrorCode::ProtocolError, why};
-}
-
-constexpr Outcome connection_error(ErrorCode e) noexcept {
-    return Outcome{Verdict::ConnectionError, e, nullptr};
-}
-
-} // namespace
 
 StreamSet::~StreamSet() { release(); }
 
@@ -88,6 +52,7 @@ void StreamSet::reset(const Limits &limits) noexcept {
      * otro extremo no ofrecio nunca.
      * \~ */
     peer_initial_ = 65535;
+    recent_.reset();
 }
 
 void StreamSet::release() noexcept {
@@ -164,84 +129,6 @@ ErrorCode StreamSet::adjust_send_windows(int64_t delta) noexcept {
     return ErrorCode::NoError;
 }
 
-Outcome StreamSet::open(uint32_t id, bool end_stream) noexcept {
-    /* \~english
-     * Zero is the connection and not a stream, and an even number is one this
-     * server would have opened.  Either one means the two ends disagree about
-     * who numbers what, and nothing after it can be taken to mean what it says.
-     * \~spanish
-     * El cero es la conexion y no un flujo, y un numero par es uno que habria
-     * abierto este servidor.  Cualquiera de los dos quiere decir que los dos
-     * extremos discrepan sobre quien numera que, y nada de lo que venga detras
-     * se puede dar por lo que dice.
-     * \~ */
-    if (id == 0 || (id & 1) == 0)
-        return connection_error(ErrorCode::ProtocolError);
-
-    /* \~english
-     * At or below the highest already seen.  Two different things end up here
-     * and both are refused: a number going backwards, and a number used twice.
-     * They are not told apart because the answer is the same and because
-     * telling them apart would mean remembering every identifier ever used,
-     * which is the memory this rule exists to avoid.
-     *
-     * Note that a stream still OPEN with this identifier lands here too -- a
-     * second HEADERS on a live stream is trailers, and that is a different
-     * question asked elsewhere, not an opening.
-     *
-     * \~spanish
-     * Igual o por debajo del mayor ya visto.  Aqui acaban dos cosas distintas y
-     * las dos se rechazan: un numero que va hacia atras, y un numero usado dos
-     * veces.  No se distinguen porque la respuesta es la misma y porque
-     * distinguirlas obligaria a recordar todos los identificadores usados, que
-     * es la memoria que esta regla existe para evitar.
-     *
-     * Fijarse en que un flujo todavia ABIERTO con este identificador tambien cae
-     * aqui -- un segundo HEADERS sobre un flujo vivo son trailers, y esa es otra
-     * pregunta que se hace en otro sitio, no una apertura.
-     * \~ */
-    if (id <= highest_) return connection_error(ErrorCode::ProtocolError);
-
-    /* \~english
-     * The number goes up whether or not the stream is accepted.  A refused
-     * stream is still a stream the peer opened, and letting the peer try the
-     * same identifier again after a refusal would be letting it reuse one.
-     * \~spanish
-     * El numero sube se acepte el flujo o no.  Un flujo rechazado es un flujo
-     * que el otro extremo abrio igual, y dejarle intentar el mismo
-     * identificador otra vez despues de un rechazo seria dejarle reutilizar uno.
-     * \~ */
-    highest_ = id;
-
-    /* \~english
-     * More at once than this server holds.  The peer did nothing wrong, so it
-     * is a stream error with the one code that means "send it again" -- and a
-     * connection error here would turn a busy moment into a dropped connection
-     * for every other request on it.
-     * \~spanish
-     * Mas a la vez de los que guarda este servidor.  El otro extremo no ha hecho
-     * nada mal, asi que es un error de flujo con el unico codigo que quiere
-     * decir "mandalo otra vez" -- y un error de conexion aqui convertiria un
-     * momento de mucho trabajo en una conexion caida para todas las demas
-     * peticiones que van por ella.
-     * \~ */
-    if (count_ >= max_streams_) return stream_error(ErrorCode::RefusedStream);
-
-    if (!make_room()) return connection_error(ErrorCode::InternalError);
-    if (count_ >= cap_) return stream_error(ErrorCode::RefusedStream);
-
-    Stream &s = streams_[count_];
-    s.id = id;
-    s.send = Window(peer_initial_);
-    s.recv = Window(own_initial_);
-    s.state = end_stream ? StreamState::HalfClosedRemote : StreamState::Open;
-    s.counted = false;
-    s.content_left = 0;
-    ++count_;
-
-    return ok();
-}
-
 void StreamSet::end_remote(Stream *s) noexcept {
     if (s->state == StreamState::HalfClosedLocal) {
         drop(static_cast<size_t>(s - streams_));
@@ -250,163 +137,10 @@ void StreamSet::end_remote(Stream *s) noexcept {
     s->state = StreamState::HalfClosedRemote;
 }
 
-Outcome StreamSet::on_data(uint32_t id, uint32_t len, uint32_t content,
-                           bool end_stream) noexcept {
-    if (id == 0) return connection_error(ErrorCode::ProtocolError);
-
-    Stream *s = find(id);
-    if (s == nullptr) {
-        /* \~english
-         * Above the highest seen means the peer sent data for a stream it never
-         * opened, which is a connection error -- there is no request to attach
-         * it to and no way to answer.  At or below means the stream finished,
-         * and the frame is merely late.
-         * \~spanish
-         * Por encima del mayor visto quiere decir que el otro extremo mando
-         * datos de un flujo que no abrio nunca, que es un error de conexion --
-         * no hay peticion a la que pegarlos ni forma de contestar.  Igual o por
-         * debajo quiere decir que el flujo termino, y la trama solo llega tarde.
-         * \~ */
-        if (id > highest_) return connection_error(ErrorCode::ProtocolError);
-        (void)len;
-        return late();
-    }
-
-    /* \~english
-     * Data after the peer said it had finished.  This one IS the peer
-     * misbehaving -- it told this end there would be no more and then sent more
-     * -- and it is a stream error rather than a connection one because only
-     * this request is confused.
-     * \~spanish
-     * Datos despues de que el otro extremo dijera que habia acabado.  Este SI es
-     * el otro portandose mal -- le dijo a este que no habria mas y luego mando
-     * mas -- y es un error de flujo y no de conexion porque la unica confundida
-     * es esta peticion.
-     * \~ */
-    if (s->state == StreamState::HalfClosedRemote)
-        return stream_error(ErrorCode::StreamClosed);
-
-    /* \~english
-     * More than this end said it would take.  A flow-control error on the
-     * stream, and it is the check that makes the announced window a promise
-     * rather than a suggestion: without it, the limit this server publishes is
-     * a number nobody enforces.
-     * \~spanish
-     * Mas de lo que dijo este extremo que aceptaria.  Un error de control de
-     * flujo del flujo, y es la comprobacion que hace de la ventana anunciada una
-     * promesa y no una sugerencia: sin ella, el limite que publica este servidor
-     * es un numero que no hace cumplir nadie.
-     * \~ */
-    if (!s->recv.take(len)) return stream_error(ErrorCode::FlowControlError);
-
-    if (s->counted) {
-        /* \~english
-         * More content than the request declared, refused on the frame that
-         * crosses the line: waiting for the end would be reading bytes the
-         * request already said do not exist (RFC 9113, 8.1.1).
-         * \~spanish
-         * Mas contenido del que declaro la peticion, rechazado en la trama que
-         * pasa de la raya: esperar al final seria leer bytes que la propia
-         * peticion ya dijo que no existen (RFC 9113, 8.1.1).
-         * \~ */
-        if (content > s->content_left)
-            return malformed("more DATA than content-length (RFC 9113, 8.1.1)");
-        s->content_left -= content;
-
-        /* \~english
-         * And less, found out on the frame that ends the content.
-         * \~spanish
-         * Y menos, descubierto en la trama que acaba el contenido.
-         * \~ */
-        if (end_stream && s->content_left != 0)
-            return malformed("less DATA than content-length (RFC 9113, 8.1.1)");
-    }
-
-    if (end_stream) end_remote(s);
-
-    return ok();
-}
-
-Outcome StreamSet::expect_content(uint32_t id, uint64_t n) noexcept {
-    Stream *s = find(id);
-
-    /* \~english
-     * Not in the table means the stream was refused or is over, and a length
-     * for it has nothing left to be compared with.
-     * \~spanish
-     * Si no esta en la tabla es que el flujo se rechazo o acabo, y una
-     * longitud suya ya no tiene con que compararse.
-     * \~ */
-    if (s == nullptr) return late();
-
-    /* \~english
-     * A HEADERS that already ended the stream: the content is empty, so the
-     * only length that equals it is zero (RFC 9113, 8.1.1).  A request is
-     * never one of the messages "defined as having no content" -- those are
-     * responses (RFC 9110, 6.4.1) -- so the exception does not apply here.
-     * \~spanish
-     * Un HEADERS que ya acabo el flujo: el contenido esta vacio, asi que la
-     * unica longitud que es igual a el es cero (RFC 9113, 8.1.1).  Una
-     * peticion no es nunca uno de los mensajes "definidos como sin contenido"
-     * -- esos son respuestas (RFC 9110, 6.4.1) --, asi que la excepcion no
-     * vale aqui.
-     * \~ */
-    if (s->state == StreamState::HalfClosedRemote) {
-        if (n != 0)
-            return malformed("a content-length other than 0 on a request "
-                             "with no DATA (RFC 9113, 8.1.1)");
-        return ok();
-    }
-
-    s->counted = true;
-    s->content_left = n;
-    return ok();
-}
-
-Outcome StreamSet::on_trailers(uint32_t id, bool end_stream) noexcept {
-    Stream *s = find(id);
-    if (s == nullptr) return late();
-
-    /* \~english
-     * The peer already said it had finished, and a HEADERS is not one of the
-     * frames still allowed after that (RFC 9113, 5.1, half-closed (remote)).
-     * This is also where a THIRD HEADERS lands: the trailers ended the stream.
-     * \~spanish
-     * El otro extremo ya dijo que habia acabado, y un HEADERS no es de las
-     * tramas que se permiten todavia despues (RFC 9113, 5.1, half-closed
-     * (remote)).  Aqui cae tambien un TERCER HEADERS: los remolques acabaron el
-     * flujo.
-     * \~ */
-    if (s->state == StreamState::HalfClosedRemote)
-        return Outcome{Verdict::StreamError, ErrorCode::StreamClosed,
-                       "a HEADERS after the stream had ended (RFC 9113, 5.1)"};
-
-    /* \~english
-     * A HEADERS after the one that opened the request, without END_STREAM:
-     * malformed (RFC 9113, 8.1).
-     * \~spanish
-     * Un HEADERS detras del que abrio la peticion, sin END_STREAM: mal formada
-     * (RFC 9113, 8.1).
-     * \~ */
-    if (!end_stream)
-        return malformed("a second HEADERS without END_STREAM (RFC 9113, 8.1)");
-
-    /* \~english
-     * The trailers end the content, so what was declared has to have arrived
-     * by now (RFC 9113, 8.1.1).
-     * \~spanish
-     * Los remolques acaban el contenido, asi que lo declarado tiene que haber
-     * llegado ya (RFC 9113, 8.1.1).
-     * \~ */
-    if (s->counted && s->content_left != 0)
-        return malformed("less DATA than content-length (RFC 9113, 8.1.1)");
-
-    end_remote(s);
-    return ok();
-}
-
 Outcome StreamSet::on_reset(uint32_t id) noexcept {
-    if (id == 0) return connection_error(ErrorCode::ProtocolError);
+    if (id == 0)
+        return connection_error(ErrorCode::ProtocolError,
+                                "RST_STREAM on stream 0 (RFC 9113, 6.4)");
 
     Stream *s = find(id);
     if (s == nullptr) {
@@ -419,12 +153,31 @@ Outcome StreamSet::on_reset(uint32_t id) noexcept {
          * de uno ya terminado es que los dos extremos se rindieron a la vez, que
          * es lo corriente.
          * \~ */
-        if (id > highest_) return connection_error(ErrorCode::ProtocolError);
+        if (never_opened(id))
+            return connection_error(ErrorCode::ProtocolError,
+                                    "RST_STREAM on an idle stream (RFC 9113, "
+                                    "5.1)");
         return late();
     }
 
     drop(static_cast<size_t>(s - streams_));
     return ok();
+}
+
+void StreamSet::on_reset_sent(uint32_t id) noexcept {
+    Stream *s = find(id);
+    if (s != nullptr) drop(static_cast<size_t>(s - streams_));
+
+    /* \~english
+     * Kept whether or not the stream was in the table: a stream refused at
+     * the door never got an entry, and it is exactly the one whose trailers
+     * and body are still on their way.
+     * \~spanish
+     * Se guarda estuviera o no el flujo en la tabla: un flujo rechazado en la
+     * puerta nunca tuvo entrada, y es justo aquel cuyos remolques y cuerpo
+     * siguen de camino.
+     * \~ */
+    recent_.reset_here(id);
 }
 
 void StreamSet::finish(uint32_t id) noexcept {

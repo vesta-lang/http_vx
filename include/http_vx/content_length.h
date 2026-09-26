@@ -55,6 +55,7 @@
 
 #include "http_vx/fields.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace http_vx {
@@ -192,6 +193,48 @@ struct ContentLength {
  */
 ContentLength parse_content_length(const Fields &fields,
                                    const uint8_t *base) noexcept;
+
+/**
+ * @brief
+ * \~english The most digits a content length written by @c write_content_length has.
+ * \~spanish Los digitos mas que tiene una longitud escrita por @c write_content_length.
+ * \~
+ */
+constexpr size_t kContentLengthDigits = 20;
+
+/**
+ * @brief
+ * \~english Writes @p v as the decimal digits a content length is (RFC 9110, 8.6).
+ * \~spanish Escribe @p v como los digitos decimales que es una longitud de contenido (RFC 9110, 8.6).
+ * \~
+ *
+ * \~english
+ * The other half of @c parse_content_length, and written out rather than
+ * handed to the C library: `snprintf` would look at the locale, and a locale
+ * that groups digits would put a separator inside a content length -- which
+ * is a number the peer parses, not text a person reads.  It has happened, and
+ * it is the kind of bug that only appears on the machines configured a certain
+ * way.  One writer for the three versions, so that the number HTTP/1.1 frames
+ * with and the one HTTP/2 and HTTP/3 announce for HEAD are spelled alike.
+ *
+ * \~spanish
+ * La otra mitad de @c parse_content_length, y escrita a mano y no entregada a
+ * la biblioteca de C: `snprintf` miraria la configuracion regional, y una que
+ * agrupe digitos pondria un separador dentro de una longitud de contenido --
+ * que es un numero que analiza el otro extremo, no texto que lea una persona
+ * --.  Ha pasado, y es de los errores que solo aparecen en las maquinas
+ * configuradas de cierta forma.  Un escritor para las tres versiones, para que
+ * el numero con el que trocea HTTP/1.1 y el que anuncian HTTP/2 y HTTP/3 para
+ * HEAD se escriban igual.
+ *
+ * \~
+ * @param out \~english room for @c kContentLengthDigits bytes
+ *            \~spanish sitio para @c kContentLengthDigits bytes  \~
+ * @param v   \~english the length  \~spanish la longitud  \~
+ * @return    \~english how many digits were written
+ *            \~spanish cuantos digitos se escribieron  \~
+ */
+size_t write_content_length(uint8_t *out, uint64_t v) noexcept;
 
 } // namespace http_vx
 

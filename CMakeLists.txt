@@ -130,6 +130,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/request_builder.cpp
         proto/semantics/method.cpp
         proto/semantics/response.cpp
+        proto/semantics/response_lines.cpp
         proto/semantics/status.cpp
 
         proto/h1/chunked.cpp
@@ -139,6 +140,8 @@ add_library(http_vx_proto STATIC
         proto/h1/writer.cpp
 
         proto/h2/connection.cpp
+        proto/h2/connection_control.cpp
+        proto/h2/connection_request.cpp
         proto/h2/decoder.cpp
         proto/h2/encoder.cpp
         proto/h2/frame.cpp
@@ -147,8 +150,12 @@ add_library(http_vx_proto STATIC
         proto/h2/table.cpp
         proto/h2/reader.cpp
         proto/h2/service.cpp
+        proto/h2/service_answer.cpp
+        proto/h2/service_read.cpp
+        proto/h2/service_write.cpp
         proto/h2/settings.cpp
         proto/h2/stream.cpp
+        proto/h2/stream_frames.cpp
         proto/h2/writer.cpp
 
         proto/h3/qpack.cpp

@@ -55,6 +55,8 @@
  * \~
  */
 
+#include "http_vx/h2_hpack.h"
+#include "http_vx/h2_huffman.h"
 #include "http_vx/http2_service.h"
 #include "http_vx/memory_backend.h"
 
@@ -72,6 +74,7 @@ using http_vx::Request;
 using http_vx::Shard;
 using http_vx::ShardConfig;
 
+using http_vx::h2::ErrorCode;
 using http_vx::h2::FrameType;
 using http_vx::h2::kEndHeaders;
 using http_vx::h2::kEndStream;
@@ -188,9 +191,18 @@ struct Seen {
     size_t headers_on[8] = {};
     size_t data_bytes_on[8] = {};
     size_t resets_on[8] = {};
+    uint32_t reset_code_on[8] = {};
+    /// \~english Window given back on the connection, and on each stream.
+    /// \~spanish Ventana devuelta en la conexion, y en cada flujo.  \~
     size_t window_given = 0;
+    size_t window_on[8] = {};
     bool ended_on[8] = {};
     bool goaway = false;
+
+    /// \~english The first header block of each stream, as it went out.
+    /// \~spanish El primer bloque de cabeceras de cada flujo, tal como salio.  \~
+    uint8_t block_on[8][512] = {};
+    size_t block_len_on[8] = {};
 
     void read(const uint8_t *p, size_t n) {
         size_t at = 0;
@@ -216,6 +228,10 @@ struct Seen {
 
             switch (static_cast<FrameType>(type)) {
             case FrameType::Headers:
+                if (headers_on[slot] == 0 && len <= sizeof block_on[slot]) {
+                    std::memcpy(block_on[slot], payload, len);
+                    block_len_on[slot] = len;
+                }
                 ++headers_on[slot];
                 if ((flags & kEndStream) != 0) ended_on[slot] = true;
                 break;
@@ -227,14 +243,23 @@ struct Seen {
 
             case FrameType::RstStream:
                 ++resets_on[slot];
+                reset_code_on[slot] = (static_cast<uint32_t>(payload[0]) << 24) |
+                                      (static_cast<uint32_t>(payload[1]) << 16) |
+                                      (static_cast<uint32_t>(payload[2]) << 8) |
+                                      static_cast<uint32_t>(payload[3]);
                 break;
 
-            case FrameType::WindowUpdate:
-                window_given += (static_cast<size_t>(payload[0] & 0x7F) << 24) |
-                                (static_cast<size_t>(payload[1]) << 16) |
-                                (static_cast<size_t>(payload[2]) << 8) |
-                                static_cast<size_t>(payload[3]);
+            case FrameType::WindowUpdate: {
+                const size_t k = (static_cast<size_t>(payload[0] & 0x7F) << 24) |
+                                 (static_cast<size_t>(payload[1]) << 16) |
+                                 (static_cast<size_t>(payload[2]) << 8) |
+                                 static_cast<size_t>(payload[3]);
+                if (id == 0)
+                    window_given += k;
+                else
+                    window_on[slot] += k;
                 break;
+            }
 
             case FrameType::Goaway:
                 goaway = true;
@@ -248,6 +273,139 @@ struct Seen {
         }
     }
 };
+
+/**
+ * @brief
+ * \~english The field lines of a response header block, read back.
+ * \~spanish Las lineas de campo de un bloque de cabeceras de respuesta, leidas de vuelta.
+ * \~
+ *
+ * \~english
+ * Only what this server writes: indexed fields of the static table and
+ * literals whose name is a static index or a string.  Anything else -- the
+ * dynamic table, a size update -- makes the read fail, which a test reports:
+ * a reader that skipped what it did not know would agree with any block.
+ * @c never marks the lines sent as never indexed (RFC 7541, 6.2.3).
+ *
+ * \~spanish
+ * Solo lo que escribe este servidor: cabeceras indexadas de la tabla estatica y
+ * literales cuyo nombre es un indice estatico o una cadena.  Cualquier otra cosa
+ * -- la tabla dinamica, una actualizacion de tamano -- hace fallar la lectura,
+ * que la prueba cuenta: un lector que se saltara lo que no conoce le daria la
+ * razon a cualquier bloque.  @c never marca las lineas mandadas como no
+ * indexables nunca (RFC 7541, 6.2.3).
+ * \~
+ */
+struct Lines {
+    char name[16][64] = {};
+    char value[16][128] = {};
+    bool never[16] = {};
+    size_t count = 0;
+    bool ok = false;
+
+    /// \~english The value of @p n, or null.  \~spanish El valor de @p n, o nulo.  \~
+    const char *of(const char *n) const {
+        for (size_t i = 0; i < count; ++i)
+            if (std::strcmp(name[i], n) == 0) return value[i];
+        return nullptr;
+    }
+
+    /// \~english Whether the line called @p n was sent as never indexed.
+    /// \~spanish Si la linea llamada @p n se mando como no indexable nunca.  \~
+    bool never_of(const char *n) const {
+        for (size_t i = 0; i < count; ++i)
+            if (std::strcmp(name[i], n) == 0) return never[i];
+        return false;
+    }
+
+    /// \~english How many lines are called @p n.  \~spanish Cuantas lineas se llaman @p n.  \~
+    size_t how_many(const char *n) const {
+        size_t k = 0;
+        for (size_t i = 0; i < count; ++i)
+            if (std::strcmp(name[i], n) == 0) ++k;
+        return k;
+    }
+};
+
+/// \~english Reads one string literal at @p at into @p out.  \~spanish Lee una cadena literal en @p at a @p out.  \~
+bool read_string(const uint8_t *p, size_t n, size_t &at, char *out, size_t cap) {
+    if (at >= n) return false;
+    const bool huffman = (p[at] & 0x80) != 0;
+    const http_vx::h2::hpack::IntResult len = http_vx::h2::hpack::decode_int(p + at, n - at, 7);
+    if (len.status != http_vx::h2::hpack::Status::Ok) return false;
+    at += len.used;
+    if (len.value > n - at) return false;
+
+    size_t got = static_cast<size_t>(len.value);
+    if (huffman) {
+        uint8_t tmp[256];
+        const http_vx::h2::hpack::HuffmanResult h =
+            http_vx::h2::hpack::huffman_decode(tmp, sizeof tmp, p + at, got);
+        if (h.status != http_vx::h2::hpack::Status::Ok || h.len >= cap) return false;
+        std::memcpy(out, tmp, h.len);
+        out[h.len] = '\0';
+    } else {
+        if (got >= cap) return false;
+        std::memcpy(out, p + at, got);
+        out[got] = '\0';
+    }
+    at += static_cast<size_t>(len.value);
+    return true;
+}
+
+/// \~english Copies a static entry's name, or value, into @p out.  \~spanish Copia el nombre, o el valor, de una entrada estatica a @p out.  \~
+bool static_text(const char *s, size_t len, char *out, size_t cap) {
+    if (s == nullptr || len >= cap) return false;
+    std::memcpy(out, s, len);
+    out[len] = '\0';
+    return true;
+}
+
+/// \~english Reads the block sent on @p stream.  \~spanish Lee el bloque mandado en @p stream.  \~
+Lines lines_of(const Seen &seen, size_t stream) {
+    Lines l;
+    const uint8_t *p = seen.block_on[stream];
+    const size_t n = seen.block_len_on[stream];
+    size_t at = 0;
+
+    while (at < n) {
+        if (l.count == 16) return l;
+        const uint8_t lead = p[at];
+        const size_t i = l.count;
+
+        if ((lead & 0x80) != 0) {
+            const http_vx::h2::hpack::IntResult idx = http_vx::h2::hpack::decode_int(p + at, n - at, 7);
+            if (idx.status != http_vx::h2::hpack::Status::Ok) return l;
+            at += idx.used;
+            const http_vx::h2::hpack::StaticEntry *e = http_vx::h2::hpack::static_entry(idx.value);
+            if (e == nullptr || !static_text(e->name, e->name_len, l.name[i], sizeof l.name[i]) ||
+                !static_text(e->value, e->value_len, l.value[i], sizeof l.value[i]))
+                return l;
+            ++l.count;
+            continue;
+        }
+
+        // \~english Only the two literals that add nothing to a table.  \~spanish Solo los dos literales que no anaden nada a una tabla.  \~
+        if ((lead & 0xE0) != 0x00) return l;
+        l.never[i] = (lead & 0x10) != 0;
+
+        const http_vx::h2::hpack::IntResult idx = http_vx::h2::hpack::decode_int(p + at, n - at, 4);
+        if (idx.status != http_vx::h2::hpack::Status::Ok) return l;
+        at += idx.used;
+
+        if (idx.value != 0) {
+            const http_vx::h2::hpack::StaticEntry *e = http_vx::h2::hpack::static_entry(idx.value);
+            if (e == nullptr || !static_text(e->name, e->name_len, l.name[i], sizeof l.name[i])) return l;
+        } else if (!read_string(p, n, at, l.name[i], sizeof l.name[i])) {
+            return l;
+        }
+        if (!read_string(p, n, at, l.value[i], sizeof l.value[i])) return l;
+        ++l.count;
+    }
+
+    l.ok = true;
+    return l;
+}
 
 /* ------------------------------------------------------------------------- *
  * \~english The server, made of all of it.
@@ -296,8 +454,23 @@ class Echo final : public Handler {
 
         res.status(200);
         res.field(http_vx::FieldId::ContentType, "text/plain", 10);
+        for (size_t i = 0; i < extras; ++i)
+            res.field(extra_name[i], std::strlen(extra_name[i]), extra_value[i], std::strlen(extra_value[i]));
         if (reply_size != 0) res.body(reply, reply_size);
+        // \~english A field after the body: the builder refuses it and says it failed.
+        // \~spanish Una cabecera despues del cuerpo: el constructor la rechaza y dice que fallo.  \~
+        if (field_after_body) res.field(http_vx::FieldId::Server, "late", 4);
     }
+
+    /// \~english Whether to write a field after the body, which fails the answer.
+    /// \~spanish Si escribir una cabecera despues del cuerpo, que hace fallar la respuesta.  \~
+    bool field_after_body = false;
+
+    /// \~english Fields added to every answer, spelled as a handler would.
+    /// \~spanish Cabeceras anadidas a cada respuesta, escritas como lo haria un manejador.  \~
+    const char *extra_name[4] = {};
+    const char *extra_value[4] = {};
+    size_t extras = 0;
 
     int calls = 0;
     size_t last_body_size = 0;
@@ -324,8 +497,9 @@ struct Server {
 
     Server() : io(shard.buffers()) {}
 
-    bool start(size_t max_body = 4096) {
+    bool start(size_t max_body = 4096, uint32_t max_header_list = 0) {
         http_vx::h2::Limits limits;
+        if (max_header_list != 0) limits.max_header_list_size = max_header_list;
         if (!service.reset(8, 4, max_body, handler, limits)) return false;
 
         ShardConfig cfg;
@@ -432,6 +606,21 @@ void test_a_body_in_one_frame() {
     check(std::strcmp(s.handler.last_target, "/upload") == 0,
           "the target was lost between the head and the body");
     check(s.service.in_hand() == 0, "the request was never let go of");
+
+    /* \~english
+     * The window goes back after the handler, and by then the answer has
+     * closed the stream: only the connection's may be given, because "an
+     * endpoint MUST NOT send frames other than PRIORITY on a closed stream"
+     * (RFC 9113, 5.1).
+     * \~spanish
+     * La ventana vuelve despues del manejador, y para entonces la respuesta ha
+     * cerrado el flujo: solo se puede dar la de la conexion, porque "an
+     * endpoint MUST NOT send frames other than PRIORITY on a closed stream"
+     * (RFC 9113, 5.1).
+     * \~ */
+    const Seen got = s.seen();
+    check(got.window_given >= 10, "the connection's window for the body never went back");
+    check(got.window_on[1] == 0, "a WINDOW_UPDATE went out on a closed stream (RFC 9113, 5.1)");
 }
 
 /**
@@ -856,6 +1045,378 @@ void test_a_content_length_that_lies_is_refused() {
     check(s.service.in_hand() == 0, "a refused request was never let go of");
 }
 
+/// \~english A server, a connection and one GET for @p path on stream 1.
+/// \~spanish Un servidor, una conexion y un GET de @p path en el flujo 1.  \~
+void one_request(Server &s, const char *method, const char *path) {
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+    uint8_t block[256];
+    const size_t n = request_block(block, method, path);
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, block, n);
+    s.send(w);
+    s.run();
+}
+
+/**
+ * @brief
+ * \~english A handler's field names go out in lower case, and secrets are never indexed (RFC 9113, 8.2; RFC 7541, 7.1.3).
+ * \~spanish Los nombres de cabecera de un manejador salen en minusculas, y los secretos no se indexan nunca (RFC 9113, 8.2; RFC 7541, 7.1.3).
+ * \~
+ *
+ * \~english
+ * The handler spells `X-Request-Id` as HTTP/1.1 lets it; HTTP/2 says the name
+ * MUST be lowered, and a peer that reads a capital treats the response as
+ * malformed.  `Set-Cookie` is one of the fields that must never be remembered
+ * by anybody on the way, so it travels as never indexed.
+ * \~spanish
+ * El manejador escribe `X-Request-Id` como le deja HTTP/1.1; HTTP/2 dice que el
+ * nombre DEBE bajarse a minusculas, y un extremo que lee una mayuscula trata la
+ * respuesta como mal formada.  `Set-Cookie` es de las cabeceras que no debe
+ * recordar nadie del camino, asi que viaja como no indexable nunca.
+ * \~
+ */
+void test_field_names_go_out_in_lower_case() {
+    Server s;
+    check(s.start(), "the server would not start");
+    s.handler.extra_name[0] = "X-Request-Id";
+    s.handler.extra_value[0] = "abc";
+    s.handler.extra_name[1] = "Set-Cookie";
+    s.handler.extra_value[1] = "id=1";
+    s.handler.extras = 2;
+
+    one_request(s, "GET", "/");
+
+    const Seen got = s.seen();
+    const Lines l = lines_of(got, 1);
+    check(l.ok, "the response header block could not be read back");
+    check(l.of(":status") != nullptr && std::strcmp(l.of(":status"), "200") == 0, "the answer was not a 200");
+    check(l.of("x-request-id") != nullptr && std::strcmp(l.of("x-request-id"), "abc") == 0,
+          "an upper-case field name was not lowered (RFC 9113, 8.2)");
+    check(l.how_many("X-Request-Id") == 0, "a field name went out with capitals (RFC 9113, 8.2)");
+    check(l.of("content-type") != nullptr, "a known field was lost");
+    check(l.of("set-cookie") != nullptr && std::strcmp(l.of("set-cookie"), "id=1") == 0,
+          "a set-cookie was lost");
+    check(l.never_of("set-cookie"), "a set-cookie was not sent as never indexed (RFC 7541, 7.1.3)");
+    check(!l.never_of("x-request-id"), "an ordinary field was sent as a secret");
+    check(s.service.bad_answers() == 0, "a good answer was counted as bad");
+}
+
+/**
+ * @brief
+ * \~english An answer HTTP/2 cannot carry as written is a 500, counted -- never a changed answer (RFC 9113, 8.2.1, 8.2.2).
+ * \~spanish Una respuesta que HTTP/2 no puede llevar tal como se escribio es un 500, contado -- nunca una respuesta cambiada (RFC 9113, 8.2.1, 8.2.2).
+ * \~
+ */
+void test_an_answer_that_cannot_travel_is_a_500() {
+    const char *names[] = {"Connection", "Transfer-Encoding", "Keep-Alive", "Upgrade", "Proxy-Connection",
+                           "x-bad", "x-edge", "bad name", "x:colon"};
+    const char *values[] = {"close", "chunked", "5", "h2c", "close", "a\r\nb", " padded", "v", "v"};
+
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; ++i) {
+        Server s;
+        check(s.start(), "the server would not start");
+        std::memcpy(s.handler.reply, "hello", 5);
+        s.handler.reply_size = 5;
+        s.handler.extra_name[0] = names[i];
+        s.handler.extra_value[0] = values[i];
+        s.handler.extras = 1;
+
+        one_request(s, "GET", "/");
+
+        const Seen got = s.seen();
+        const Lines l = lines_of(got, 1);
+        char what[160];
+        std::snprintf(what, sizeof what, "a response with `%s` was not answered 500", names[i]);
+        check(l.ok && l.of(":status") != nullptr && std::strcmp(l.of(":status"), "500") == 0, what);
+        std::snprintf(what, sizeof what, "a response with `%s` was not counted as bad", names[i]);
+        check(s.service.bad_answers() == 1, what);
+        std::snprintf(what, sizeof what, "a response with `%s` was refused without a reason", names[i]);
+        check(s.service.last_bad_answer() != nullptr && std::strstr(s.service.last_bad_answer(), "RFC") != nullptr,
+              what);
+        check(l.count == 1, "the 500 carried the handler's fields");
+        check(got.data_bytes_on[1] == 0, "the 500 carried the handler's body");
+        check(got.ended_on[1], "the 500 did not end the stream");
+        check(got.resets_on[1] == 0, "a stream that was over was reset (RFC 9113, 5.1)");
+        check(!got.goaway, "a bad answer ended the connection");
+        check(s.service.in_hand() == 0, "the request was never let go of");
+    }
+}
+
+/**
+ * @brief
+ * \~english A handler that failed is answered 500, and a stream already over is not reset afterwards (RFC 9113, 5.1).
+ * \~spanish A un manejador que fallo se le contesta 500, y un flujo que ya acabo no se reinicia despues (RFC 9113, 5.1).
+ * \~
+ *
+ * \~english
+ * The request ended with its HEADERS, so the 500's END_STREAM closes the
+ * stream -- and "an endpoint MUST NOT send frames other than PRIORITY on a
+ * closed stream".  The RST_STREAM(NO_ERROR) that asks a client to stop
+ * uploading is for a request still arriving, and this one is not.
+ * \~spanish
+ * La peticion acabo con su HEADERS, asi que el END_STREAM del 500 cierra el
+ * flujo -- y "an endpoint MUST NOT send frames other than PRIORITY on a closed
+ * stream".  El RST_STREAM(NO_ERROR) que le pide a un cliente que deje de subir
+ * es para una peticion que sigue llegando, y esta no.
+ * \~
+ */
+void test_a_failed_handler_is_a_500_without_a_reset() {
+    Server s;
+    check(s.start(), "the server would not start");
+    std::memcpy(s.handler.reply, "hello", 5);
+    s.handler.reply_size = 5;
+    s.handler.field_after_body = true;
+
+    one_request(s, "GET", "/");
+
+    const Seen got = s.seen();
+    const Lines l = lines_of(got, 1);
+    check(l.ok && l.of(":status") != nullptr && std::strcmp(l.of(":status"), "500") == 0,
+          "a handler that failed was not answered 500");
+    check(got.ended_on[1], "the 500 did not end the stream");
+    check(got.resets_on[1] == 0, "a closed stream was reset after its answer (RFC 9113, 5.1)");
+    check(s.service.bad_answers() == 1, "a failed handler was not counted");
+    check(s.service.last_bad_answer() != nullptr && std::strstr(s.service.last_bad_answer(), "handler") != nullptr,
+          "a failed handler was not said to be the reason");
+    check(!got.goaway, "a failed handler ended the connection");
+}
+
+/**
+ * @brief
+ * \~english HEAD gets the fields GET would, and no content (RFC 9110, 9.3.2; RFC 9113, 8.1.1).
+ * \~spanish HEAD recibe las cabeceras que recibiria GET, y ningun contenido (RFC 9110, 9.3.2; RFC 9113, 8.1.1).
+ * \~
+ */
+void test_head_sends_no_content() {
+    {
+        // \~english The length GET would have had.  \~spanish La longitud que habria tenido GET.  \~
+        Server s;
+        check(s.start(), "the server would not start");
+        std::memcpy(s.handler.reply, "hello", 5);
+        s.handler.reply_size = 5;
+
+        one_request(s, "HEAD", "/");
+
+        const Seen got = s.seen();
+        const Lines l = lines_of(got, 1);
+        check(s.handler.calls == 1, "the handler was not asked about a HEAD");
+        check(got.headers_on[1] == 1 && got.ended_on[1], "a HEAD was not answered with one ended header block");
+        check(got.data_bytes_on[1] == 0, "a HEAD was sent content (RFC 9110, 9.3.2)");
+        check(l.ok && l.of("content-length") != nullptr && std::strcmp(l.of("content-length"), "5") == 0,
+              "a HEAD did not say the length GET would have had");
+        check(l.of("content-type") != nullptr, "a HEAD lost the fields GET would have had");
+        check(s.service.in_hand() == 0, "a HEAD was never let go of");
+    }
+    {
+        // \~english The handler's own length is the one that goes, once.  \~spanish La longitud del propio manejador es la que sale, una vez.  \~
+        Server s;
+        check(s.start(), "the server would not start");
+        std::memcpy(s.handler.reply, "hello", 5);
+        s.handler.reply_size = 5;
+        s.handler.extra_name[0] = "Content-Length";
+        s.handler.extra_value[0] = "99";
+        s.handler.extras = 1;
+
+        one_request(s, "HEAD", "/");
+
+        const Lines l = lines_of(s.seen(), 1);
+        check(l.ok && l.how_many("content-length") == 1 && std::strcmp(l.of("content-length"), "99") == 0,
+              "a HEAD's own content-length was replaced or doubled");
+    }
+    {
+        // \~english No content means nothing waits for a window; GET gets no length added.
+        // \~spanish Sin contenido no hay nada que espere una ventana; a GET no se le anade longitud.  \~
+        Server s;
+        check(s.start(), "the server would not start");
+        std::memset(s.handler.reply, 'x', 40);
+        s.handler.reply_size = 40;
+
+        const ConnHandle c = s.shard.adopt(7, 0);
+        check(c.valid(), "the connection was not adopted");
+        Wire w;
+        w.text("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        const uint8_t small[6] = {0x00, 0x04, 0x00, 0x00, 0x00, 0x0A};
+        w.frame(FrameType::Settings, 0, 0, small, sizeof small);
+        uint8_t block[256];
+        size_t n = request_block(block, "HEAD", "/big");
+        w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, block, n);
+        n = request_block(block, "GET", "/big");
+        w.frame(FrameType::Headers, kEndHeaders | kEndStream, 3, block, n);
+        s.send(w);
+        s.run();
+
+        const Seen got = s.seen();
+        const Lines head = lines_of(got, 1);
+        check(got.ended_on[1] && got.data_bytes_on[1] == 0, "a HEAD waited for a window it did not need");
+        check(head.ok && head.of("content-length") != nullptr && std::strcmp(head.of("content-length"), "40") == 0,
+              "a HEAD larger than the window did not say its length");
+        const Lines get = lines_of(got, 3);
+        check(get.ok && get.of("content-length") == nullptr, "a GET was given a length nobody wrote");
+        check(got.data_bytes_on[3] == 10, "the GET beside it did not stop at its window");
+        check(s.service.in_hand() == 1, "the HEAD was kept, or the GET's rest was not");
+    }
+}
+
+/**
+ * @brief
+ * \~english A header list over the limit is answered 431 on its stream (RFC 9113, 10.5.1).
+ * \~spanish Una lista de cabeceras por encima del limite se contesta 431 en su flujo (RFC 9113, 10.5.1).
+ * \~
+ */
+void test_a_header_list_too_large_is_431() {
+    Server s;
+    check(s.start(4096, 256), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    char big[101];
+    std::memset(big, 'b', 100);
+    big[100] = '\0';
+
+    Wire w;
+    hello(w);
+    uint8_t block[512];
+    size_t n = request_block(block, "GET", "/large");
+    field(block, n, "x-big", big);
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, block, n);
+
+    n = request_block(block, "POST", "/large");
+    field(block, n, "x-big", big);
+    w.frame(FrameType::Headers, kEndHeaders, 3, block, n);
+
+    n = request_block(block, "GET", "/after");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 5, block, n);
+
+    // \~english Trailers over the limit, behind a body being gathered.  \~spanish Remolques por encima del limite, detras de un cuerpo que se esta juntando.  \~
+    n = request_block(block, "POST", "/trailed");
+    w.frame(FrameType::Headers, kEndHeaders, 7, block, n);
+    w.frame(FrameType::Data, 0, 7, reinterpret_cast<const uint8_t *>("abc"), 3);
+    uint8_t tail[256];
+    size_t t = 0;
+    field(tail, t, "x-big", big);
+    field(tail, t, "x-big2", big);
+    field(tail, t, "x-big3", big);
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 7, tail, t);
+
+    s.send(w);
+    s.run();
+
+    check(s.handler.calls == 1 && std::strcmp(s.handler.last_target, "/after") == 0,
+          "a request over the header limit reached the handler, or the next one did not");
+
+    const Seen seven = s.seen();
+    const Lines trailed = lines_of(seven, 7);
+    check(trailed.ok && trailed.of(":status") != nullptr && std::strcmp(trailed.of(":status"), "431") == 0,
+          "trailers over the header limit were not answered 431 (RFC 9113, 10.5.1)");
+    check(seven.ended_on[7] && seven.resets_on[7] == 0, "the 431 to finished trailers did not end the stream cleanly");
+
+    const Seen got = s.seen();
+    const Lines one = lines_of(got, 1);
+    check(one.ok && one.of(":status") != nullptr && std::strcmp(one.of(":status"), "431") == 0,
+          "a GET over the header limit was not answered 431 (RFC 9113, 10.5.1)");
+    check(got.ended_on[1] && got.resets_on[1] == 0, "the 431 to a finished request did not end it cleanly");
+
+    const Lines three = lines_of(got, 3);
+    check(three.ok && three.of(":status") != nullptr && std::strcmp(three.of(":status"), "431") == 0,
+          "a POST over the header limit was not answered 431 (RFC 9113, 10.5.1)");
+    check(got.ended_on[3] && got.resets_on[3] == 1 &&
+              got.reset_code_on[3] == static_cast<uint32_t>(ErrorCode::NoError),
+          "a client still sending was not asked to stop with NO_ERROR after the 431 (RFC 9113, 8.1)");
+
+    check(got.headers_on[5] == 1 && got.ended_on[5], "the request after them was not answered");
+    check(!got.goaway, "a header list over the limit ended the connection");
+    check(s.service.in_hand() == 0, "a refused request was never let go of");
+}
+
+/**
+ * @brief
+ * \~english An answer the handler gave is never reset as REFUSED_STREAM (RFC 9113, 8.7).
+ * \~spanish Una respuesta que dio el manejador no se reinicia nunca como REFUSED_STREAM (RFC 9113, 8.7).
+ * \~
+ *
+ * \~english
+ * REFUSED_STREAM tells a client that nothing was processed and the request
+ * may be sent again.  Once the handler has run that is false -- a POST sent
+ * twice is a POST done twice -- so an answer with nowhere to wait for a window
+ * is an INTERNAL_ERROR.  Four uploads hold the four pieces of work, and a
+ * GET whose answer is larger than the window arrives behind them.
+ * \~spanish
+ * REFUSED_STREAM le dice a un cliente que no se proceso nada y que puede volver
+ * a mandar la peticion.  Una vez que ha corrido el manejador eso es falso -- un
+ * POST mandado dos veces es un POST hecho dos veces --, asi que una respuesta
+ * sin donde esperar una ventana es un INTERNAL_ERROR.  Cuatro subidas tienen los
+ * cuatro trabajos, y detras llega un GET cuya respuesta es mayor que la ventana.
+ * \~
+ */
+void test_an_answer_with_nowhere_to_wait_is_not_refused() {
+    Server s;
+    check(s.start(), "the server would not start");
+    std::memset(s.handler.reply, 'x', 40);
+    s.handler.reply_size = 40;
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    w.text("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    const uint8_t small[6] = {0x00, 0x04, 0x00, 0x00, 0x00, 0x0A};
+    w.frame(FrameType::Settings, 0, 0, small, sizeof small);
+    uint8_t block[256];
+    for (uint32_t id = 1; id <= 7; id += 2) {
+        const size_t n = request_block(block, "POST", "/upload");
+        w.frame(FrameType::Headers, kEndHeaders, id, block, n);
+    }
+    const size_t n = request_block(block, "GET", "/big");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 9, block, n);
+    s.send(w);
+    s.run();
+
+    // \~english Stream 9 is counted in slot 0 by @c Seen.  \~spanish @c Seen cuenta el flujo 9 en la ranura 0.  \~
+    const Seen got = s.seen();
+    check(s.handler.calls == 1, "the GET was not answered by the handler");
+    check(got.resets_on[0] == 1, "an answer with nowhere to wait was not reset");
+    check(got.reset_code_on[0] == static_cast<uint32_t>(ErrorCode::InternalError),
+          "an answer the handler gave was reset as if it had never been processed (RFC 9113, 8.7)");
+    check(!got.goaway, "one answer with nowhere to wait ended the connection");
+}
+
+/**
+ * @brief
+ * \~english A request that needs a body and finds no work left is REFUSED_STREAM, before any processing (RFC 9113, 8.7).
+ * \~spanish Una peticion que necesita cuerpo y no encuentra trabajo libre es REFUSED_STREAM, antes de procesar nada (RFC 9113, 8.7).
+ * \~
+ */
+void test_a_request_with_no_work_left_is_refused() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+    uint8_t block[256];
+    for (uint32_t id = 1; id <= 9; id += 2) {
+        const size_t n = request_block(block, "POST", "/upload");
+        w.frame(FrameType::Headers, kEndHeaders, id, block, n);
+    }
+    s.send(w);
+    s.run();
+
+    // \~english Stream 9 is counted in slot 0 by @c Seen.  \~spanish @c Seen cuenta el flujo 9 en la ranura 0.  \~
+    const Seen got = s.seen();
+    check(s.handler.calls == 0, "a request with no work left reached the handler");
+    check(got.resets_on[0] == 1 && got.reset_code_on[0] == static_cast<uint32_t>(ErrorCode::RefusedStream),
+          "a request with no work left was not refused as one that may be sent again");
+    check(got.resets_on[1] == 0 && got.resets_on[7] == 0, "a request that found work was refused");
+    check(!got.goaway, "running out of work ended the connection");
+    check(s.service.in_hand() == 4, "the four requests that found work were not kept");
+}
+
 } // namespace
 
 int main() {
@@ -868,6 +1429,13 @@ int main() {
     test_padding_gives_its_window_back();
     test_trailers_reach_the_handler();
     test_a_content_length_that_lies_is_refused();
+    test_field_names_go_out_in_lower_case();
+    test_an_answer_that_cannot_travel_is_a_500();
+    test_a_failed_handler_is_a_500_without_a_reset();
+    test_head_sends_no_content();
+    test_a_header_list_too_large_is_431();
+    test_an_answer_with_nowhere_to_wait_is_not_refused();
+    test_a_request_with_no_work_left_is_refused();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

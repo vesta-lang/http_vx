@@ -279,4 +279,39 @@ FieldId field_id_of(const char *name, size_t len) noexcept {
     return FieldId::Unknown;
 }
 
+bool field_is_connection_specific(FieldId id) noexcept {
+    return id == FieldId::Connection || id == FieldId::KeepAlive || id == FieldId::TransferEncoding ||
+           id == FieldId::Upgrade || id == FieldId::ProxyConnection;
+}
+
+bool field_is_secret(FieldId id) noexcept {
+    /* \~english
+     * Four, and each is a thing somebody IS rather than a thing somebody asked
+     * for.  Remembering one puts it in a table whose size somebody else can
+     * measure by watching how long the messages come out -- which is CRIME, and
+     * which is why the protocol has a representation that asks the whole path
+     * not to keep it.
+     *
+     * A set rather than a rule, because there is no property of the bytes that
+     * tells a secret from anything else.  Which also means the set is a
+     * FLOOR: a caller with a header of its own that carries a credential has to
+     * say so, and the way to say so is the compressor's never-indexed form.
+     *
+     * \~spanish
+     * Cuatro, y cada una es algo que alguien ES en vez de algo que alguien ha
+     * pedido.  Recordar una la mete en una tabla cuyo tamano puede medir otro
+     * mirando cuanto salen midiendo los mensajes -- que es CRIME, y que es la
+     * razon de que el protocolo tenga una representacion que le pide a todo el
+     * camino que no la guarde.
+     *
+     * Un conjunto y no una regla, porque no hay ninguna propiedad de los bytes
+     * que distinga un secreto de lo demas.  Lo que quiere decir ademas que el
+     * conjunto es un SUELO: quien tenga una cabecera propia que lleve una
+     * credencial tiene que decirlo, y la forma de decirlo es la forma no
+     * indexable nunca del compresor.
+     * \~ */
+    return id == FieldId::Authorization || id == FieldId::ProxyAuthorization || id == FieldId::Cookie ||
+           id == FieldId::SetCookie;
+}
+
 } // namespace http_vx

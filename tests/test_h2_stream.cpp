@@ -52,6 +52,7 @@
 #include "http_vx/h2_stream.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace {
 
@@ -189,9 +190,11 @@ void test_one_too_many_is_refused_and_retryable() {
     check(accepted(set.open(1, false)), "the first request was refused");
     check(accepted(set.open(3, false)), "the second request was refused");
 
-    check(is(set.open(5, false), Verdict::StreamError,
-             ErrorCode::RefusedStream),
+    const Outcome refused = set.open(5, false);
+    check(is(refused, Verdict::StreamError, ErrorCode::RefusedStream),
           "one stream too many was not refused as retryable");
+    check(refused.why != nullptr && std::strstr(refused.why, "SETTINGS_MAX_CONCURRENT_STREAMS") != nullptr,
+          "one stream too many does not say which rule");
     check(set.count() == 2, "a refused stream was remembered anyway");
     check(set.highest_seen() == 5,
           "a refused identifier may be used again");
@@ -241,24 +244,123 @@ void test_a_late_frame_is_discarded_not_refused() {
     check(accepted(set.open(1, false)), "the request was refused");
     check(accepted(set.on_data(1, 100, 100, false)), "data on an open stream was refused");
 
-    check(accepted(set.on_reset(1)), "resetting the stream was refused");
-    check(set.count() == 0, "the reset stream was not forgotten");
+    set.on_reset_sent(1);
+    check(set.count() == 0, "the stream this end reset was not forgotten");
 
     /* \~english
      * Now the data the peer had already sent arrives.  It must be discarded
      * and it must NOT be an error, because the peer sent it before it could
-     * have known.
+     * have known -- this end is the one that reset the stream.
      * \~spanish
      * Ahora llegan los datos que el otro extremo ya habia mandado.  Hay que
      * descartarlos y NO puede ser un error, porque el otro los mando antes de
-     * poder saberlo.
+     * poder saberlo -- el que reinicio el flujo es este extremo.
      * \~ */
     check(is(set.on_data(1, 4096, 4096, false), Verdict::Discard, ErrorCode::NoError),
-          "data for a finished stream was treated as an error");
+          "data for a stream this end reset was treated as an error");
     check(is(set.on_data(1, 4096, 4096, true), Verdict::Discard, ErrorCode::NoError),
-          "the last data for a finished stream was treated as an error");
+          "the last data for a stream this end reset was treated as an error");
+    check(is(set.open(1, true), Verdict::Discard, ErrorCode::NoError),
+          "a HEADERS for a stream this end reset was treated as an error");
     check(is(set.on_reset(1), Verdict::Discard, ErrorCode::NoError),
           "a reset crossing this end's reset was treated as an error");
+
+    /* \~english
+     * A stream refused at the door never had an entry, and it is remembered
+     * all the same: its body is the one most surely on its way.
+     * \~spanish
+     * Un flujo rechazado en la puerta no tuvo nunca entrada, y se recuerda
+     * igual: su cuerpo es el que con mas seguridad viene de camino.
+     * \~ */
+    http_vx::h2::Limits one;
+    one.max_concurrent_streams = 1;
+    StreamSet door;
+    door.reset(one);
+    check(accepted(door.open(1, false)), "the first request was refused");
+    check(is(door.open(3, false), Verdict::StreamError, ErrorCode::RefusedStream),
+          "one stream too many was not refused");
+    door.on_reset_sent(3);
+    check(door.count() == 1, "resetting a stream that had no entry touched the table");
+    check(is(door.on_data(3, 1, 1, false), Verdict::Discard, ErrorCode::NoError),
+          "data for a stream refused at the door was treated as an error");
+    check(is(door.open(3, true), Verdict::Discard, ErrorCode::NoError),
+          "trailers for a stream refused at the door were treated as an error");
+
+    // \~english A reset of one never opened is not remembered.  \~spanish Un reinicio de uno que no se abrio no se recuerda.  \~
+    door.on_reset_sent(5);
+    check(is(door.on_data(5, 1, 1, false), Verdict::ConnectionError, ErrorCode::ProtocolError),
+          "a reset of a stream not yet opened made it exist");
+
+    check(accepted(set.open(3, false)), "the second request was refused");
+
+    /* \~english
+     * But when the PEER reset the stream it knew it was over, and so it was
+     * when both ends had finished: a frame after that is the peer's mistake,
+     * a connection error STREAM_CLOSED (RFC 9113, 5.1).
+     * \~spanish
+     * Pero cuando el flujo lo reinicio el OTRO, el otro sabia que se habia
+     * acabado, y lo mismo cuando habian acabado los dos: una trama despues es
+     * un error del otro, error de conexion STREAM_CLOSED (RFC 9113, 5.1).
+     * \~ */
+    check(accepted(set.on_reset(3)), "the peer's reset was refused");
+    const Outcome after_reset = set.on_data(3, 10, 10, false);
+    check(is(after_reset, Verdict::ConnectionError, ErrorCode::StreamClosed) && after_reset.why != nullptr,
+          "data after the peer's own reset was not STREAM_CLOSED");
+    check(is(set.on_reset(3), Verdict::Discard, ErrorCode::NoError),
+          "a second reset from the peer was treated as an error");
+
+    StreamSet ended;
+    ended.reset(limits);
+    check(accepted(ended.open(1, true)), "the request was refused");
+    ended.finish(1);
+    check(ended.count() == 0, "a stream both ends finished was kept");
+    check(is(ended.on_data(1, 1, 1, false), Verdict::ConnectionError, ErrorCode::StreamClosed),
+          "data on a stream both ends finished was not STREAM_CLOSED");
+    const Outcome again = ended.open(1, true);
+    check(is(again, Verdict::ConnectionError, ErrorCode::StreamClosed) && again.why != nullptr,
+          "a HEADERS on a stream both ends finished was not STREAM_CLOSED");
+
+    /* \~english
+     * And an identifier skipped over is not a closed stream to reuse: a
+     * HEADERS for it is out of order (5.1.1), a DATA a frame on a closed
+     * stream (5.1).  An even one was never opened by anybody (idle).
+     * \~spanish
+     * Y un identificador saltado no es un flujo cerrado que reutilizar: un
+     * HEADERS suyo va fuera de orden (5.1.1), un DATA es una trama de un flujo
+     * cerrado (5.1).  Uno par no lo abrio nunca nadie (inactivo).
+     * \~ */
+    check(accepted(ended.open(7, true)), "the request was refused");
+    check(is(ended.open(5, true), Verdict::ConnectionError, ErrorCode::ProtocolError),
+          "a HEADERS on a skipped identifier was not PROTOCOL_ERROR");
+    check(is(ended.on_data(3, 1, 1, false), Verdict::ConnectionError, ErrorCode::StreamClosed),
+          "data on a skipped identifier was not STREAM_CLOSED");
+    check(is(ended.on_data(4, 1, 1, false), Verdict::ConnectionError, ErrorCode::ProtocolError),
+          "data on an even identifier was not PROTOCOL_ERROR");
+    const Outcome idle_reset = ended.on_reset(4);
+    check(is(idle_reset, Verdict::ConnectionError, ErrorCode::ProtocolError) && idle_reset.why != nullptr,
+          "a reset on an even identifier was not PROTOCOL_ERROR, or not said why");
+    check(ended.on_reset(0).why != nullptr && ended.on_data(0, 1, 1, false).why != nullptr,
+          "a frame on stream 0 does not say why");
+
+    /* \~english
+     * A table reset for a new connection forgets how the old one's streams
+     * ended: a stream 3 reset there is not one reset here.
+     * \~spanish
+     * Una tabla reiniciada para una conexion nueva olvida como acabaron los
+     * flujos de la vieja: un flujo 3 reiniciado alli no lo es aqui.
+     * \~ */
+    StreamSet reused;
+    reused.reset(limits);
+    for (uint32_t id = 1; id <= 21; id += 2) check(accepted(reused.open(id, true)), "a request was refused");
+    reused.on_reset_sent(3);
+    reused.reset(limits);
+    check(accepted(reused.open(5, true)), "a request on the new connection was refused");
+    check(is(reused.on_data(3, 1, 1, false), Verdict::ConnectionError, ErrorCode::StreamClosed),
+          "the new connection remembered a reset of the old one");
+    check(is(ended.on_reset(3), Verdict::Discard, ErrorCode::NoError),
+          "a reset on a closed stream was treated as an error");
+    check(ended.never_opened(4) && ended.never_opened(9) && !ended.never_opened(7) && !ended.never_opened(3),
+          "never_opened does not tell idle from closed");
 
     /* \~english
      * But data for a stream ABOVE the highest seen is a different thing
@@ -304,9 +406,9 @@ void test_data_after_the_end_ends_the_stream() {
     check(s != nullptr && s->state == StreamState::HalfClosedRemote,
           "a request that said it was done is not half closed");
 
-    check(is(set.on_data(1, 1, 1, false), Verdict::StreamError,
-             ErrorCode::StreamClosed),
-          "data after the end of the request was accepted");
+    const Outcome o = set.on_data(1, 1, 1, false);
+    check(is(o, Verdict::StreamError, ErrorCode::StreamClosed) && o.why != nullptr,
+          "data after the end of the request was accepted, or not said why");
 }
 
 /**
@@ -341,9 +443,10 @@ void test_more_than_the_window_is_refused() {
     check(accepted(set.on_data(1, 400, 400, false)),
           "data filling the window exactly was refused");
 
-    check(is(set.on_data(1, 1, 1, false), Verdict::StreamError,
-             ErrorCode::FlowControlError),
-          "one byte past the announced window was accepted");
+    const Outcome o = set.on_data(1, 1, 1, false);
+    check(is(o, Verdict::StreamError, ErrorCode::FlowControlError) && o.why != nullptr &&
+              std::strstr(o.why, "flow-control") != nullptr,
+          "one byte past the announced window was accepted, or not said why");
 }
 
 /**
@@ -532,6 +635,129 @@ void test_trailers_end_the_stream() {
           "trailers for a stream that is not there were acted on");
 }
 
+/**
+ * @brief
+ * \~english The ring that remembers how recent streams ended, and what falls off it.
+ * \~spanish El anillo que recuerda como acabaron los flujos recientes, y lo que se cae de el.
+ * \~
+ *
+ * \~english
+ * Bounded is the point: a peer that opens a million streams leaves the same
+ * sixteen words behind as one that opens two.  What is checked is that the
+ * slots a jump skips over are cleared -- across the word boundary and all
+ * the way round -- so no stale bit from a stream a ring older ever answers
+ * for a new one, and that what falls off answers @c Forgotten.
+ * \~spanish
+ * Acotado es la cuestion: un extremo que abre un millon de flujos deja atras
+ * las mismas dieciseis palabras que uno que abre dos.  Lo que se comprueba es
+ * que las plazas que salta un salto se limpian -- cruzando el borde de palabra
+ * y dando la vuelta entera -- para que ningun bit rancio de un flujo un anillo
+ * mas viejo conteste nunca por uno nuevo, y que lo que se cae contesta
+ * @c Forgotten.
+ * \~
+ */
+void test_the_recent_streams_ring() {
+    using http_vx::h2::Past;
+    using http_vx::h2::RecentStreams;
+    const uint32_t ring = http_vx::h2::kRecentStreams;
+
+    RecentStreams r;
+    r.reset();
+    check(r.past(1) == Past::Skipped, "a ring that saw nothing remembered something");
+
+    r.opened(1);
+    check(r.past(1) == Past::Closed, "an opened stream was not remembered as opened");
+    r.reset_here(1);
+    check(r.past(1) == Past::ResetHere, "a stream this end reset was not remembered as such");
+
+    r.opened(5);
+    check(r.past(3) == Past::Skipped, "a skipped identifier was remembered as opened");
+    check(r.past(1) == Past::ResetHere, "opening a higher stream forgot a lower one");
+    r.opened(3);
+    check(r.past(3) == Past::Skipped, "an opening below the highest was taken");
+
+    // \~english Exactly one ring later, the first falls off.  \~spanish Justo un anillo despues, el primero se cae.  \~
+    for (uint32_t id = 7; id <= 2 * ring + 1; id += 2) r.opened(id);
+    check(r.past(1) == Past::Forgotten, "a stream a whole ring old was still answered for");
+    check(r.past(3) == Past::Skipped, "the oldest slot still in the ring was lost");
+    check(r.past(5) == Past::Closed, "a slot the ring did not pass over was cleared");
+    const uint32_t top = 2 * ring + 1;
+    r.reset_here(1);
+    check(r.past(1) == Past::Forgotten, "a forgotten stream was marked");
+    check(r.past(top) == Past::Closed, "marking a forgotten stream marked the one in its slot now");
+
+    // \~english A jump past the whole ring clears it all.  \~spanish Un salto de mas de un anillo lo limpia entero.  \~
+    r.reset_here(top);
+    check(r.past(top) == Past::ResetHere, "the highest stream could not be marked");
+    r.opened(top + 2 * (ring + 88));
+    check(r.past(top) == Past::Forgotten, "a jump past the ring kept the old top");
+    check(r.past(top + 2 * 300) == Past::Skipped, "a jump past the ring left a stale bit");
+    check(r.past(4 * ring + 1) == Past::Skipped, "a jump past the ring left a stale reset in the top's old slot");
+
+    /* \~english
+     * A jump of part of a ring, across a word boundary: every slot is opened
+     * and reset, then a hundred new slots are opened over the first hundred
+     * positions -- and none of them may answer with what the old ones said.
+     * \~spanish
+     * Un salto de parte de un anillo, cruzando un borde de palabra: se abren y
+     * se reinician todas las plazas, y luego se abren cien plazas nuevas sobre
+     * las cien primeras posiciones -- y ninguna puede contestar lo que decian
+     * las viejas.
+     * \~ */
+    RecentStreams q;
+    q.reset();
+    for (uint32_t slot = 0; slot < ring; ++slot) {
+        q.opened(2 * slot + 1);
+        q.reset_here(2 * slot + 1);
+    }
+    q.opened(2 * (ring + 99) + 1);
+    bool clean = true;
+    for (uint32_t slot = ring; slot < ring + 99; ++slot)
+        clean = clean && q.past(2 * slot + 1) == Past::Skipped;
+    check(clean, "a partial jump left stale bits in the slots it passed over");
+    check(q.past(2 * (ring + 99) + 1) == Past::Closed, "the stream that jumped was not opened");
+    check(q.past(2 * (ring - 1) + 1) == Past::ResetHere, "a partial jump cleared past where it went");
+    check(q.past(2 * 100 + 1) == Past::ResetHere, "the oldest slot of the ring was cleared");
+    check(q.past(2 * 99 + 1) == Past::Forgotten, "a slot the jump pushed out was still answered for");
+
+    // \~english A partial jump that wraps round the end of the ring.  \~spanish Un salto parcial que da la vuelta al final del anillo.  \~
+    RecentStreams w;
+    w.reset();
+    for (uint32_t slot = 0; slot < ring + 450; ++slot) {
+        w.opened(2 * slot + 1);
+        w.reset_here(2 * slot + 1);
+    }
+    w.opened(2 * (ring + 549) + 1);
+    bool wrapped = true;
+    for (uint32_t slot = ring + 450; slot < ring + 549; ++slot)
+        wrapped = wrapped && w.past(2 * slot + 1) == Past::Skipped;
+    check(wrapped, "a jump round the end of the ring left stale bits");
+    check(w.past(2 * (ring + 449) + 1) == Past::ResetHere, "a wrapping jump cleared behind where it started");
+
+    q.reset();
+    check(q.past(1) == Past::Skipped && q.past(2 * (ring - 1) + 1) == Past::Skipped,
+          "a reset ring still remembered");
+
+    /* \~english
+     * And in the table: a stream that closed normally, once forgotten, gets
+     * the lenient answer -- which is safe whatever it really was.
+     * \~spanish
+     * Y en la tabla: un flujo que se cerro normalmente, una vez olvidado,
+     * recibe la respuesta indulgente -- que es segura sea lo que fuera.
+     * \~ */
+    http_vx::h2::Limits limits;
+    StreamSet set;
+    set.reset(limits);
+    for (uint32_t id = 1; id <= 2 * ring + 1; id += 2) {
+        check(accepted(set.open(id, true)), "a request was refused");
+        set.finish(id);
+    }
+    check(is(set.on_data(1, 1, 1, false), Verdict::Discard, ErrorCode::NoError),
+          "a forgotten stream was not treated as possibly reset here");
+    check(is(set.on_data(3, 1, 1, false), Verdict::ConnectionError, ErrorCode::StreamClosed),
+          "a remembered closed stream was treated as forgotten");
+}
+
 } // namespace
 
 int main() {
@@ -543,6 +769,7 @@ int main() {
     test_a_new_initial_window_moves_both_ways();
     test_the_content_is_counted();
     test_trailers_end_the_stream();
+    test_the_recent_streams_ring();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

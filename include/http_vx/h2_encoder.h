@@ -28,7 +28,9 @@
  * sensitive ones are written in the form that exists for exactly this: LITERAL
  * NEVER INDEXED, which asks not only this end but every intermediary along the
  * way not to remember it.  There is no other reason for that representation to
- * exist.
+ * exist.  Which fields are sensitive is not this file's to say: it is a fact
+ * about HTTP fields that QPACK needs as well, so it lives beside them, in
+ * @c field_is_secret.
  *
  * **And this table is not the other one.**  A connection has two, one per
  * direction: what the peer told this end to remember, and what this end told
@@ -52,7 +54,9 @@
  * sensibles se escriben en la forma que existe justo para esto: LITERAL QUE NO
  * SE INDEXA NUNCA, que le pide no solo a este extremo sino a todos los
  * intermediarios del camino que no la recuerden.  No hay otra razon para que
- * esa representacion exista.
+ * esa representacion exista.  Cuales son sensibles no lo dice este fichero: es
+ * un hecho de las cabeceras HTTP que necesita tambien QPACK, asi que vive a su
+ * lado, en @c field_is_secret.
  *
  * **Y esta tabla no es la otra.**  Una conexion tiene dos, una por sentido: lo
  * que el otro extremo le dijo a este que recordara, y lo que este le dijo al
@@ -66,6 +70,7 @@
 #define HTTP_VX_H2_ENCODER_H
 
 #include "http_vx/buffer.h"
+#include "http_vx/field.h"
 #include "http_vx/h2_table.h"
 #include "http_vx/status.h"
 
@@ -206,36 +211,6 @@ enum class WriteStatus : uint8_t {
     /// \~spanish No se pudo conseguir la memoria.  \~
     OutOfMemory,
 };
-
-/**
- * @brief
- * \~english Whether @p id is one that must never be remembered.
- * \~spanish Si @p id es una de las que no se pueden recordar nunca.
- * \~
- *
- * \~english
- * The fields that carry what somebody is, rather than what they asked for.  A
- * remembered credential is a credential whose length can be measured by
- * somebody who can make the server send it again -- which is the whole of
- * CRIME in one sentence.
- *
- * Exposed because it is a question with one answer, and a caller that worked
- * it out for itself would be a second list of what is a secret.
- *
- * \~spanish
- * Las cabeceras que llevan quien es alguien, en vez de que ha pedido.  Una
- * credencial recordada es una credencial cuya longitud puede medir alguien que
- * consiga que el servidor la mande otra vez -- que es todo CRIME en una frase.
- *
- * Expuesto porque es una pregunta con una sola respuesta, y quien la resolviera
- * por su cuenta seria una segunda lista de lo que es un secreto.
- *
- * \~
- * @param id \~english the identifier  \~spanish el identificador  \~
- * @return   \~english true if it must never be remembered
- *           \~spanish true si no se puede recordar nunca  \~
- */
-bool must_never_be_indexed(FieldId id) noexcept;
 
 /**
  * @brief

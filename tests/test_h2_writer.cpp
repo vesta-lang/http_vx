@@ -249,7 +249,7 @@ void test_a_long_block_is_cut_at_the_frame_size() {
  * \~
  */
 void test_a_refusal_writes_nothing() {
-    uint8_t block[1000];
+    uint8_t block[1000] = {};
 
     HeaderFramer f;
     IoList list;
@@ -326,7 +326,7 @@ void test_an_empty_block_is_still_sent() {
  * \~
  */
 void test_the_body_spends_both_windows() {
-    uint8_t body[1000];
+    uint8_t body[1000] = {};
     uint8_t head[9];
 
     Window stream(600);
@@ -388,7 +388,7 @@ void test_the_body_spends_both_windows() {
  * \~
  */
 void test_a_stream_in_debt_sends_nothing() {
-    uint8_t body[1000];
+    uint8_t body[1000] = {};
     uint8_t head[9];
 
     Window stream(65535);

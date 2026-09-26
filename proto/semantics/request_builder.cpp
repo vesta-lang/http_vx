@@ -21,21 +21,6 @@ namespace http_vx {
 
 namespace {
 
-constexpr uint64_t bit(FieldId id) noexcept { return uint64_t{1} << static_cast<unsigned>(id); }
-
-/* \~english
- * Connection-specific fields: Connection and those with connection-specific
- * semantics -- Proxy-Connection, Keep-Alive, Transfer-Encoding, Upgrade (RFC
- * 9113, 8.2.2; RFC 9114, 4.2).
- * \~spanish
- * Campos propios de la conexion: Connection y los que tienen semantica de
- * conexion -- Proxy-Connection, Keep-Alive, Transfer-Encoding, Upgrade (RFC
- * 9113, 8.2.2; RFC 9114, 4.2).
- * \~ */
-constexpr uint64_t kConnectionSpecific = bit(FieldId::Connection) | bit(FieldId::KeepAlive) |
-                                         bit(FieldId::TransferEncoding) | bit(FieldId::Upgrade) |
-                                         bit(FieldId::ProxyConnection);
-
 bool is(const uint8_t *p, size_t n, const char *s, size_t sn) noexcept {
     if (n != sn) return false;
     for (size_t i = 0; i < n; ++i)
@@ -116,7 +101,7 @@ const char *RequestBuilder::add(const uint8_t *base, Span name, Span value, Fiel
         if (!is_tchar(n[i])) return "a field name that is not a token (RFC 9113, 8.2.1; RFC 9114, 10.3)";
     }
     if (id == FieldId::Unknown) id = field_id_of(reinterpret_cast<const char *>(n), name.len);
-    if (id != FieldId::Unknown && (kConnectionSpecific & bit(id)) != 0)
+    if (field_is_connection_specific(id))
         return "a connection-specific field (RFC 9113, 8.2.2; RFC 9114, 4.2)";
     if (id == FieldId::TE && !is(v, value.len, "trailers", 8))
         return "TE other than \"trailers\" (RFC 9113, 8.2.2; RFC 9114, 4.2)";
