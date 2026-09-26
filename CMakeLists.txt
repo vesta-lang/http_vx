@@ -125,6 +125,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/content_length.cpp
         proto/semantics/field.cpp
         proto/semantics/fields.cpp
+        proto/semantics/host_entity.cpp
         proto/semantics/message.cpp
         proto/semantics/request_builder.cpp
         proto/semantics/method.cpp

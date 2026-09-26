@@ -167,6 +167,42 @@ class Decoder {
     ErrorCode decode(const uint8_t *block, size_t n, Buffer &out,
                      Request &req) noexcept;
 
+    /**
+     * @brief
+     * \~english Reads one whole trailer section, adding its fields to @p req.
+     * \~spanish Lee una seccion de remolques entera, anadiendo sus campos a @p req.
+     * \~
+     *
+     * \~english
+     * The same block and the same table as @c decode -- a trailer section is
+     * an HPACK block like any other, and skipping it would leave the table out
+     * of step with the peer's.  What differs is where it goes: @p req is NOT
+     * emptied, its fields gain the trailers, and a pseudo-header field makes
+     * the message malformed (RFC 9113, 8.1).  For the new spans and the old
+     * ones to share a base, @p out is the buffer the head was decoded into,
+     * and it is only appended to.
+     *
+     * \~spanish
+     * El mismo bloque y la misma tabla que @c decode -- una seccion de remolques
+     * es un bloque HPACK como cualquier otro, y saltarselo dejaria la tabla
+     * desacompasada de la del otro extremo.  Lo que cambia es adonde va: @p req
+     * NO se vacia, sus campos ganan los remolques, y una pseudo-cabecera deja el
+     * mensaje mal formado (RFC 9113, 8.1).  Para que los trozos nuevos y los
+     * viejos compartan base, @p out es el buffer en que se descodifico la
+     * cabecera, y solo se le anade.
+     *
+     * \~
+     * @param block \~english the whole block  \~spanish el bloque entero  \~
+     * @param n     \~english how many bytes  \~spanish cuantos bytes  \~
+     * @param out   \~english where the names and values go, after what it holds
+     *              \~spanish donde van los nombres y valores, detras de lo que tiene  \~
+     * @param req   \~english the request the trailers belong to
+     *              \~spanish la peticion de la que son los remolques  \~
+     * @return      \~english as @c decode  \~spanish como @c decode  \~
+     */
+    ErrorCode decode_trailers(const uint8_t *block, size_t n, Buffer &out,
+                              Request &req) noexcept;
+
     /// \~english What the connection remembers.  \~spanish Lo que recuerda la conexion.  \~
     DynamicTable &table() noexcept { return table_; }
 
@@ -201,6 +237,11 @@ class Decoder {
     ErrorCode take_indexed_name(uint64_t index, Buffer &out,
                                 Reading &f) noexcept;
     ErrorCode keep(const Buffer &out, const Reading &f, Request &req) noexcept;
+
+    /// \~english The block itself, once the builder knows whether it is a head or trailers.
+    /// \~spanish El bloque en si, una vez el constructor sabe si es cabecera o remolques.  \~
+    ErrorCode read_block(const uint8_t *block, size_t n, Buffer &out,
+                         Request &req) noexcept;
 
     DynamicTable table_;
     Limits limits_;

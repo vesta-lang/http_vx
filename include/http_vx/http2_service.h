@@ -283,6 +283,10 @@ class Http2Service final : public Service {
                 const uint8_t *head, const uint8_t *body, size_t n,
                 Work *w, Buffer &out) noexcept;
 
+    /// \~english Moves the trailer section just read into @p w: its bytes after the body, its fields into the request.
+    /// \~spanish Muda la seccion de remolques recien leida a @p w: sus bytes detras del cuerpo, sus campos a la peticion.  \~
+    bool add_trailers(State &s, Work &w, Buffer &keep) noexcept;
+
     /// \~english Writes @p res as HTTP/2, keeping what does not fit.
     /// \~spanish Escribe @p res como HTTP/2, guardando lo que no quepa.  \~
     bool deliver(State &s, uint32_t stream, const ResponseBuilder &res,

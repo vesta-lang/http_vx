@@ -602,6 +602,40 @@ bool Http2Service::refuse(State &s, uint32_t stream, StatusCode status, Work *w,
     return true;
 }
 
+bool Http2Service::add_trailers(State &s, Work &w, Buffer &keep) noexcept {
+    /* \~english
+     * The trailers were read into the connection's decoding slot, emptied
+     * before the read, so everything in it is theirs.  The bytes go after the
+     * body, which is already whole -- the trailers ended the stream -- and the
+     * fields are moved over by the distance they travelled, so that one base
+     * serves the head, the body and the trailers alike.
+     * \~spanish
+     * Los remolques se leyeron en la ranura de descodificacion de la conexion,
+     * vaciada antes de la lectura, asi que todo lo que hay en ella es suyo.  Los
+     * bytes van detras del cuerpo, que ya esta entero -- los remolques acabaron
+     * el flujo --, y los campos se desplazan lo que se movieron, para que una
+     * base sirva igual a la cabecera, al cuerpo y a los remolques.
+     * \~ */
+    const size_t base = keep.size();
+    const size_t n = s.headers.size();
+
+    if (n != 0) {
+        uint8_t *room = keep.reserve(n);
+        if (room == nullptr) return false;
+        util::vesta_memcpy(room, s.headers.data(), n);
+        keep.commit(n);
+    }
+
+    for (const Field *f = s.req.fields.begin(); f != s.req.fields.end(); ++f) {
+        Field moved = *f;
+        moved.name_off += static_cast<uint32_t>(base);
+        moved.value_off += static_cast<uint32_t>(base);
+        w.req.fields.add(moved);
+    }
+
+    return true;
+}
+
 bool Http2Service::answer(State &s, uint32_t stream, const Request &req,
                           const uint8_t *head, const uint8_t *body, size_t n,
                           Work *w, Buffer &out) noexcept {
@@ -645,6 +679,20 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
         if (!flush_control(s, out)) return false;
 
         const uint64_t was = s.conn.consumed();
+
+        /* \~english
+         * The slot is emptied before every read, because a trailer section is
+         * ADDED to what it holds rather than replacing it.  A head empties it
+         * anyway; trailers must find nothing there but what they bring, or
+         * they would carry along the fields of whatever request was read last.
+         * \~spanish
+         * La ranura se vacia antes de cada lectura, porque una seccion de
+         * remolques se ANADE a lo que tenga en vez de sustituirlo.  Una cabecera
+         * la vacia igual; los remolques no pueden encontrar ahi mas que lo que
+         * traen, o arrastrarian los campos de la ultima peticion leida.
+         * \~ */
+        s.headers.clear();
+        s.req.clear();
         const h2::Event e = s.conn.read(in.view(), s.headers, s.req);
 
         /* \~english
@@ -734,6 +782,38 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
             std::swap(s.headers, *keep);
             w->req = s.req;
             w->head_size = keep->size();
+            continue;
+        }
+
+        if (e.kind == h2::EventKind::Trailers) {
+            /* \~english
+             * The trailer section ends the request (RFC 9113, 8.1), so this is
+             * where a body that was waiting for more is answered.  The same
+             * refusal as a body frame for a stream nothing is gathering for.
+             * \~spanish
+             * La seccion de remolques acaba la peticion (RFC 9113, 8.1), asi que
+             * aqui se contesta un cuerpo que estaba esperando mas.  El mismo
+             * rechazo que una trama de cuerpo de un flujo para el que no se
+             * junta nada.
+             * \~ */
+            Work *w = find_work(s, e.stream_id);
+            if (w == nullptr || w->answering) {
+                s.conn.reset_stream(e.stream_id, h2::ErrorCode::StreamClosed);
+                continue;
+            }
+
+            Buffer *keep = bodies_.at(w->buffer);
+            if (keep == nullptr) return false;
+
+            // \~english The body is measured BEFORE the trailers go after it.
+            // \~spanish El cuerpo se mide ANTES de que los remolques vayan detras.  \~
+            const size_t n = keep->size() - w->head_size;
+            if (!add_trailers(s, *w, *keep)) return false;
+
+            if (!answer(s, e.stream_id, w->req, keep->data(),
+                        n == 0 ? nullptr : keep->data() + w->head_size, n, w,
+                        out))
+                return false;
             continue;
         }
 

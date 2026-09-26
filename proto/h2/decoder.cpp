@@ -243,8 +243,31 @@ ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
 
 ErrorCode Decoder::decode(const uint8_t *block, size_t n, Buffer &out,
                           Request &req) noexcept {
+    builder_.start(req, RequestBuilder::Options::http2());
+    const ErrorCode e = read_block(block, n, out, req);
+    if (e == ErrorCode::NoError) req.version = Version::Http2;
+    return e;
+}
+
+ErrorCode Decoder::decode_trailers(const uint8_t *block, size_t n, Buffer &out,
+                                   Request &req) noexcept {
+    /* \~english
+     * The same reading and the same table, since a trailer section is a field
+     * block like any other (RFC 9113, 8.1) -- only the builder is told that
+     * what comes is added to @p req and may not name a pseudo-header field.
+     * \~spanish
+     * La misma lectura y la misma tabla, porque una seccion de remolques es un
+     * bloque de campos como cualquier otro (RFC 9113, 8.1) -- solo que al
+     * constructor se le dice que lo que venga se anade a @p req y no puede
+     * nombrar una pseudo-cabecera.
+     * \~ */
+    builder_.start_trailers(req);
+    return read_block(block, n, out, req);
+}
+
+ErrorCode Decoder::read_block(const uint8_t *block, size_t n, Buffer &out,
+                              Request &req) noexcept {
     why_ = nullptr;
-    builder_.start(req, RequestBuilder::Options{});
     list_size_ = 0;
 
     /* \~english
@@ -369,7 +392,6 @@ ErrorCode Decoder::decode(const uint8_t *block, size_t n, Buffer &out,
         why_ = bad;
         return ErrorCode::ProtocolError;
     }
-    req.version = Version::Http2;
     return ErrorCode::NoError;
 }
 

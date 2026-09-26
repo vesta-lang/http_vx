@@ -44,19 +44,25 @@ namespace {
  * \~
  */
 constexpr Outcome late() noexcept {
-    return Outcome{Verdict::Discard, ErrorCode::NoError};
+    return Outcome{Verdict::Discard, ErrorCode::NoError, nullptr};
 }
 
 constexpr Outcome ok() noexcept {
-    return Outcome{Verdict::Accept, ErrorCode::NoError};
+    return Outcome{Verdict::Accept, ErrorCode::NoError, nullptr};
 }
 
 constexpr Outcome stream_error(ErrorCode e) noexcept {
-    return Outcome{Verdict::StreamError, e};
+    return Outcome{Verdict::StreamError, e, nullptr};
+}
+
+/// \~english A malformed request: a stream error, PROTOCOL_ERROR, and why (RFC 9113, 8.1.1).
+/// \~spanish Una peticion mal formada: error de flujo, PROTOCOL_ERROR, y por que (RFC 9113, 8.1.1).  \~
+constexpr Outcome malformed(const char *why) noexcept {
+    return Outcome{Verdict::StreamError, ErrorCode::ProtocolError, why};
 }
 
 constexpr Outcome connection_error(ErrorCode e) noexcept {
-    return Outcome{Verdict::ConnectionError, e};
+    return Outcome{Verdict::ConnectionError, e, nullptr};
 }
 
 } // namespace
@@ -229,12 +235,22 @@ Outcome StreamSet::open(uint32_t id, bool end_stream) noexcept {
     s.send = Window(peer_initial_);
     s.recv = Window(own_initial_);
     s.state = end_stream ? StreamState::HalfClosedRemote : StreamState::Open;
+    s.counted = false;
+    s.content_left = 0;
     ++count_;
 
     return ok();
 }
 
-Outcome StreamSet::on_data(uint32_t id, uint32_t len,
+void StreamSet::end_remote(Stream *s) noexcept {
+    if (s->state == StreamState::HalfClosedLocal) {
+        drop(static_cast<size_t>(s - streams_));
+        return;
+    }
+    s->state = StreamState::HalfClosedRemote;
+}
+
+Outcome StreamSet::on_data(uint32_t id, uint32_t len, uint32_t content,
                            bool end_stream) noexcept {
     if (id == 0) return connection_error(ErrorCode::ProtocolError);
 
@@ -283,14 +299,109 @@ Outcome StreamSet::on_data(uint32_t id, uint32_t len,
      * \~ */
     if (!s->recv.take(len)) return stream_error(ErrorCode::FlowControlError);
 
-    if (end_stream) {
-        if (s->state == StreamState::HalfClosedLocal) {
-            drop(static_cast<size_t>(s - streams_));
-            return ok();
-        }
-        s->state = StreamState::HalfClosedRemote;
+    if (s->counted) {
+        /* \~english
+         * More content than the request declared, refused on the frame that
+         * crosses the line: waiting for the end would be reading bytes the
+         * request already said do not exist (RFC 9113, 8.1.1).
+         * \~spanish
+         * Mas contenido del que declaro la peticion, rechazado en la trama que
+         * pasa de la raya: esperar al final seria leer bytes que la propia
+         * peticion ya dijo que no existen (RFC 9113, 8.1.1).
+         * \~ */
+        if (content > s->content_left)
+            return malformed("more DATA than content-length (RFC 9113, 8.1.1)");
+        s->content_left -= content;
+
+        /* \~english
+         * And less, found out on the frame that ends the content.
+         * \~spanish
+         * Y menos, descubierto en la trama que acaba el contenido.
+         * \~ */
+        if (end_stream && s->content_left != 0)
+            return malformed("less DATA than content-length (RFC 9113, 8.1.1)");
     }
 
+    if (end_stream) end_remote(s);
+
+    return ok();
+}
+
+Outcome StreamSet::expect_content(uint32_t id, uint64_t n) noexcept {
+    Stream *s = find(id);
+
+    /* \~english
+     * Not in the table means the stream was refused or is over, and a length
+     * for it has nothing left to be compared with.
+     * \~spanish
+     * Si no esta en la tabla es que el flujo se rechazo o acabo, y una
+     * longitud suya ya no tiene con que compararse.
+     * \~ */
+    if (s == nullptr) return late();
+
+    /* \~english
+     * A HEADERS that already ended the stream: the content is empty, so the
+     * only length that equals it is zero (RFC 9113, 8.1.1).  A request is
+     * never one of the messages "defined as having no content" -- those are
+     * responses (RFC 9110, 6.4.1) -- so the exception does not apply here.
+     * \~spanish
+     * Un HEADERS que ya acabo el flujo: el contenido esta vacio, asi que la
+     * unica longitud que es igual a el es cero (RFC 9113, 8.1.1).  Una
+     * peticion no es nunca uno de los mensajes "definidos como sin contenido"
+     * -- esos son respuestas (RFC 9110, 6.4.1) --, asi que la excepcion no
+     * vale aqui.
+     * \~ */
+    if (s->state == StreamState::HalfClosedRemote) {
+        if (n != 0)
+            return malformed("a content-length other than 0 on a request "
+                             "with no DATA (RFC 9113, 8.1.1)");
+        return ok();
+    }
+
+    s->counted = true;
+    s->content_left = n;
+    return ok();
+}
+
+Outcome StreamSet::on_trailers(uint32_t id, bool end_stream) noexcept {
+    Stream *s = find(id);
+    if (s == nullptr) return late();
+
+    /* \~english
+     * The peer already said it had finished, and a HEADERS is not one of the
+     * frames still allowed after that (RFC 9113, 5.1, half-closed (remote)).
+     * This is also where a THIRD HEADERS lands: the trailers ended the stream.
+     * \~spanish
+     * El otro extremo ya dijo que habia acabado, y un HEADERS no es de las
+     * tramas que se permiten todavia despues (RFC 9113, 5.1, half-closed
+     * (remote)).  Aqui cae tambien un TERCER HEADERS: los remolques acabaron el
+     * flujo.
+     * \~ */
+    if (s->state == StreamState::HalfClosedRemote)
+        return Outcome{Verdict::StreamError, ErrorCode::StreamClosed,
+                       "a HEADERS after the stream had ended (RFC 9113, 5.1)"};
+
+    /* \~english
+     * A HEADERS after the one that opened the request, without END_STREAM:
+     * malformed (RFC 9113, 8.1).
+     * \~spanish
+     * Un HEADERS detras del que abrio la peticion, sin END_STREAM: mal formada
+     * (RFC 9113, 8.1).
+     * \~ */
+    if (!end_stream)
+        return malformed("a second HEADERS without END_STREAM (RFC 9113, 8.1)");
+
+    /* \~english
+     * The trailers end the content, so what was declared has to have arrived
+     * by now (RFC 9113, 8.1.1).
+     * \~spanish
+     * Los remolques acaban el contenido, asi que lo declarado tiene que haber
+     * llegado ya (RFC 9113, 8.1.1).
+     * \~ */
+    if (s->counted && s->content_left != 0)
+        return malformed("less DATA than content-length (RFC 9113, 8.1.1)");
+
+    end_remote(s);
     return ok();
 }
 

@@ -144,19 +144,32 @@ const char *RequestBuilder::finish(const uint8_t *base) noexcept {
         if ((seen_pseudo_ & (kScheme | kPath)) != 0) return "a CONNECT with :scheme or :path (RFC 9113, 8.5; RFC 9114, 4.4)";
         if ((seen_pseudo_ & kAuthority) == 0 || r.authority.len == 0)
             return "a CONNECT with no :authority (RFC 9113, 8.5; RFC 9114, 4.4)";
-        return nullptr;
+        // \~english No :scheme, so no default port: only the host and the port written count.
+        // \~spanish Sin :scheme, asi que sin puerto por defecto: solo cuentan el host y el puerto escritos.  \~
+        return check_host_entity(base, nullptr, 0);
     }
     if ((seen_pseudo_ & kScheme) == 0 || r.scheme.len == 0) return "no :scheme (RFC 9113, 8.3.1; RFC 9114, 4.3.1)";
     if ((seen_pseudo_ & kPath) == 0) return "no :path (RFC 9113, 8.3.1; RFC 9114, 4.3.1)";
     const uint8_t *scheme = base + r.scheme.off;
     const bool web = is(scheme, r.scheme.len, "http", 4) || is(scheme, r.scheme.len, "https", 5);
-    if (!web) return nullptr;
+    // \~english Host names the same entity as :authority, whatever the scheme (RFC 9113, 8.3.1).
+    // \~spanish Host nombra la misma entidad que :authority, sea cual sea el esquema (RFC 9113, 8.3.1).  \~
+    if (!web) return check_host_entity(base, scheme, r.scheme.len);
     if (r.target.len == 0) return "an empty :path for http or https (RFC 9113, 8.3.1; RFC 9114, 4.3.1)";
     const uint8_t *authority = base + r.authority.off;
     // \~english No userinfo for http or https: nothing before an '@' (RFC 9113, 8.3.1; RFC 9114, 4.3.1).
     // \~spanish Sin userinfo para http o https: nada antes de una '@' (RFC 9113, 8.3.1; RFC 9114, 4.3.1).  \~
     for (uint32_t i = 0; i < r.authority.len; ++i)
         if (authority[i] == '@') return "userinfo in :authority (RFC 9113, 8.3.1; RFC 9114, 4.3.1)";
+    // \~english :authority is the authority of the target URI (RFC 9113, 8.3.1), and an http or https URI with an empty
+    // host MUST be rejected (RFC 9110, 4.2.1-4.2.2).  The host is empty when nothing comes before the port's ':' -- an
+    // IP literal always starts with '[' (RFC 3986, 3.2.2).
+    // \~spanish :authority es la autoridad del URI objetivo (RFC 9113, 8.3.1), y un URI http o https con el host vacio
+    // DEBE rechazarse (RFC 9110, 4.2.1-4.2.2).  El host esta vacio cuando no hay nada antes de los ':' del puerto -- un
+    // literal IP siempre empieza por '[' (RFC 3986, 3.2.2).  \~
+    if (opt_.no_empty_host && (seen_pseudo_ & kAuthority) != 0 && (r.authority.len == 0 || authority[0] == ':'))
+        return "an empty host in :authority for http or https (RFC 9110, 4.2.1-4.2.2; RFC 9113, 8.3.1)";
+    if (const char *why = check_host_entity(base, scheme, r.scheme.len)) return why;
     if (!opt_.exact_host) return nullptr;
     // \~english HTTP/3: :authority or Host, never empty, and the same value if both (RFC 9114, 4.3.1).
     // \~spanish HTTP/3: :authority o Host, nunca vacios, y el mismo valor si estan los dos (RFC 9114, 4.3.1).  \~
@@ -168,6 +181,19 @@ const char *RequestBuilder::finish(const uint8_t *base) noexcept {
         if (host->value_len == 0) return "an empty Host (RFC 9114, 4.3.1)";
         if (has_authority && !same(base + host->value_off, host->value_len, authority, r.authority.len))
             return "Host and :authority that differ (RFC 9114, 4.3.1)";
+    }
+    return nullptr;
+}
+
+const char *RequestBuilder::check_host_entity(const uint8_t *base, const uint8_t *scheme, size_t scheme_len) const noexcept {
+    if (!opt_.same_host_entity || (seen_pseudo_ & kAuthority) == 0) return nullptr;
+    // \~english Every Host, not only the first: a second one naming another entity is as misleading (RFC 9113, 8.3.1).
+    // \~spanish Cada Host, no solo el primero: un segundo que nombre otra entidad engaña igual (RFC 9113, 8.3.1).  \~
+    const Request &r = *req_;
+    for (const Field *host = r.fields.find(FieldId::Host); host != nullptr; host = r.fields.find_next(host)) {
+        const char *why = host_entity_mismatch(base + r.authority.off, r.authority.len, base + host->value_off,
+                                               host->value_len, scheme, scheme_len);
+        if (why != nullptr) return why;
     }
     return nullptr;
 }

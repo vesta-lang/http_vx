@@ -280,6 +280,20 @@ class Echo final : public Handler {
             last_target[req.target.len] = '\0';
         }
 
+        // \~english The last field, spelled out, over the base the handler was given.
+        // \~spanish La ultima cabecera, escrita entera, sobre la base que se le dio al manejador.  \~
+        last_fields = req.fields.size();
+        last_field[0] = '\0';
+        if (!req.fields.empty()) {
+            const http_vx::Field &f = req.fields.end()[-1];
+            if (static_cast<size_t>(f.name_len) + f.value_len + 2 < sizeof last_field) {
+                std::memcpy(last_field, head + f.name_off, f.name_len);
+                last_field[f.name_len] = '=';
+                std::memcpy(last_field + f.name_len + 1, head + f.value_off, f.value_len);
+                last_field[f.name_len + 1 + f.value_len] = '\0';
+            }
+        }
+
         res.status(200);
         res.field(http_vx::FieldId::ContentType, "text/plain", 10);
         if (reply_size != 0) res.body(reply, reply_size);
@@ -289,6 +303,8 @@ class Echo final : public Handler {
     size_t last_body_size = 0;
     char last_body[4096] = {};
     char last_target[256] = {};
+    size_t last_fields = 0;
+    char last_field[256] = {};
 
     char reply[4096] = {};
     size_t reply_size = 0;
@@ -735,6 +751,111 @@ void test_padding_gives_its_window_back() {
     check(!got.goaway, "a padded frame ended the connection");
 }
 
+/**
+ * @brief
+ * \~english Trailers reach the handler with the head, and the body is still the body (RFC 9113, 8.1).
+ * \~spanish Los remolques llegan al manejador con la cabecera, y el cuerpo sigue siendo el cuerpo (RFC 9113, 8.1).
+ * \~
+ */
+void test_trailers_reach_the_handler() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+
+    uint8_t block[256];
+    size_t n = request_block(block, "POST", "/upload");
+    field(block, n, "content-length", "6");
+    w.frame(FrameType::Headers, kEndHeaders, 1, block, n);
+    w.frame(FrameType::Data, 0, 1, reinterpret_cast<const uint8_t *>("pie"), 3);
+
+    /* \~english
+     * A GET in between, answered where it stands: the trailers that follow
+     * must not pick up its fields from the decoding slot.
+     * \~spanish
+     * Un GET en medio, contestado donde esta: los remolques que siguen no
+     * pueden llevarse sus cabeceras de la ranura de descodificacion.
+     * \~ */
+    uint8_t get[256];
+    size_t g = request_block(get, "GET", "/other");
+    field(get, g, "x-other", "no");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 3, get, g);
+
+    w.frame(FrameType::Data, 0, 1, reinterpret_cast<const uint8_t *>("ces"), 3);
+
+    uint8_t tail[64];
+    size_t t = 0;
+    field(tail, t, "x-sum", "42");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, tail, t);
+
+    s.send(w);
+    s.run();
+
+    check(s.handler.calls == 2, "the request with trailers was not answered");
+    check(std::strcmp(s.handler.last_target, "/upload") == 0, "the trailers were given to the wrong request");
+    check(std::strcmp(s.handler.last_body, "pieces") == 0, "the trailers changed the body");
+    check(s.handler.last_body_size == 6, "the trailer bytes were counted as body");
+    check(s.handler.last_fields == 2, "the request did not carry its head and its trailers, and nothing else");
+    check(std::strcmp(s.handler.last_field, "x-sum=42") == 0, "the trailer did not reach the handler");
+
+    const Seen got = s.seen();
+    check(got.headers_on[1] == 1 && got.ended_on[1], "the request with trailers was not answered");
+    check(got.resets_on[1] == 0, "a request with trailers was reset");
+    check(!got.goaway, "trailers ended the connection");
+    check(s.service.in_hand() == 0, "the request with trailers was never let go of");
+}
+
+/**
+ * @brief
+ * \~english A body that does not match its content-length never reaches the handler (RFC 9113, 8.1.1).
+ * \~spanish Un cuerpo que no coincide con su content-length no llega nunca al manejador (RFC 9113, 8.1.1).
+ * \~
+ */
+void test_a_content_length_that_lies_is_refused() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+
+    uint8_t block[256];
+    size_t n = request_block(block, "POST", "/short");
+    field(block, n, "content-length", "10");
+    w.frame(FrameType::Headers, kEndHeaders, 1, block, n);
+    w.frame(FrameType::Data, kEndStream, 1, reinterpret_cast<const uint8_t *>("four"), 4);
+
+    n = request_block(block, "POST", "/long");
+    field(block, n, "content-length", "2");
+    w.frame(FrameType::Headers, kEndHeaders, 3, block, n);
+    w.frame(FrameType::Data, 0, 3, reinterpret_cast<const uint8_t *>("four"), 4);
+
+    n = request_block(block, "POST", "/exact");
+    field(block, n, "content-length", "4");
+    w.frame(FrameType::Headers, kEndHeaders, 5, block, n);
+    w.frame(FrameType::Data, kEndStream, 5, reinterpret_cast<const uint8_t *>("four"), 4);
+
+    s.send(w);
+    s.run();
+
+    check(s.handler.calls == 1, "a body that did not match its content-length reached the handler");
+    check(std::strcmp(s.handler.last_target, "/exact") == 0, "the exact body was not the one answered");
+
+    const Seen got = s.seen();
+    check(got.resets_on[1] == 1, "too little DATA was not reset");
+    check(got.resets_on[3] == 1, "too much DATA was not reset");
+    check(got.headers_on[1] == 0 && got.headers_on[3] == 0, "a malformed request was answered");
+    check(!got.goaway, "a malformed request ended the connection");
+    check(got.window_given >= 12, "the window of the refused bodies never went back");
+    check(s.service.in_hand() == 0, "a refused request was never let go of");
+}
+
 } // namespace
 
 int main() {
@@ -745,6 +866,8 @@ int main() {
     test_an_answer_waits_for_a_window();
     test_a_body_too_large_is_refused();
     test_padding_gives_its_window_back();
+    test_trailers_reach_the_handler();
+    test_a_content_length_that_lies_is_refused();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

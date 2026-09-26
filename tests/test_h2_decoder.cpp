@@ -673,8 +673,96 @@ void test_request_rules() {
     }
 }
 
+/**
+ * @brief
+ * \~english A trailer section is added to the request, goes through the table, and names no pseudo-header field (RFC 9113, 8.1).
+ * \~spanish Una seccion de remolques se anade a la peticion, pasa por la tabla, y no nombra ninguna pseudo-cabecera (RFC 9113, 8.1).
+ * \~
+ */
+void test_trailers() {
+    http_vx::h2::Limits limits;
+    Decoder d;
+    d.reset(limits);
+
+    http_vx::Buffer out;
+    http_vx::Request req;
+
+    // \~english :method GET, :scheme https, :path /, and x-a: 1.  \~spanish :method GET, :scheme https, :path /, y x-a: 1.  \~
+    const uint8_t head[] = {0x82, 0x87, 0x84, 0x00, 0x03, 'x', '-', 'a', 0x01, '1'};
+    check(d.decode(head, sizeof head, out, req) == ErrorCode::NoError, "the head was refused");
+
+    const size_t before = out.size();
+
+    // \~english x-sum: 42, remembered (literal with incremental indexing).
+    // \~spanish x-sum: 42, recordada (literal con indexado incremental).  \~
+    const uint8_t trailers[] = {0x40, 0x05, 'x', '-', 's', 'u', 'm', 0x02, '4', '2'};
+    check(d.decode_trailers(trailers, sizeof trailers, out, req) == ErrorCode::NoError,
+          "a trailer section was refused");
+    check(d.why() == nullptr, "an accepted trailer section gave a reason");
+
+    /* \~english
+     * Added, not replacing: the head is still there, over the same bytes,
+     * and the trailer follows it.
+     * \~spanish
+     * Anadidos, no sustituidos: la cabecera sigue ahi, sobre los mismos bytes,
+     * y el remolque va detras.
+     * \~ */
+    check(req.method == http_vx::MethodId::Get, "the trailers emptied the request");
+    check(span_is(req.target, out, "/"), "the target was lost to the trailers");
+    check(req.fields.size() == 2, "the trailers did not add exactly one field");
+    check(field_is(req, out, 0, "x-a", "1"), "the head's field was lost to the trailers");
+    check(field_is(req, out, 1, "x-sum", "42"), "the trailer field is not the one that was sent");
+    check(out.size() > before, "the trailer bytes were not appended");
+    check(req.fields.begin()[1].name_off >= before, "the trailer was written over the head");
+
+    /* \~english
+     * And the table heard about it: the next block names the trailer by index.
+     * \~spanish
+     * Y la tabla se entero: el bloque siguiente nombra el remolque por indice.
+     * \~ */
+    check(d.table().count() == 1, "the trailer section did not reach the table");
+    const uint8_t again[] = {0x82, 0x87, 0x84, 0xbe};
+    out.clear();
+    check(d.decode(again, sizeof again, out, req) == ErrorCode::NoError, "the next head was refused");
+    check(req.fields.size() == 1 && field_is(req, out, 0, "x-sum", "42"),
+          "the remembered trailer did not come back by index");
+
+    // \~english A pseudo-header field in trailers: malformed, and it says so.
+    // \~spanish Una pseudo-cabecera en los remolques: mal formada, y lo dice.  \~
+    const uint8_t pseudo[] = {0x82};
+    check(d.decode_trailers(pseudo, sizeof pseudo, out, req) == ErrorCode::ProtocolError,
+          "a pseudo-header field in trailers was accepted (8.1)");
+    check(d.why() != nullptr && std::strstr(d.why(), "trailers") != nullptr,
+          "the refused trailers do not say why");
+
+    // \~english An empty trailer section is fine and adds nothing.
+    // \~spanish Una seccion de remolques vacia vale y no anade nada.  \~
+    const size_t had = req.fields.size();
+    check(d.decode_trailers(nullptr, 0, out, req) == ErrorCode::NoError && req.fields.size() == had,
+          "an empty trailer section was refused or added something");
+
+    /* \~english
+     * The limit is per field SECTION (RFC 9113, 6.5.2): a head and its
+     * trailers are two, and each is measured on its own.
+     * \~spanish
+     * El limite es por SECCION de campos (RFC 9113, 6.5.2): una cabecera y sus
+     * remolques son dos, y cada una se mide por separado.
+     * \~ */
+    http_vx::h2::Limits small;
+    small.max_header_list_size = 200;
+    Decoder e;
+    e.reset(small);
+    out.clear();
+    check(e.decode(head, sizeof head, out, req) == ErrorCode::NoError, "a head under the limit was refused");
+    const uint8_t plain[] = {0x00, 0x05, 'x', '-', 's', 'u', 'm', 0x02, '4', '2'};
+    for (int i = 0; i < 4; ++i)
+        check(e.decode_trailers(plain, sizeof plain, out, req) == ErrorCode::NoError,
+              "a trailer section under the limit was measured with the ones before it");
+}
+
 int main() {
     test_request_rules();
+    test_trailers();
     test_the_specification_sequence();
     test_the_same_thing_in_huffman();
     test_the_bomb();

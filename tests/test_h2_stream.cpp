@@ -239,7 +239,7 @@ void test_a_late_frame_is_discarded_not_refused() {
     set.reset(limits);
 
     check(accepted(set.open(1, false)), "the request was refused");
-    check(accepted(set.on_data(1, 100, false)), "data on an open stream was refused");
+    check(accepted(set.on_data(1, 100, 100, false)), "data on an open stream was refused");
 
     check(accepted(set.on_reset(1)), "resetting the stream was refused");
     check(set.count() == 0, "the reset stream was not forgotten");
@@ -253,9 +253,9 @@ void test_a_late_frame_is_discarded_not_refused() {
      * descartarlos y NO puede ser un error, porque el otro los mando antes de
      * poder saberlo.
      * \~ */
-    check(is(set.on_data(1, 4096, false), Verdict::Discard, ErrorCode::NoError),
+    check(is(set.on_data(1, 4096, 4096, false), Verdict::Discard, ErrorCode::NoError),
           "data for a finished stream was treated as an error");
-    check(is(set.on_data(1, 4096, true), Verdict::Discard, ErrorCode::NoError),
+    check(is(set.on_data(1, 4096, 4096, true), Verdict::Discard, ErrorCode::NoError),
           "the last data for a finished stream was treated as an error");
     check(is(set.on_reset(1), Verdict::Discard, ErrorCode::NoError),
           "a reset crossing this end's reset was treated as an error");
@@ -269,7 +269,7 @@ void test_a_late_frame_is_discarded_not_refused() {
      * completamente: no llegan tarde, son de un flujo que el otro extremo no
      * abrio nunca, y no hay peticion a la que pegarlos.
      * \~ */
-    check(is(set.on_data(9, 10, false), Verdict::ConnectionError,
+    check(is(set.on_data(9, 10, 10, false), Verdict::ConnectionError,
              ErrorCode::ProtocolError),
           "data for a stream nobody opened was accepted as late");
 }
@@ -304,7 +304,7 @@ void test_data_after_the_end_ends_the_stream() {
     check(s != nullptr && s->state == StreamState::HalfClosedRemote,
           "a request that said it was done is not half closed");
 
-    check(is(set.on_data(1, 1, false), Verdict::StreamError,
+    check(is(set.on_data(1, 1, 1, false), Verdict::StreamError,
              ErrorCode::StreamClosed),
           "data after the end of the request was accepted");
 }
@@ -337,11 +337,11 @@ void test_more_than_the_window_is_refused() {
     set.reset(limits);
 
     check(accepted(set.open(1, false)), "the request was refused");
-    check(accepted(set.on_data(1, 600, false)), "data within the window was refused");
-    check(accepted(set.on_data(1, 400, false)),
+    check(accepted(set.on_data(1, 600, 600, false)), "data within the window was refused");
+    check(accepted(set.on_data(1, 400, 400, false)),
           "data filling the window exactly was refused");
 
-    check(is(set.on_data(1, 1, false), Verdict::StreamError,
+    check(is(set.on_data(1, 1, 1, false), Verdict::StreamError,
              ErrorCode::FlowControlError),
           "one byte past the announced window was accepted");
 }
@@ -415,6 +415,123 @@ void test_a_new_initial_window_moves_both_ways() {
           "a window pushed past the ceiling was accepted");
 }
 
+/**
+ * @brief
+ * \~english The content counted against a declared length, to the byte (RFC 9113, 8.1.1).
+ * \~spanish El contenido contado contra una longitud declarada, al byte (RFC 9113, 8.1.1).
+ * \~
+ */
+void test_the_content_is_counted() {
+    http_vx::h2::Limits limits;
+    StreamSet set;
+    set.reset(limits);
+
+    // \~english Exactly to the byte, padding not counted.  \~spanish Justo al byte, sin contar el relleno.  \~
+    check(accepted(set.open(1, false)), "the request was refused");
+    check(accepted(set.expect_content(1, 5)), "a content-length was refused");
+    check(accepted(set.on_data(1, 16, 3, false)), "content under the length was refused");
+    check(accepted(set.on_data(1, 2, 2, true)), "content reaching the length exactly was refused");
+    check(set.find(1) != nullptr && set.find(1)->state == StreamState::HalfClosedRemote,
+          "an exact body did not end the stream");
+
+    // \~english One byte over.  \~spanish Un byte de mas.  \~
+    check(accepted(set.open(3, false)), "the request was refused");
+    check(accepted(set.expect_content(3, 5)), "a content-length was refused");
+    const Outcome over = set.on_data(3, 6, 6, false);
+    check(is(over, Verdict::StreamError, ErrorCode::ProtocolError) && over.why != nullptr,
+          "one byte over the content-length was accepted");
+
+    // \~english One byte short, at the end.  \~spanish Un byte de menos, al final.  \~
+    check(accepted(set.open(5, false)), "the request was refused");
+    check(accepted(set.expect_content(5, 5)), "a content-length was refused");
+    const Outcome under = set.on_data(5, 4, 4, true);
+    check(is(under, Verdict::StreamError, ErrorCode::ProtocolError) && under.why != nullptr,
+          "one byte short of the content-length was accepted");
+
+    // \~english No length declared: nothing is counted.  \~spanish Sin longitud declarada: no se cuenta nada.  \~
+    check(accepted(set.open(7, false)), "the request was refused");
+    check(accepted(set.on_data(7, 100, 100, true)), "a body without a content-length was refused");
+
+    // \~english A HEADERS that ended the stream: only zero is the content.  \~spanish Un HEADERS que acabo el flujo: solo el cero es el contenido.  \~
+    check(accepted(set.open(9, true)), "the request was refused");
+    check(accepted(set.expect_content(9, 0)), "content-length: 0 without DATA was refused");
+    check(accepted(set.open(11, true)), "the request was refused");
+    check(is(set.expect_content(11, 1), Verdict::StreamError, ErrorCode::ProtocolError),
+          "a content-length without DATA was accepted");
+
+    // \~english A stream that is not there has nothing to count.  \~spanish Un flujo que no esta no tiene nada que contar.  \~
+    check(is(set.expect_content(99, 1), Verdict::Discard, ErrorCode::NoError),
+          "a length for a stream that is not there was acted on");
+
+    /* \~english
+     * A slot a counted stream left behind does not count for the next one:
+     * the length is the request's, not the entry's.
+     * \~spanish
+     * Una plaza que dejo un flujo contado no cuenta para el siguiente: la
+     * longitud es de la peticion, no de la entrada.
+     * \~ */
+    StreamSet again;
+    again.reset(limits);
+    check(accepted(again.open(1, false)), "the request was refused");
+    check(accepted(again.expect_content(1, 1)), "a content-length was refused");
+    check(accepted(again.on_data(1, 1, 1, true)), "an exact body was refused");
+    again.finish(1);
+    check(again.find(1) == nullptr && again.count() == 0, "a finished stream was kept");
+    check(accepted(again.open(3, false)), "the next request was refused");
+    check(accepted(again.on_data(3, 5, 5, true)), "the previous request's length was counted against the next");
+}
+
+/**
+ * @brief
+ * \~english What a second HEADERS means to the stream (RFC 9113, 5.1, 8.1, 8.1.1).
+ * \~spanish Que significa un segundo HEADERS para el flujo (RFC 9113, 5.1, 8.1, 8.1.1).
+ * \~
+ */
+void test_trailers_end_the_stream() {
+    http_vx::h2::Limits limits;
+    StreamSet set;
+    set.reset(limits);
+
+    check(accepted(set.open(1, false)), "the request was refused");
+    check(accepted(set.on_trailers(1, true)), "trailers were refused");
+    check(set.find(1) != nullptr && set.find(1)->state == StreamState::HalfClosedRemote,
+          "the trailers did not end the stream");
+    check(is(set.on_trailers(1, true), Verdict::StreamError, ErrorCode::StreamClosed),
+          "a third HEADERS was accepted");
+
+    check(accepted(set.open(3, false)), "the request was refused");
+    check(is(set.on_trailers(3, false), Verdict::StreamError, ErrorCode::ProtocolError),
+          "a second HEADERS without END_STREAM was accepted");
+
+    // \~english Too little content, ended by the trailers.  \~spanish Poco contenido, acabado por los remolques.  \~
+    check(accepted(set.open(5, false)), "the request was refused");
+    check(accepted(set.expect_content(5, 2)), "a content-length was refused");
+    check(accepted(set.on_data(5, 1, 1, false)), "content under the length was refused");
+    check(is(set.on_trailers(5, true), Verdict::StreamError, ErrorCode::ProtocolError),
+          "trailers ending the content short were accepted");
+    check(accepted(set.on_data(5, 1, 1, false)), "the last byte was refused");
+    check(accepted(set.on_trailers(5, true)), "trailers after the whole content were refused");
+
+    /* \~english
+     * This end had already answered: the trailers end the stream for good.
+     * \~spanish
+     * Este extremo ya habia contestado: los remolques acaban el flujo del todo.
+     * \~ */
+    check(accepted(set.open(7, false)), "the request was refused");
+    set.finish(7);
+    check(accepted(set.on_trailers(7, true)), "trailers after the answer were refused");
+    check(set.find(7) == nullptr, "a stream both ends finished was not forgotten");
+
+    // \~english Likewise a DATA that ends it.  \~spanish Igual un DATA que lo acaba.  \~
+    check(accepted(set.open(9, false)), "the request was refused");
+    set.finish(9);
+    check(accepted(set.on_data(9, 1, 1, true)), "the last DATA after the answer was refused");
+    check(set.find(9) == nullptr, "a stream both ends finished was not forgotten");
+
+    check(is(set.on_trailers(99, true), Verdict::Discard, ErrorCode::NoError),
+          "trailers for a stream that is not there were acted on");
+}
+
 } // namespace
 
 int main() {
@@ -424,6 +541,8 @@ int main() {
     test_data_after_the_end_ends_the_stream();
     test_more_than_the_window_is_refused();
     test_a_new_initial_window_moves_both_ways();
+    test_the_content_is_counted();
+    test_trailers_end_the_stream();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

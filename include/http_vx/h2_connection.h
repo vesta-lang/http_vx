@@ -148,6 +148,23 @@ enum class EventKind : uint8_t {
 
     /**
      * \~english
+     * The trailer section of a stream, which always ends it (RFC 9113, 8.1).
+     * Its fields have been ADDED to the @c Request that was passed in and its
+     * names and values to the end of the header buffer: a caller that passes
+     * the request and buffer of that stream's head gets one request with
+     * both, and one that passes empty ones gets the trailers alone.
+     * \~spanish
+     * La seccion de remolques de un flujo, que siempre lo acaba (RFC 9113,
+     * 8.1).  Sus campos se han ANADIDO al @c Request que se paso y sus nombres
+     * y valores al final del buffer de cabeceras: quien pase la peticion y el
+     * buffer de la cabecera de ese flujo recibe una peticion con las dos cosas,
+     * y quien los pase vacios recibe solo los remolques.
+     * \~
+     */
+    Trailers,
+
+    /**
+     * \~english
      * One stream is over and the connection carries on.  Whatever was being
      * done for it should stop.
      * \~spanish
@@ -397,6 +414,25 @@ class Connection {
      */
     bool reset_stream(uint32_t id, ErrorCode code) noexcept;
 
+    /**
+     * @brief
+     * \~english Why the event just returned refused its stream as malformed.
+     * \~spanish Por que el suceso recien devuelto rechazo su flujo por mal formado.
+     * \~
+     *
+     * \~english
+     * A @c StreamEnded carries the code the peer is sent, and PROTOCOL_ERROR
+     * alone says nothing about which rule was broken.  This is the rule, for
+     * logging; null when the last event was not such a refusal.
+     * \~spanish
+     * Un @c StreamEnded lleva el codigo que se le manda al otro extremo, y
+     * PROTOCOL_ERROR solo no dice que regla se rompio.  Esto es la regla, para
+     * anotarla; nulo cuando el ultimo suceso no fue un rechazo asi.
+     * \~
+     * @return \~english the reason, or null  \~spanish el motivo, o nulo  \~
+     */
+    const char *why() const noexcept { return why_; }
+
     /// \~english What the peer said it would accept.
     /// \~spanish Lo que dijo el otro extremo que aceptaria.  \~
     const Settings &peer() const noexcept { return peer_; }
@@ -482,6 +518,15 @@ class Connection {
     bool credit_connection(uint32_t n) noexcept;
 
     Event fail(ErrorCode code) noexcept;
+
+    /// \~english Ends stream @p id with @p code, keeps @p why for @c why, and says so.
+    /// \~spanish Acaba el flujo @p id con @p code, guarda @p why para @c why, y lo dice.  \~
+    Event refuse(uint32_t id, ErrorCode code, const char *why) noexcept;
+
+    /// \~english What the content-length of a request just read says about its stream; null if nothing is wrong.
+    /// \~spanish Lo que dice del flujo la content-length de una peticion recien leida; nulo si no hay nada mal.  \~
+    const char *expect_content(const Buffer &headers,
+                               const http_vx::Request &req) noexcept;
     Event on_settings(const View &v) noexcept;
     Event on_ping(const View &v) noexcept;
     Event on_window_update(const View &v) noexcept;
@@ -545,9 +590,29 @@ class Connection {
     uint32_t block_stream_ = 0;
     bool block_ends_ = false;
 
+    /**
+     * \~english
+     * Whether the open block is a trailer section: a HEADERS for a stream
+     * still in the table rather than one that opens a new stream (RFC 9113,
+     * 8.1).  Decided on the HEADERS, for the same reason as the two above.
+     * \~spanish
+     * Si el bloque abierto es una seccion de remolques: un HEADERS de un flujo
+     * que sigue en la tabla y no uno que abre un flujo nuevo (RFC 9113, 8.1).
+     * Se decide en el HEADERS, por lo mismo que los dos de arriba.
+     * \~
+     */
+    bool block_trailers_ = false;
+
     /// \~english Why the stream was refused, if it was.
     /// \~spanish Por que se rechazo el flujo, si se rechazo.  \~
     ErrorCode block_refused_ = ErrorCode::NoError;
+
+    /// \~english And the rule behind it, when there is one to name.
+    /// \~spanish Y la regla detras, cuando hay una que nombrar.  \~
+    const char *block_why_ = nullptr;
+
+    /// \~english What @c why answers.  \~spanish Lo que contesta @c why.  \~
+    const char *why_ = nullptr;
 
     uint8_t control_[kControlRoom] = {};
     size_t control_len_ = 0;

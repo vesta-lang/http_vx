@@ -208,6 +208,10 @@ enum class Verdict : uint8_t {
 struct Outcome {
     Verdict verdict = Verdict::Accept;
     ErrorCode error = ErrorCode::NoError;
+
+    /// \~english Why a stream was refused as malformed, where the code alone cannot say it; null otherwise.
+    /// \~spanish Por que se rechazo un flujo mal formado, donde el codigo solo no lo dice; nulo si no.  \~
+    const char *why = nullptr;
 };
 
 /**
@@ -217,18 +221,28 @@ struct Outcome {
  * \~
  *
  * \~english
- * Sixteen bytes, and it is worth saying why the shape matters: there is one of
- * these per concurrent request, and the reactor walks them.  R17 says the
+ * Twenty-four bytes, and it is worth saying why the shape matters: there is one
+ * of these per concurrent request, and the reactor walks them.  R17 says the
  * state the loop touches every time round goes in a dense array; this is that
  * array's element, so what belongs here is what the loop needs and nothing it
  * only wants when something has gone wrong.
  *
+ * It was sixteen until the content length came in, and the eight bytes it
+ * costs are loop state and not error state: every DATA frame of a request
+ * that declared a length is counted against it, as it arrives (RFC 9113,
+ * 8.1.1).
+ *
  * \~spanish
- * Dieciseis bytes, y merece decirse por que importa la forma: hay uno de estos
- * por peticion concurrente, y el reactor los recorre.  La R17 dice que el
+ * Veinticuatro bytes, y merece decirse por que importa la forma: hay uno de
+ * estos por peticion concurrente, y el reactor los recorre.  La R17 dice que el
  * estado que toca el bucle cada vuelta va en un array denso; esto es el
  * elemento de ese array, asi que aqui va lo que necesita el bucle y nada de lo
  * que solo quiere cuando algo ha ido mal.
+ *
+ * Eran dieciseis hasta que entro la longitud de contenido, y los ocho bytes que
+ * cuesta son estado del bucle y no de error: cada trama DATA de una peticion
+ * que declaro una longitud se cuenta contra ella, segun llega (RFC 9113,
+ * 8.1.1).
  *
  * \~
  */
@@ -244,10 +258,19 @@ struct Stream {
     Window recv;
 
     StreamState state;
-    uint8_t _pad[3];
+
+    /// \~english Whether the request declared a content length.
+    /// \~spanish Si la peticion declaro una longitud de contenido.  \~
+    bool counted;
+
+    uint8_t _pad[2];
+
+    /// \~english How much content is still owed, when @c counted.
+    /// \~spanish Cuanto contenido se debe todavia, cuando @c counted.  \~
+    uint64_t content_left;
 };
 
-static_assert(sizeof(Stream) == 16, "a stream is meant to be sixteen bytes");
+static_assert(sizeof(Stream) == 24, "a stream is meant to be twenty-four bytes");
 
 /**
  * @brief
@@ -417,15 +440,107 @@ class StreamSet {
      * que va @c Verdict::Discard y se perderia si las dos se gastaran en el
      * mismo sitio.
      *
+     * \~english
+     * The CONTENT is a different number, and it is the one a declared
+     * content length is compared with: the sum of what the frames carry,
+     * padding NOT included, has to come to exactly what the request said
+     * (RFC 9113, 8.1.1).  Too much is refused on the frame that crosses the
+     * line, not at the end; too little is refused on the frame that ends the
+     * stream.  Either one is a malformed request: a stream error,
+     * @c ProtocolError.
+     *
+     * \~spanish
+     * El CONTENIDO es otro numero, y es con el que se compara una longitud de
+     * contenido declarada: la suma de lo que llevan las tramas, relleno NO
+     * incluido, tiene que llegar exactamente a lo que dijo la peticion (RFC
+     * 9113, 8.1.1).  Lo que sobra se rechaza en la trama que pasa de la raya, no
+     * al final; lo que falta se rechaza en la trama que acaba el flujo.
+     * Cualquiera de los dos es una peticion mal formada: error de flujo,
+     * @c ProtocolError.
+     *
      * \~
      * @param id         \~english the identifier  \~spanish el identificador  \~
      * @param len        \~english the whole payload's length
      *                   \~spanish la longitud de la carga entera  \~
+     * @param content    \~english how much of it is content, padding taken off
+     *                   \~spanish cuanto de ella es contenido, quitado el relleno  \~
      * @param end_stream \~english whether it is the last
      *                   \~spanish si es la ultima  \~
      * @return           \~english what to do  \~spanish que hacer  \~
      */
-    Outcome on_data(uint32_t id, uint32_t len, bool end_stream) noexcept;
+    Outcome on_data(uint32_t id, uint32_t len, uint32_t content,
+                    bool end_stream) noexcept;
+
+    /**
+     * @brief
+     * \~english Records the content length the request on @p id declared.
+     * \~spanish Apunta la longitud de contenido que declaro la peticion de @p id.
+     * \~
+     *
+     * \~english
+     * Called once the header block that opened the stream has been read,
+     * because that is the first moment the length is known.  A request whose
+     * HEADERS already ended the stream has no content at all, so a length
+     * other than zero is refused here and not left for a DATA frame that is
+     * never coming (RFC 9113, 8.1.1).
+     *
+     * \~spanish
+     * Se llama una vez leido el bloque de cabeceras que abrio el flujo, porque
+     * ese es el primer momento en que se conoce la longitud.  Una peticion cuyo
+     * HEADERS ya acabo el flujo no tiene contenido ninguno, asi que una longitud
+     * distinta de cero se rechaza aqui y no se deja para una trama DATA que no
+     * va a llegar (RFC 9113, 8.1.1).
+     *
+     * \~
+     * @param id \~english the identifier  \~spanish el identificador  \~
+     * @param n  \~english the length declared  \~spanish la longitud declarada  \~
+     * @return   \~english what to do  \~spanish que hacer  \~
+     */
+    Outcome expect_content(uint32_t id, uint64_t n) noexcept;
+
+    /**
+     * @brief
+     * \~english What a second HEADERS on @p id, the trailer section, means.
+     * \~spanish Que significa un segundo HEADERS sobre @p id, la seccion de remolques.
+     * \~
+     *
+     * \~english
+     * Asked only for a stream still in the table; one that is not is a
+     * question for @c open.  Three refusals, all stream errors:
+     *
+     *  - the peer had already ended the stream: @c StreamClosed (RFC 9113,
+     *    5.1, half-closed (remote));
+     *  - the HEADERS does not carry END_STREAM: the trailer section is the
+     *    last thing on a request, so one that does not end it is malformed,
+     *    @c ProtocolError (RFC 9113, 8.1);
+     *  - the content that arrived is less than the length declared: the
+     *    trailers end the stream, and with it the content, @c ProtocolError
+     *    (RFC 9113, 8.1.1).
+     *
+     * An accepted one ends the stream the way a DATA with END_STREAM would.
+     *
+     * \~spanish
+     * Solo se pregunta por un flujo que sigue en la tabla; uno que no esta es
+     * una pregunta para @c open.  Tres rechazos, todos errores de flujo:
+     *
+     *  - el otro extremo ya habia acabado el flujo: @c StreamClosed (RFC 9113,
+     *    5.1, half-closed (remote));
+     *  - el HEADERS no lleva END_STREAM: la seccion de remolques es lo ultimo de
+     *    una peticion, asi que una que no la acaba esta mal formada,
+     *    @c ProtocolError (RFC 9113, 8.1);
+     *  - el contenido que llego es menos que la longitud declarada: los
+     *    remolques acaban el flujo, y con el el contenido, @c ProtocolError
+     *    (RFC 9113, 8.1.1).
+     *
+     * Uno aceptado acaba el flujo como lo acabaria un DATA con END_STREAM.
+     *
+     * \~
+     * @param id         \~english the identifier  \~spanish el identificador  \~
+     * @param end_stream \~english whether the HEADERS carries END_STREAM
+     *                   \~spanish si el HEADERS lleva END_STREAM  \~
+     * @return           \~english what to do  \~spanish que hacer  \~
+     */
+    Outcome on_trailers(uint32_t id, bool end_stream) noexcept;
 
     /**
      * @brief
@@ -517,6 +632,10 @@ class StreamSet {
 
     /// \~english Forgets the one at @p i.  \~spanish Olvida el de @p i.  \~
     void drop(size_t i) noexcept;
+
+    /// \~english The peer has finished on @p s: half-closed, or forgotten if this end had too.
+    /// \~spanish El otro extremo acabo en @p s: medio cerrado, u olvidado si este tambien.  \~
+    void end_remote(Stream *s) noexcept;
 
     Stream *streams_ = nullptr;
     size_t cap_ = 0;

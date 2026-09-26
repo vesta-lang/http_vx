@@ -15,6 +15,8 @@
 
 #include "http_vx/h2_connection.h"
 
+#include "http_vx/content_length.h"
+
 #include "util/mem/vesta_memcpy.h"
 
 namespace http_vx {
@@ -98,6 +100,9 @@ void Connection::reset(const Limits &limits) noexcept {
 
     control_len_ = 0;
     block_.clear();
+    block_trailers_ = false;
+    block_why_ = nullptr;
+    why_ = nullptr;
 
     /* \~english
      * And this end speaks first.  The peer may start sending requests the
@@ -240,6 +245,62 @@ Event Connection::fail(ErrorCode code) noexcept {
     e.kind = EventKind::Closed;
     e.error = code;
     return e;
+}
+
+Event Connection::refuse(uint32_t id, ErrorCode code, const char *why) noexcept {
+    reset_stream(id, code);
+    why_ = why;
+
+    Event e;
+    e.kind = EventKind::StreamEnded;
+    e.stream_id = id;
+    e.error = code;
+    return e;
+}
+
+const char *Connection::expect_content(const Buffer &headers,
+                                       const http_vx::Request &req) noexcept {
+    /* \~english
+     * The field is read by the same code HTTP/1.1 reads it with (RFC 9110,
+     * 8.6): every occurrence, every list element, digits only.  A value that
+     * is not a length at all cannot equal the content, whatever the content
+     * turns out to be, so it is malformed now rather than later (RFC 9113,
+     * 8.1.1).
+     * \~spanish
+     * La cabecera se lee con el mismo codigo con que la lee HTTP/1.1 (RFC 9110,
+     * 8.6): todas las apariciones, todos los elementos de la lista, solo
+     * digitos.  Un valor que no es una longitud no puede ser igual al
+     * contenido, sea el contenido el que sea, asi que esta mal formado ahora y
+     * no mas tarde (RFC 9113, 8.1.1).
+     * \~ */
+    const ContentLength cl = parse_content_length(req.fields, headers.data());
+
+    if (cl.status == ContentLengthStatus::Absent) return nullptr;
+
+    if (cl.status == ContentLengthStatus::Present) {
+        const Outcome o = streams_.expect_content(block_stream_, cl.value);
+        return o.verdict == Verdict::StreamError ? o.why : nullptr;
+    }
+
+    if (cl.status == ContentLengthStatus::Conflicting)
+        return "content-length values that disagree (RFC 9110, 8.6; RFC 9113, "
+               "8.1.1)";
+
+    if (cl.status == ContentLengthStatus::Malformed)
+        return "a content-length that is not a number (RFC 9110, 8.6; RFC "
+               "9113, 8.1.1)";
+
+    /* \~english
+     * Too large to hold: the DATA this end counts could never add up to it,
+     * so the equality RFC 9113, 8.1.1 asks for cannot be checked -- and a rule
+     * that cannot be checked is refused, not waved through.
+     * \~spanish
+     * Demasiado grande para guardarla: los DATA que cuenta este extremo no
+     * podrian sumarla nunca, asi que la igualdad que pide RFC 9113, 8.1.1 no se
+     * puede comprobar -- y una regla que no se puede comprobar se rechaza, no se
+     * deja pasar.
+     * \~ */
+    return "a content-length larger than this end can count (RFC 9113, 8.1.1)";
 }
 
 Event Connection::on_settings(const View &v) noexcept {
@@ -411,11 +472,29 @@ Event Connection::on_headers(const View &v, Buffer &headers,
         block_stream_ = h.stream_id;
         block_ends_ = (h.flags & kEndStream) != 0;
 
-        const Outcome o = streams_.open(block_stream_, block_ends_);
+        /* \~english
+         * A HEADERS for a stream still in the table does not open anything:
+         * it is the trailer section of the request already there (RFC 9113,
+         * 8.1), and what it may be is a question for that stream.  One for a
+         * stream that is not in the table goes on being an opening, and the
+         * identifier rules there refuse whatever is not.
+         * \~spanish
+         * Un HEADERS de un flujo que sigue en la tabla no abre nada: es la
+         * seccion de remolques de la peticion que ya esta (RFC 9113, 8.1), y lo
+         * que pueda ser es cosa de ese flujo.  Uno de un flujo que no esta en la
+         * tabla sigue siendo una apertura, y las reglas del identificador de
+         * alli rechazan lo que no lo sea.
+         * \~ */
+        block_trailers_ = streams_.find(block_stream_) != nullptr;
+
+        const Outcome o = block_trailers_
+                              ? streams_.on_trailers(block_stream_, block_ends_)
+                              : streams_.open(block_stream_, block_ends_);
         if (o.verdict == Verdict::ConnectionError) return fail(o.error);
 
         block_refused_ =
             o.verdict == Verdict::StreamError ? o.error : ErrorCode::NoError;
+        block_why_ = o.why;
     }
 
     /* \~english
@@ -466,8 +545,22 @@ Event Connection::on_headers(const View &v, Buffer &headers,
      * sigue funcionando --.  Saltarse el trabajo de una peticion rechazada le
      * costaria a la conexion todas las peticiones siguientes.
      * \~ */
-    headers.clear();
-    const ErrorCode de = decoder_.decode(block, block_len, headers, req);
+    ErrorCode de = ErrorCode::NoError;
+    if (block_trailers_) {
+        /* \~english
+         * Trailers are ADDED: to the request passed in and after what the
+         * header buffer holds, so that a caller that kept the stream's head
+         * there sees one request, head and trailers, over one base.
+         * \~spanish
+         * Los remolques se ANADEN: a la peticion que se paso y detras de lo que
+         * tenga el buffer de cabeceras, para que quien guardo ahi la cabecera
+         * del flujo vea una peticion, cabecera y remolques, sobre una base.
+         * \~ */
+        de = decoder_.decode_trailers(block, block_len, headers, req);
+    } else {
+        headers.clear();
+        de = decoder_.decode(block, block_len, headers, req);
+    }
     block_.clear();
 
     /* \~english
@@ -481,18 +574,30 @@ Event Connection::on_headers(const View &v, Buffer &headers,
      * \~ */
     if (de == ErrorCode::CompressionError) return fail(de);
 
-    const ErrorCode why =
-        de != ErrorCode::NoError ? de : block_refused_;
+    if (de != ErrorCode::NoError)
+        return refuse(block_stream_, de, decoder_.why());
 
-    if (why != ErrorCode::NoError) {
-        reset_stream(block_stream_, why);
+    if (block_refused_ != ErrorCode::NoError)
+        return refuse(block_stream_, block_refused_, block_why_);
 
+    if (block_trailers_) {
         Event e;
-        e.kind = EventKind::StreamEnded;
+        e.kind = EventKind::Trailers;
         e.stream_id = block_stream_;
-        e.error = why;
+        e.ends = true;
         return e;
     }
+
+    /* \~english
+     * The head is whole, so its content-length is known: from here on every
+     * DATA of the stream is counted against it (RFC 9113, 8.1.1).
+     * \~spanish
+     * La cabecera esta entera, asi que se conoce su content-length: desde aqui
+     * cada DATA del flujo se cuenta contra ella (RFC 9113, 8.1.1).
+     * \~ */
+    const char *bad = expect_content(headers, req);
+    if (bad != nullptr)
+        return refuse(block_stream_, ErrorCode::ProtocolError, bad);
 
     Event e;
     e.kind = EventKind::Request;
@@ -503,6 +608,7 @@ Event Connection::on_headers(const View &v, Buffer &headers,
 
 Event Connection::read(const View &v, Buffer &headers,
                        http_vx::Request &req) noexcept {
+    why_ = nullptr;
     if (closed_) return Event{};
 
     /* \~english
@@ -559,7 +665,19 @@ Event Connection::read(const View &v, Buffer &headers,
         if (!recv_.take(h.length)) return fail(ErrorCode::FlowControlError);
 
         const bool end_stream = (h.flags & kEndStream) != 0;
-        const Outcome o = streams_.on_data(h.stream_id, h.length, end_stream);
+
+        /* \~english
+         * Two lengths: the whole payload is what the windows are charged, and
+         * what is left once the reader took the padding off is the content a
+         * content-length is compared with (RFC 9113, 6.1 and 8.1.1).
+         * \~spanish
+         * Dos longitudes: la carga entera es lo que se cobra a las ventanas, y
+         * lo que queda cuando el lector quito el relleno es el contenido con el
+         * que se compara una content-length (RFC 9113, 6.1 y 8.1.1).
+         * \~ */
+        const Span p = reader_.payload();
+        const Outcome o =
+            streams_.on_data(h.stream_id, h.length, p.len, end_stream);
 
         if (o.verdict == Verdict::ConnectionError) return fail(o.error);
 
@@ -582,6 +700,7 @@ Event Connection::read(const View &v, Buffer &headers,
         if (o.verdict == Verdict::StreamError) {
             reset_stream(h.stream_id, o.error);
             credit_connection(h.length);
+            why_ = o.why;
 
             Event e;
             e.kind = EventKind::StreamEnded;
@@ -594,8 +713,6 @@ Event Connection::read(const View &v, Buffer &headers,
             credit_connection(h.length);
             return Event{};
         }
-
-        const Span p = reader_.payload();
 
         /* \~english
          * And the padding, which the reader took off and the peer paid for.

@@ -599,6 +599,457 @@ void test_a_broken_connection_says_why() {
     check(c.consumed() == at, "a closed connection consumed more bytes");
 }
 
+/**
+ * @brief
+ * \~english One literal field, not remembered (RFC 7541, 6.2.2), or remembered (6.2.1).
+ * \~spanish Una cabecera literal, sin recordar (RFC 7541, 6.2.2), o recordada (6.2.1).
+ * \~
+ */
+void literal(uint8_t *at, size_t &n, const char *name, const char *value,
+             bool remember = false) {
+    const size_t nlen = std::strlen(name);
+    const size_t vlen = std::strlen(value);
+
+    at[n++] = remember ? 0x40 : 0x00;
+    at[n++] = static_cast<uint8_t>(nlen);
+    std::memcpy(at + n, name, nlen);
+    n += nlen;
+    at[n++] = static_cast<uint8_t>(vlen);
+    std::memcpy(at + n, value, vlen);
+    n += vlen;
+}
+
+/**
+ * @brief
+ * \~english A POST head: :method POST, :scheme https, :path /, and a content-length if @p length is not null.
+ * \~spanish Una cabecera de POST: :method POST, :scheme https, :path /, y una content-length si @p length no es nulo.
+ * \~
+ */
+size_t post_head(uint8_t *at, const char *length) {
+    size_t n = 0;
+    at[n++] = 0x83;
+    at[n++] = 0x87;
+    at[n++] = 0x84;
+    if (length != nullptr) literal(at, n, "content-length", length);
+    return n;
+}
+
+/**
+ * @brief
+ * \~english A connection past the preface and settings, and what a caller keeps.
+ * \~spanish Una conexion pasado el preambulo y los ajustes, y lo que guarda quien llama.
+ * \~
+ */
+struct Session {
+    http_vx::h2::Limits limits;
+    Connection c;
+    Peer p;
+    http_vx::Buffer headers;
+    http_vx::Request req;
+
+    Session() {
+        c.reset(limits);
+        c.flushed(c.pending_size());
+        p.preface();
+        p.settings();
+    }
+
+    Event next() {
+        c.flushed(c.pending_size());
+        return pump(c, p, headers, req);
+    }
+
+    void data(uint32_t id, const char *text, bool ends) {
+        p.frame(FrameType::Data, ends ? http_vx::h2::kEndStream : 0, id,
+                reinterpret_cast<const uint8_t *>(text), std::strlen(text));
+    }
+};
+
+/**
+ * @brief
+ * \~english The code of the RST_STREAM waiting for @p id; ~0 if there is none.
+ * \~spanish El codigo del RST_STREAM que espera para @p id; ~0 si no hay.
+ * \~
+ */
+uint32_t reset_code(const Connection &c, uint32_t id) {
+    size_t at = 0;
+    while (at + 9 <= c.pending_size()) {
+        FrameHeader h;
+        http_vx::h2::decode_frame_header(c.pending() + at, h);
+        if (h.type == static_cast<uint8_t>(FrameType::RstStream) && h.stream_id == id)
+            return http_vx::h2::be32(c.pending() + at + 9);
+        at += 9 + h.length;
+    }
+    return ~uint32_t{0};
+}
+
+/// \~english Whether @p why says @p what.  \~spanish Si @p why dice @p what.  \~
+bool says(const char *why, const char *what) {
+    return why != nullptr && std::strstr(why, what) != nullptr;
+}
+
+/**
+ * @brief
+ * \~english A stream error for a malformed request, told to the peer and kept for the log.
+ * \~spanish Un error de flujo por una peticion mal formada, dicho al otro extremo y guardado para anotarlo.
+ * \~
+ */
+bool malformed(const Session &s, const Event &e, uint32_t id, const char *what) {
+    return e.kind == EventKind::StreamEnded && e.stream_id == id &&
+           e.error == ErrorCode::ProtocolError &&
+           reset_code(s.c, id) == static_cast<uint32_t>(ErrorCode::ProtocolError) &&
+           says(s.c.why(), what);
+}
+
+/**
+ * @brief
+ * \~english The content-length has to be the sum of the DATA, no more and no less (RFC 9113, 8.1.1).
+ * \~spanish La content-length tiene que ser la suma de los DATA, ni mas ni menos (RFC 9113, 8.1.1).
+ * \~
+ */
+void test_the_content_length_is_the_data() {
+    uint8_t block[128];
+
+    {
+        // \~english Exactly: 2 + 3 = 5.  \~spanish Exacto: 2 + 3 = 5.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "ab", false);
+        s.data(1, "cde", true);
+
+        check(s.next().kind == EventKind::Request, "a request with a content-length did not come out");
+        Event e = s.next();
+        check(e.kind == EventKind::Body && !e.ends && e.size == 2, "the first piece of an exact body was refused");
+        e = s.next();
+        check(e.kind == EventKind::Body && e.ends && e.size == 3, "the last piece of an exact body was refused");
+        check(count_answers(s.c, FrameType::RstStream, 0) == 0, "an exact body was reset");
+        check(s.c.why() == nullptr, "an exact body gave a reason");
+    }
+    {
+        /* \~english
+         * Too much, and refused on the frame that crosses the line, not at the
+         * end: 3 is fine, 3 + 3 is past 5.
+         * \~spanish
+         * De mas, y rechazado en la trama que pasa de la raya, no al final: 3
+         * vale, 3 + 3 pasa de 5.
+         * \~ */
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "abc", false);
+        s.data(1, "def", false);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(s.next().kind == EventKind::Body, "data within the content-length was refused");
+        const Event e = s.next();
+        check(malformed(s, e, 1, "more DATA"), "more DATA than the content-length was not refused (8.1.1)");
+
+        /* \~english
+         * A stream error, not the connection's: the next request is served.
+         * \~spanish
+         * Un error de flujo, no de la conexion: la peticion siguiente se sirve.
+         * \~ */
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3,
+                  kRequestBlock, sizeof kRequestBlock);
+        const Event n = s.next();
+        check(n.kind == EventKind::Request && n.stream_id == 3, "a malformed request ended the connection");
+        check(s.c.why() == nullptr, "the reason of a refusal stayed on the next event");
+        check(count_answers(s.c, FrameType::Goaway, 0) == 0, "a malformed request sent a GOAWAY");
+    }
+    {
+        // \~english One byte over, in a single frame.  \~spanish Un byte de mas, en una sola trama.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "abcdef", true);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(malformed(s, s.next(), 1, "more DATA"), "one byte over the content-length was not refused");
+    }
+    {
+        // \~english Too little: 4 of 5 and the stream ends.  \~spanish De menos: 4 de 5 y el flujo acaba.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5"));
+        s.data(1, "abcd", true);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(malformed(s, s.next(), 1, "less DATA"), "less DATA than the content-length was not refused (8.1.1)");
+    }
+    {
+        // \~english No content-length: nothing to compare with.  \~spanish Sin content-length: nada con que comparar.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        s.data(1, "anything", true);
+
+        check(s.next().kind == EventKind::Request, "a request without a content-length did not come out");
+        const Event e = s.next();
+        check(e.kind == EventKind::Body && e.ends && e.size == 8, "a body without a content-length was refused");
+        check(count_answers(s.c, FrameType::RstStream, 0) == 0, "a body without a content-length was reset");
+    }
+    {
+        /* \~english
+         * Padding is not content: four bytes of data and eleven of padding
+         * meet a content-length of four.
+         * \~spanish
+         * El relleno no es contenido: cuatro bytes de datos y once de relleno
+         * cumplen una content-length de cuatro.
+         * \~ */
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "4"));
+        uint8_t padded[16] = {};
+        padded[0] = 11;
+        std::memcpy(padded + 1, "four", 4);
+        s.p.frame(FrameType::Data, http_vx::h2::kEndStream | 0x08, 1, padded, sizeof padded);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        const Event e = s.next();
+        check(e.kind == EventKind::Body && e.ends && e.size == 4, "padding was counted as content");
+    }
+}
+
+/**
+ * @brief
+ * \~english A content-length that cannot be the content is malformed as soon as the head is read (RFC 9113, 8.1.1).
+ * \~spanish Una content-length que no puede ser el contenido esta mal formada en cuanto se lee la cabecera (RFC 9113, 8.1.1).
+ * \~
+ */
+void test_a_content_length_that_cannot_be() {
+    struct Case {
+        const char *value;
+        bool ends;
+        const char *why;
+    };
+    const Case cases[] = {
+        {"5x", false, "not a number"},
+        {"", false, "not a number"},
+        {"5, 6", false, "disagree"},
+        {"99999999999999999999999", false, "larger"},
+        // \~english No DATA at all, but a length: the content is empty.  \~spanish Ningun DATA, pero una longitud: el contenido esta vacio.  \~
+        {"3", true, "no DATA"},
+    };
+
+    for (const Case &k : cases) {
+        Session s;
+        uint8_t block[128];
+        const uint8_t flags = http_vx::h2::kEndHeaders | (k.ends ? http_vx::h2::kEndStream : 0);
+        s.p.frame(FrameType::Headers, flags, 1, block, post_head(block, k.value));
+
+        const Event e = s.next();
+        check(malformed(s, e, 1, k.why), k.why);
+    }
+
+    {
+        // \~english But "5, 5" is one length, and "0" with END_STREAM is exact.
+        // \~spanish Pero "5, 5" es una longitud, y "0" con END_STREAM es exacto.  \~
+        Session s;
+        uint8_t block[128];
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "5, 5"));
+        s.data(1, "abcde", true);
+        check(s.next().kind == EventKind::Request, "a repeated agreeing content-length was refused");
+        check(s.next().kind == EventKind::Body, "the body of a repeated content-length was refused");
+
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, block,
+                  post_head(block, "0"));
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.ends, "content-length: 0 with END_STREAM was refused");
+        check(s.c.why() == nullptr, "an accepted request gave a reason");
+    }
+}
+
+/**
+ * @brief
+ * \~english A second HEADERS that ends the stream is the trailer section, added to the request (RFC 9113, 8.1).
+ * \~spanish Un segundo HEADERS que acaba el flujo es la seccion de remolques, anadida a la peticion (RFC 9113, 8.1).
+ * \~
+ */
+void test_trailers_are_added_to_the_request() {
+    uint8_t block[128];
+    uint8_t tail[64];
+
+    {
+        Session s;
+        size_t n = post_head(block, "2");
+        literal(block, n, "x-a", "1");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, n);
+        s.data(1, "hi", false);
+
+        size_t t = 0;
+        literal(tail, t, "x-sum", "42");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        check(s.next().kind == EventKind::Body, "the body did not come out");
+
+        const Event e = s.next();
+        check(e.kind == EventKind::Trailers, "the trailer section did not come out");
+        check(e.stream_id == 1 && e.ends, "the trailer section did not end its stream");
+        check(count_answers(s.c, FrameType::RstStream, 0) == 0, "a trailer section was reset");
+
+        /* \~english
+         * Into the request that was there: the head and the trailers, over
+         * one buffer.
+         * \~spanish
+         * En la peticion que habia: la cabecera y los remolques, sobre un
+         * buffer.
+         * \~ */
+        check(s.req.method == http_vx::MethodId::Post, "the trailers emptied the request");
+        check(s.req.fields.size() == 3, "the trailers were not added to the head's fields");
+        const http_vx::Field &f = s.req.fields.begin()[2];
+        check(span_is(f.name_off, f.name_len, s.headers, "x-sum") &&
+                  span_is(f.value_off, f.value_len, s.headers, "42"),
+              "the trailer field is not the one that was sent");
+        const http_vx::Field &g = s.req.fields.begin()[1];
+        check(span_is(g.name_off, g.name_len, s.headers, "x-a"), "the head's field was lost to the trailers");
+
+        // \~english Every span, the head's too, inside what the buffer holds.
+        // \~spanish Todos los trozos, tambien los de la cabecera, dentro de lo que tiene el buffer.  \~
+        bool inside = s.req.target.off + s.req.target.len <= s.headers.size();
+        for (const http_vx::Field *h = s.req.fields.begin(); h != s.req.fields.end(); ++h)
+            inside = inside && h->name_off + h->name_len <= s.headers.size() &&
+                     h->value_off + h->value_len <= s.headers.size();
+        check(inside, "the trailers were written over the head");
+
+        /* \~english
+         * And the stream is over: a DATA after the trailers is data after the
+         * end (RFC 9113, 5.1).
+         * \~spanish
+         * Y el flujo acabo: un DATA detras de los remolques es un dato
+         * despues del final (RFC 9113, 5.1).
+         * \~ */
+        s.data(1, "late", false);
+        const Event d = s.next();
+        check(d.kind == EventKind::StreamEnded && d.error == ErrorCode::StreamClosed,
+              "DATA after the trailers was accepted");
+    }
+    {
+        // \~english Split over a CONTINUATION, and still trailers.  \~spanish Partido en una CONTINUATION, y siguen siendo remolques.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        size_t t = 0;
+        literal(tail, t, "x-one", "1");
+        const size_t half = t;
+        literal(tail, t, "x-two", "2");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndStream, 1, tail, half);
+        s.p.frame(FrameType::Continuation, http_vx::h2::kEndHeaders, 1, tail + half, t - half);
+
+        check(s.next().kind == EventKind::Request, "the request did not come out");
+        const Event e = s.next();
+        check(e.kind == EventKind::Trailers && e.ends, "trailers split over a CONTINUATION were not trailers");
+        check(s.req.fields.size() == 2, "a piece of the split trailers was lost");
+    }
+    {
+        // \~english An exact content-length ended by the trailers.  \~spanish Una content-length exacta que acaban los remolques.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "3"));
+        s.data(1, "abc", false);
+        size_t t = 0;
+        literal(tail, t, "x-sum", "1");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+
+        s.next();
+        s.next();
+        check(s.next().kind == EventKind::Trailers, "trailers after an exact body were refused");
+    }
+}
+
+/**
+ * @brief
+ * \~english What a second HEADERS may not be (RFC 9113, 5.1, 8.1, 8.1.1).
+ * \~spanish Lo que no puede ser un segundo HEADERS (RFC 9113, 5.1, 8.1, 8.1.1).
+ * \~
+ */
+void test_what_trailers_may_not_be() {
+    uint8_t block[128];
+    uint8_t tail[64];
+
+    {
+        // \~english A pseudo-header field in trailers.  \~spanish Una pseudo-cabecera en los remolques.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        const uint8_t pseudo[] = {0x84};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, pseudo,
+                  sizeof pseudo);
+
+        s.next();
+        check(malformed(s, s.next(), 1, "pseudo-header"), "a pseudo-header field in trailers was accepted (8.1)");
+    }
+    {
+        /* \~english
+         * A second HEADERS without END_STREAM, which remembers a field: the
+         * request is refused, and the block is read anyway -- the next
+         * request names that field by index and has to find it.
+         * \~spanish
+         * Un segundo HEADERS sin END_STREAM, que recuerda una cabecera: la
+         * peticion se rechaza, y el bloque se lee igual -- la peticion
+         * siguiente nombra esa cabecera por indice y tiene que encontrarla.
+         * \~ */
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        size_t t = 0;
+        literal(tail, t, "x-k", "v", true);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, tail, t);
+
+        s.next();
+        check(malformed(s, s.next(), 1, "without END_STREAM"),
+              "a second HEADERS without END_STREAM was accepted (8.1)");
+
+        const uint8_t again[] = {0x82, 0x87, 0x84, 0xbe};
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 3, again,
+                  sizeof again);
+        const Event e = s.next();
+        check(e.kind == EventKind::Request && e.stream_id == 3, "the request after the refusal was lost");
+        // \~english First in the buffer, the name :method, and the value right after it.
+        // \~spanish Lo primero del buffer, el nombre :method, y el valor justo detras.  \~
+        check(s.req.method_text.off == 7, "a new head did not start the header buffer afresh");
+        check(s.req.fields.size() == 1 && span_is(s.req.fields.begin()[0].name_off,
+                                                  s.req.fields.begin()[0].name_len, s.headers, "x-k"),
+              "the refused block did not reach the table");
+    }
+    {
+        // \~english A third HEADERS, after the trailers ended the stream.  \~spanish Un tercer HEADERS, despues de que los remolques acabaran el flujo.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, nullptr));
+        size_t t = 0;
+        literal(tail, t, "x-sum", "1");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+
+        s.next();
+        check(s.next().kind == EventKind::Trailers, "the trailers did not come out");
+        const Event e = s.next();
+        check(e.kind == EventKind::StreamEnded && e.error == ErrorCode::StreamClosed &&
+                  reset_code(s.c, 1) == static_cast<uint32_t>(ErrorCode::StreamClosed) &&
+                  says(s.c.why(), "after the stream had ended"),
+              "a third HEADERS was accepted (5.1)");
+        check(count_answers(s.c, FrameType::Goaway, 0) == 0, "a third HEADERS ended the connection");
+    }
+    {
+        // \~english A second HEADERS on a stream the first one already ended.  \~spanish Un segundo HEADERS en un flujo que ya acabo el primero.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, block,
+                  post_head(block, nullptr));
+        size_t t = 0;
+        literal(tail, t, "x-sum", "1");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+
+        s.next();
+        const Event e = s.next();
+        check(e.kind == EventKind::StreamEnded && e.error == ErrorCode::StreamClosed,
+              "trailers after a HEADERS with END_STREAM were accepted (5.1)");
+    }
+    {
+        // \~english Trailers that end the content short.  \~spanish Remolques que acaban el contenido corto.  \~
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders, 1, block, post_head(block, "10"));
+        s.data(1, "abcd", false);
+        size_t t = 0;
+        literal(tail, t, "x-sum", "1");
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, tail, t);
+
+        s.next();
+        s.next();
+        check(malformed(s, s.next(), 1, "less DATA"), "trailers ending the content short were accepted (8.1.1)");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -607,6 +1058,10 @@ int main() {
     test_a_flood_of_questions_stops_the_reading();
     test_the_window_comes_back_when_the_body_is_used();
     test_a_broken_connection_says_why();
+    test_the_content_length_is_the_data();
+    test_a_content_length_that_cannot_be();
+    test_trailers_are_added_to_the_request();
+    test_what_trailers_may_not_be();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);
