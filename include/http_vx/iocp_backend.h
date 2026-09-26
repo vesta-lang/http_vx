@@ -73,6 +73,7 @@
 #define HTTP_VX_IOCP_BACKEND_H
 
 #include "http_vx/buffer_pool.h"
+#include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
 #include <cstddef>
@@ -157,6 +158,45 @@ class IocpBackend final : public Backend {
     /// \~spanish En que puerto esta escuchando.  \~
     uint16_t port() const noexcept { return port_; }
 
+    /**
+     * @brief
+     * \~english Opens a UDP socket bound to @p host and @p port, v4 or v6 by what @p host is.
+     * \~spanish Abre un socket UDP atado a @p host y @p port, v4 o v6 segun lo que sea @p host.
+     * \~
+     *
+     * \~english
+     * The backend keeps it and closes it on @c release.  A v6 socket is v6
+     * ONLY: a dual-stack one would hand up v4 peers as mapped v6 addresses,
+     * and the same peer would then have two spellings depending on the socket
+     * it came through.  Packet information is switched on, so that every
+     * datagram says which local address it was sent to, and so is not being
+     * told on a later receive that an earlier send hit a closed port -- which
+     * Windows does by default and which would fail a receive over a datagram
+     * that had nothing to do with it.
+     * \~spanish
+     * El backend se lo queda y lo cierra en @c release.  Un socket v6 es SOLO v6:
+     * uno de doble pila entregaria los extremos v4 como direcciones v6 mapeadas,
+     * y el mismo extremo tendria entonces dos grafias segun el socket por el que
+     * llegara.  Se enciende la informacion del paquete, para que cada datagrama
+     * diga a que direccion local se mando, y se apaga que una recepcion posterior
+     * cuente que un envio anterior dio con un puerto cerrado -- que Windows hace
+     * por defecto y que haria fallar una recepcion por un datagrama que no tenia
+     * nada que ver.
+     * \~
+     *
+     * @param host  \~english the address, as text  \~spanish la direccion, como texto  \~
+     * @param port  \~english the port, or zero for any  \~spanish el puerto, o cero para cualquiera  \~
+     * @param bound \~english where the address it got goes
+     *              \~spanish donde va la direccion que le toco  \~
+     * @return      \~english the socket, or -1 with @c last_error set
+     *              \~spanish el socket, o -1 con @c last_error puesto  \~
+     */
+    int32_t open_datagram(const char *host, uint16_t port,
+                          NetAddress &bound) noexcept;
+
+    /// \~english What happened to datagrams.  \~spanish Lo que les paso a los datagramas.  \~
+    const DatagramCounts &datagrams() const noexcept { return dgram_counts_; }
+
     bool submit(const Op &op) noexcept override;
     size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
     const char *name() const noexcept override { return "iocp"; }
@@ -236,6 +276,39 @@ class IocpBackend final : public Backend {
     bool start_recv(const Op &op, Context *c) noexcept;
     bool start_send(const Op &op, Context *c) noexcept;
     bool start_close(const Op &op) noexcept;
+
+    /// \~english Posts a receive of one datagram.
+    /// \~spanish Pone la recepcion de un datagrama.  \~
+    bool start_recv_from(const Op &op, Context *c) noexcept;
+
+    /// \~english Starts sending one datagram.
+    /// \~spanish Empieza a mandar un datagrama.  \~
+    bool start_send_to(const Op &op, Context *c) noexcept;
+
+    /**
+     * @brief
+     * \~english What a datagram operation came to, from what Windows said.
+     * \~spanish En que quedo una operacion de datagramas, por lo que dijo Windows.
+     * \~
+     *
+     * @return \~english the completion's result  \~spanish el resultado de la finalizacion  \~
+     */
+    int32_t finish_datagram(Context *c, bool fine, uint32_t moved,
+                            uint32_t flags) noexcept;
+
+    /// \~english Closes every datagram socket.
+    /// \~spanish Cierra todos los sockets de datagramas.  \~
+    void close_datagrams() noexcept;
+
+    /// \~english The datagram sockets opened.
+    /// \~spanish Los sockets de datagramas abiertos.  \~
+    DatagramSockets dgram_;
+
+    /// \~english `WSARecvMsg`, looked up at run time like `AcceptEx`.
+    /// \~spanish `WSARecvMsg`, buscado en ejecucion como `AcceptEx`.  \~
+    void *recvmsg_fn_ = nullptr;
+
+    DatagramCounts dgram_counts_;
 
     /// \~english The completion port.  \~spanish El puerto de finalizacion.  \~
     void *iocp_ = nullptr;

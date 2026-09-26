@@ -151,21 +151,73 @@ enum class OpKind : uint8_t {
 
     /**
      * \~english
-     * Read datagrams, more than one at a time.  R26: QUIC runs on UDP and one
-     * system call per datagram is the ceiling long before the encryption or
-     * the parsing is, so the batched operations of each platform are not an
-     * optimisation to add later -- they decide the shape of this enum now.
+     * Receive ONE datagram, with who sent it and to which address.
+     *
+     * The buffer must be empty; the backend fills it as `datagram.h` lays it
+     * out -- the header with both addresses, then the payload -- and @c length
+     * is the most payload it may hold.  The result is the payload's size, and
+     * zero is a datagram with nothing in it, NOT the end of anything: a
+     * datagram socket has no end.  One larger than @c length is cut by every
+     * system, and it completes with @c kTruncated instead of being delivered
+     * as if it were whole.
+     *
+     * R26 wants datagrams in BATCHES, and the batch is not in the operation:
+     * it is in the backend, over every operation outstanding on the same
+     * socket.  epoll answers all the receives waiting on a socket with one
+     * `recvmmsg`; io_uring hands every one to the kernel in the same enter;
+     * a completion port posts each on its own and takes the completions back
+     * together.  One datagram per operation is what lets each land in its own
+     * pooled buffer and go back to the pool on its own.
+     *
+     * The socket is @c fd and must be one the backend opened for datagrams;
+     * @c conn is the caller's to name what the socket is to it, and comes back
+     * untouched -- a datagram socket belongs to no connection.
+     *
      * \~spanish
-     * Leer datagramas, mas de uno a la vez.  R26: QUIC va sobre UDP y una
-     * llamada al sistema por datagrama es el techo mucho antes que el cifrado o
-     * el analisis, asi que las operaciones agrupadas de cada plataforma no son
-     * una optimizacion para mas tarde -- deciden la forma de este enum ahora.
+     * Recibir UN datagrama, con quien lo mando y a que direccion.
+     *
+     * El buffer tiene que estar vacio; el backend lo rellena como lo dispone
+     * `datagram.h` -- la cabecera con las dos direcciones, y despues la carga --
+     * y @c length es la mayor carga que puede tener.  El resultado es el tamano
+     * de la carga, y cero es un datagrama sin nada dentro, NO el final de nada:
+     * un socket de datagramas no tiene final.  Uno mayor que @c length lo corta
+     * cualquier sistema, y acaba con @c kTruncated en vez de entregarse como si
+     * estuviera entero.
+     *
+     * La R26 quiere datagramas por LOTES, y el lote no esta en la operacion:
+     * esta en el backend, sobre todas las operaciones pendientes en el mismo
+     * socket.  epoll contesta todas las recepciones que esperan en un socket con
+     * un `recvmmsg`; io_uring se las da todas al nucleo en la misma entrada; un
+     * puerto de finalizacion pone cada una por su lado y recoge las
+     * finalizaciones juntas.  Un datagrama por operacion es lo que permite que
+     * cada uno caiga en su propio buffer del pozo y vuelva al pozo por su lado.
+     *
+     * El socket es @c fd y tiene que ser uno que el backend abrio para
+     * datagramas; @c conn es de quien llama para nombrar lo que el socket es
+     * para el, y vuelve sin tocar -- un socket de datagramas no es de ninguna
+     * conexion.
      * \~
      */
     RecvFrom,
 
-    /// \~english Write datagrams, more than one at a time.
-    /// \~spanish Escribir datagramas, mas de uno a la vez.  \~
+    /**
+     * \~english
+     * Send ONE datagram, to the peer its header names and, when the header
+     * knows it, from the local address it names.  The buffer holds the header
+     * and @c length payload bytes, nothing else.  Batched like @c RecvFrom:
+     * epoll gathers every send waiting on a socket into one `sendmmsg` when it
+     * next waits, io_uring into one enter, and a completion port does not
+     * batch sends at all -- Windows has no call that sends several.
+     * \~spanish
+     * Mandar UN datagrama, al otro extremo que nombra su cabecera y, cuando la
+     * cabecera la sabe, desde la direccion local que nombra.  El buffer tiene la
+     * cabecera y @c length bytes de carga, nada mas.  Agrupado como
+     * @c RecvFrom: epoll junta todos los envios que esperan en un socket en un
+     * `sendmmsg` la proxima vez que espera, io_uring en una entrada, y un puerto
+     * de finalizacion no agrupa envios -- Windows no tiene una llamada que mande
+     * varios.
+     * \~
+     */
     SendTo,
 
     /**
@@ -356,12 +408,46 @@ struct Completion {
     /// \~english Whether it worked.  \~spanish Si funciono.  \~
     bool ok() const noexcept { return result >= 0; }
 
-    /// \~english Whether the peer closed its end.
-    /// \~spanish Si el otro extremo cerro su lado.  \~
-    bool eof() const noexcept {
-        return result == 0 && (kind == OpKind::Recv || kind == OpKind::RecvFrom);
-    }
+    /**
+     * \~english
+     * Whether the peer closed its end.  Only a stream has an end: a
+     * @c RecvFrom of zero is an empty datagram, which is legal and says
+     * nothing about the socket.  Reading it as the end would close a datagram
+     * socket on the first empty datagram anybody sent to it.
+     * \~spanish
+     * Si el otro extremo cerro su lado.  Solo un flujo tiene final: un
+     * @c RecvFrom de cero es un datagrama vacio, que es legal y no dice nada del
+     * socket.  Leerlo como el final cerraria un socket de datagramas con el
+     * primer datagrama vacio que le mandara cualquiera.
+     * \~
+     */
+    bool eof() const noexcept { return result == 0 && kind == OpKind::Recv; }
+
+    /// \~english Whether a datagram was cut by the system and not delivered.
+    /// \~spanish Si el sistema corto un datagrama y no se entrego.  \~
+    bool truncated() const noexcept;
 };
+
+/**
+ * \~english
+ * The result of a @c RecvFrom whose datagram did not fit.  Negative, so that
+ * @c ok is false and nothing that only asks whether it worked can take a cut
+ * datagram for a whole one; and distinct from every other failure, so that the
+ * loop can count it apart -- a peer sending datagrams larger than configured
+ * is a configuration to fix, not a socket in trouble.
+ * \~spanish
+ * El resultado de un @c RecvFrom cuyo datagrama no cabia.  Negativo, para que
+ * @c ok sea falso y nada que solo pregunte si funciono pueda tomar un datagrama
+ * cortado por uno entero; y distinto de cualquier otro fallo, para que el bucle
+ * lo cuente aparte -- un extremo que manda datagramas mayores de lo configurado
+ * es una configuracion que arreglar, no un socket con problemas.
+ * \~
+ */
+constexpr int32_t kTruncated = -0x7FFFFF00;
+
+inline bool Completion::truncated() const noexcept {
+    return kind == OpKind::RecvFrom && result == kTruncated;
+}
 
 /**
  * @brief

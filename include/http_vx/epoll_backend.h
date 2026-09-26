@@ -82,6 +82,7 @@
 #define HTTP_VX_EPOLL_BACKEND_H
 
 #include "http_vx/buffer_pool.h"
+#include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
 #include <cstddef>
@@ -164,6 +165,37 @@ class EpollBackend final : public Backend {
     /// \~spanish En que puerto esta escuchando.  \~
     uint16_t port() const noexcept { return port_; }
 
+    /**
+     * @brief
+     * \~english Opens a UDP socket bound to @p host and @p port, v4 or v6 by what @p host is.
+     * \~spanish Abre un socket UDP atado a @p host y @p port, v4 o v6 segun lo que sea @p host.
+     * \~
+     *
+     * \~english
+     * Kept and closed by the backend.  Receives waiting on it are answered
+     * together, by one `recvmmsg` when the socket becomes readable; sends are
+     * gathered and go out together, by one `sendmmsg`, when the backend next
+     * waits.  v6 sockets are v6 only; packet information and the traffic
+     * class are switched on, so every datagram says where it was sent and
+     * with which ECN mark.
+     * \~spanish
+     * Lo guarda y lo cierra el backend.  Las recepciones que esperan en el se
+     * contestan juntas, con un `recvmmsg` cuando el socket tiene algo; los envios
+     * se juntan y salen juntos, con un `sendmmsg`, la proxima vez que espera el
+     * backend.  Los sockets v6 son solo v6; se encienden la informacion del
+     * paquete y la clase de trafico, asi que cada datagrama dice a donde se mando
+     * y con que marca ECN.
+     * \~
+     *
+     * @return \~english the socket, or -1 with @c last_error set
+     *         \~spanish el socket, o -1 con @c last_error puesto  \~
+     */
+    int32_t open_datagram(const char *host, uint16_t port,
+                          NetAddress &bound) noexcept;
+
+    /// \~english What happened to datagrams.  \~spanish Lo que les paso a los datagramas.  \~
+    const DatagramCounts &datagrams() const noexcept { return dgram_counts_; }
+
     bool submit(const Op &op) noexcept override;
     size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
     const char *name() const noexcept override { return "epoll"; }
@@ -215,6 +247,65 @@ class EpollBackend final : public Backend {
     /// \~english Forgets everything about @p fd.
     /// \~spanish Olvida todo lo de @p fd.  \~
     void forget(int32_t fd) noexcept;
+
+    /// \~english Moves what is ready into @p out; how many now.
+    /// \~spanish Pasa lo que ya esta listo a @p out; cuantas hay ahora.  \~
+    size_t take_ready(Completion *out, size_t cap, size_t made) noexcept;
+
+    /**
+     * @brief
+     * \~english One datagram socket and the operations waiting on it.
+     * \~spanish Un socket de datagramas y las operaciones que esperan en el.
+     * \~
+     *
+     * \~english
+     * Queues and not one note per direction, because a datagram socket is
+     * shared by every peer: many receives wait on it at once, which is what
+     * lets one `recvmmsg` answer them together, and many sends wait for the
+     * next `sendmmsg`.  Two datagrams in two buffers cannot be reordered into
+     * a wrong stream, so the rule that forbids two reads on a stream socket
+     * does not apply.
+     * \~spanish
+     * Colas y no una nota por sentido, porque un socket de datagramas lo
+     * comparten todos los extremos: muchas recepciones esperan en el a la vez,
+     * que es lo que deja que un `recvmmsg` las conteste juntas, y muchos envios
+     * esperan al `sendmmsg` siguiente.  Dos datagramas en dos buffers no se
+     * pueden desordenar en un flujo equivocado, asi que la regla que prohibe dos
+     * lecturas en un socket de flujo no se aplica.
+     * \~
+     */
+    struct DgramSocket;
+
+    /// \~english Takes a datagram operation on socket @p i.
+    /// \~spanish Coge una operacion de datagramas sobre el socket @p i.  \~
+    bool dgram_submit(const Op &op, int32_t i) noexcept;
+
+    /// \~english The events socket @p i wants.  \~spanish Los sucesos que quiere el socket @p i.  \~
+    uint32_t dgram_events(int32_t i) const noexcept;
+
+    /// \~english Sends what waits on socket @p i, completions into the ready list.
+    /// \~spanish Manda lo que espera en el socket @p i, finalizaciones a la lista de listas.  \~
+    void dgram_flush(int32_t i) noexcept;
+
+    /// \~english Answers what socket @p i can answer now; how many went into @p out.
+    /// \~spanish Contesta lo que puede contestar ya el socket @p i; cuantas fueron a @p out.  \~
+    size_t dgram_ready(int32_t i, bool readable, bool writable, Completion *out,
+                       size_t room) noexcept;
+
+    /// \~english Fails everything waiting on socket @p i and forgets it.
+    /// \~spanish Hace fallar todo lo que espera en el socket @p i y lo olvida.  \~
+    void dgram_close(int32_t i) noexcept;
+
+    /// \~english Makes room for the datagram sockets.
+    /// \~spanish Hace sitio para los sockets de datagramas.  \~
+    bool dgram_reset() noexcept;
+
+    /// \~english Closes every datagram socket and gives the room back.
+    /// \~spanish Cierra todos los sockets de datagramas y devuelve el sitio.  \~
+    void dgram_release() noexcept;
+
+    DgramSocket *dgram_ = nullptr;
+    DatagramCounts dgram_counts_;
 
     int queue_ = -1;
     int listener_ = -1;

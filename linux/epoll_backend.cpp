@@ -13,7 +13,7 @@
  * \~
  */
 
-#include "http_vx/epoll_backend.h"
+#include "epoll_waiting.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -31,44 +31,13 @@
 
 namespace http_vx {
 
-/**
- * @brief
- * \~english What one socket is waiting for, in each direction.
- * \~spanish Lo que espera un socket, en cada sentido.
- * \~
- */
-struct EpollBackend::Waiting {
-    Op read;
-    Op write;
-
-    bool has_read;
-    bool has_write;
-
-    /**
-     * \~english
-     * What the queue was last told about this socket, so that it is only told
-     * again when it changed.  An `epoll_ctl` per operation would be a syscall
-     * bought for nothing on every read of a connection that was already being
-     * read from.
-     * \~spanish
-     * Lo ultimo que se le dijo a la cola sobre este socket, para decirselo solo
-     * cuando cambie.  Un `epoll_ctl` por operacion seria una llamada al sistema
-     * comprada para nada en cada lectura de una conexion de la que ya se estaba
-     * leyendo.
-     * \~
-     */
-    uint32_t armed;
-
-    bool known;
-};
-
 namespace {
 
 /// \~english Whether @p kind is one that reads.
 /// \~spanish Si @p kind es de los que leen.  \~
 bool reads(OpKind kind) noexcept {
-    return kind == OpKind::Recv || kind == OpKind::RecvFrom ||
-           kind == OpKind::Accept || kind == OpKind::Ready;
+    return kind == OpKind::Recv || kind == OpKind::Accept ||
+           kind == OpKind::Ready;
 }
 
 /**
@@ -110,6 +79,8 @@ void EpollBackend::release() noexcept {
         ::close(listener_);
         listener_ = -1;
     }
+
+    dgram_release();
 
     if (queue_ >= 0) {
         ::close(queue_);
@@ -158,6 +129,12 @@ bool EpollBackend::reset(BufferPool &pool, uint32_t max_fds) noexcept {
         waiting_[i].has_write = false;
         waiting_[i].armed = 0;
         waiting_[i].known = false;
+        waiting_[i].dgram = -1;
+    }
+
+    if (!dgram_reset()) {
+        release();
+        return false;
     }
 
     return true;
@@ -244,6 +221,7 @@ bool EpollBackend::arm(int32_t fd) noexcept {
     uint32_t want = 0;
     if (w.has_read) want |= EPOLLIN;
     if (w.has_write) want |= EPOLLOUT;
+    if (w.dgram >= 0) want = dgram_events(w.dgram);
 
     if (w.known && w.armed == want) return true;
 
@@ -397,8 +375,20 @@ int EpollBackend::try_now(const Op &op) noexcept {
          * \~ */
         return 0;
 
-    case OpKind::Recv:
-    case OpKind::RecvFrom: {
+    /* \~english
+     * Never here: datagram operations go to their socket's queues in
+     * @c submit, and a stream call on them would read a datagram as a stream.
+     * \~spanish
+     * Nunca aqui: las operaciones de datagramas van a las colas de su socket en
+     * @c submit, y una llamada de flujo sobre ellas leeria un datagrama como un
+     * flujo.
+     * \~ */
+    case OpKind::RecvFrom:
+    case OpKind::SendTo:
+        errno = EINVAL;
+        return -1;
+
+    case OpKind::Recv: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr) return -1;
 
@@ -423,8 +413,7 @@ int EpollBackend::try_now(const Op &op) noexcept {
         return static_cast<int>(n);
     }
 
-    case OpKind::Send:
-    case OpKind::SendTo: {
+    case OpKind::Send: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr) return -1;
         if (op.offset + op.length > b->size()) return -1;
@@ -497,6 +486,9 @@ bool EpollBackend::submit(const Op &want) noexcept {
          * olvidada ahi seria una nota sobre otro.
          * \~ */
         if (op.fd >= 0) {
+            if (static_cast<uint32_t>(op.fd) < max_fds_ &&
+                waiting_[op.fd].dgram >= 0)
+                dgram_close(waiting_[op.fd].dgram);
             forget(op.fd);
             ::close(op.fd);
         }
@@ -505,6 +497,34 @@ bool EpollBackend::submit(const Op &want) noexcept {
 
     if (op.fd < 0 || static_cast<uint32_t>(op.fd) >= max_fds_) {
         last_error_ = EBADF;
+        return remember(op, -1, -1);
+    }
+
+    /* \~english
+     * A datagram operation goes to its socket's queues -- and only on a
+     * socket opened for datagrams.  Anywhere else it is refused, counted: a
+     * stream read answering it would deliver a stream's bytes as a datagram
+     * from nobody.
+     * \~spanish
+     * Una operacion de datagramas va a las colas de su socket -- y solo sobre un
+     * socket abierto para datagramas.  En cualquier otro se rechaza, contada: una
+     * lectura de flujo que la contestara entregaria los bytes de un flujo como un
+     * datagrama de nadie.
+     * \~ */
+    if (op.kind == OpKind::RecvFrom || op.kind == OpKind::SendTo) {
+        const int8_t at = waiting_[op.fd].dgram;
+        if (at >= 0) return dgram_submit(op, at);
+
+        last_error_ = ENOTSOCK;
+        if (op.kind == OpKind::RecvFrom)
+            ++dgram_counts_.receive_errors;
+        else
+            ++dgram_counts_.send_errors;
+        return remember(op, -1, -1);
+    }
+
+    if (waiting_[op.fd].dgram >= 0) {
+        last_error_ = EINVAL;
         return remember(op, -1, -1);
     }
 
@@ -566,19 +586,40 @@ bool EpollBackend::submit(const Op &want) noexcept {
     return remember(op, -1, -1);
 }
 
-size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
-    size_t made = 0;
+size_t EpollBackend::take_ready(Completion *out, size_t cap,
+                                size_t made) noexcept {
+    size_t taken = 0;
 
-    while (made < cap && made < ready_count_) {
-        out[made] = ready_[made];
+    while (made < cap && taken < ready_count_) {
+        out[made] = ready_[taken];
         ++made;
+        ++taken;
     }
 
-    if (made != 0) {
-        for (size_t i = made; i < ready_count_; ++i)
-            ready_[i - made] = ready_[i];
-        ready_count_ -= made;
+    if (taken != 0) {
+        for (size_t i = taken; i < ready_count_; ++i)
+            ready_[i - taken] = ready_[i];
+        ready_count_ -= taken;
     }
+
+    return made;
+}
+
+size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
+    /* \~english
+     * The datagrams waiting to go out go FIRST, all of each socket in one
+     * `sendmmsg`: this is the moment a loop that asked for several sends
+     * hands over, so it is the moment they can leave together.
+     * \~spanish
+     * Los datagramas que esperan a salir van PRIMERO, todos los de cada socket
+     * en un `sendmmsg`: este es el momento en que un bucle que pidio varios
+     * envios los entrega, asi que es el momento en que pueden salir juntos.
+     * \~ */
+    if (dgram_ != nullptr)
+        for (int32_t i = 0; i < static_cast<int32_t>(kMaxDatagramSockets); ++i)
+            dgram_flush(i);
+
+    size_t made = take_ready(out, cap, 0);
 
     if (queue_ < 0 || made == cap) return made;
 
@@ -605,7 +646,20 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
     const int got = epoll_wait(queue_, events, room, ms);
     if (got <= 0) return made;
 
-    for (int i = 0; i < got && made < cap; ++i) {
+    /* \~english
+     * EVERY event is visited, even once @p out is full.  With `EPOLLONESHOT`
+     * the kernel disarmed each descriptor it reported, so one skipped here
+     * would stay disarmed while this end believed it armed -- its operations
+     * parked for ever.  One with no room left does nothing but get re-armed,
+     * and reports again on the next wait.
+     * \~spanish
+     * Se visitan TODOS los sucesos, aunque @p out ya este lleno.  Con
+     * `EPOLLONESHOT` el nucleo desarmo cada descriptor que informo, asi que uno
+     * saltado aqui se quedaria desarmado mientras este extremo lo cree armado --
+     * con sus operaciones guardadas para siempre.  Uno sin sitio no hace nada
+     * mas que rearmarse, y vuelve a informar en la espera siguiente.
+     * \~ */
+    for (int i = 0; i < got; ++i) {
         const int32_t fd = events[i].data.fd;
         if (fd < 0 || static_cast<uint32_t>(fd) >= max_fds_) continue;
 
@@ -643,6 +697,13 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
         const bool broken = (events[i].events & (EPOLLERR | EPOLLHUP)) != 0;
         const bool readable = broken || (events[i].events & EPOLLIN) != 0;
         const bool writable = broken || (events[i].events & EPOLLOUT) != 0;
+
+        if (w.dgram >= 0) {
+            made += dgram_ready(w.dgram, readable, writable, out + made,
+                                cap - made);
+            arm(fd);
+            continue;
+        }
 
         if (readable && w.has_read && made < cap) {
             const Op op = w.read;
@@ -711,7 +772,14 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
         arm(fd);
     }
 
-    return made;
+    /* \~english
+     * And what a socket that became writable just sent is reported now, not
+     * one wait later.
+     * \~spanish
+     * Y lo que acaba de mandar un socket que se pudo escribir se informa ahora,
+     * no una espera despues.
+     * \~ */
+    return take_ready(out, cap, made);
 }
 
 } // namespace http_vx

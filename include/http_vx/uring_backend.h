@@ -72,6 +72,7 @@
 #define HTTP_VX_URING_BACKEND_H
 
 #include "http_vx/buffer_pool.h"
+#include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
 #include <cstddef>
@@ -173,6 +174,40 @@ class UringBackend final : public Backend {
     /// \~spanish En que puerto esta escuchando.  \~
     uint16_t port() const noexcept { return port_; }
 
+    /**
+     * @brief
+     * \~english Opens a UDP socket bound to @p host and @p port, v4 or v6 by what @p host is.
+     * \~spanish Abre un socket UDP atado a @p host y @p port, v4 o v6 segun lo que sea @p host.
+     * \~
+     *
+     * \~english
+     * Kept and closed by the backend.  Each receive is an `IORING_OP_RECVMSG`
+     * and each send an `IORING_OP_SENDMSG`, one datagram each; the batch is
+     * the ring's, every entry written since the last enter handed over in
+     * one.  Here @c DatagramCounts::receive_calls and @c send_calls stay at
+     * zero, because no call is made per datagram: the calls are @c enters.
+     * Multishot receive with provided buffers, which R26 names, is not used --
+     * it hands the kernel a pool of its own, and the pool here is the shard's.
+     * \~spanish
+     * Lo guarda y lo cierra el backend.  Cada recepcion es un
+     * `IORING_OP_RECVMSG` y cada envio un `IORING_OP_SENDMSG`, un datagrama
+     * cada uno; el lote es el del anillo, todas las entradas escritas desde la
+     * ultima entrada entregadas en una.  Aqui @c DatagramCounts::receive_calls y
+     * @c send_calls se quedan en cero, porque no se hace ninguna llamada por
+     * datagrama: las llamadas son @c enters.  La recepcion multishot con buffers
+     * provistos, que nombra la R26, no se usa -- le da al nucleo un pozo propio,
+     * y el pozo de aqui es el del fragmento.
+     * \~
+     *
+     * @return \~english the socket, or -1 with @c last_error set
+     *         \~spanish el socket, o -1 con @c last_error puesto  \~
+     */
+    int32_t open_datagram(const char *host, uint16_t port,
+                          NetAddress &bound) noexcept;
+
+    /// \~english What happened to datagrams.  \~spanish Lo que les paso a los datagramas.  \~
+    const DatagramCounts &datagrams() const noexcept { return dgram_counts_; }
+
     bool submit(const Op &op) noexcept override;
     size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
     const char *name() const noexcept override { return "io_uring"; }
@@ -265,6 +300,36 @@ class UringBackend final : public Backend {
      *                   \~spanish lo que dijo el sistema  \~
      */
     int enter(uint32_t want, int timeout_ms) noexcept;
+
+    /// \~english The message of a datagram in flight, one per slot.
+    /// \~spanish El mensaje de un datagrama en vuelo, uno por sitio.  \~
+    struct DgramMsg;
+
+    /**
+     * @brief
+     * \~english Fills the ring entry @p sqe for datagram operation @p op in slot @p slot.
+     * \~spanish Rellena la entrada del anillo @p sqe para la operacion de datagramas @p op en el sitio @p slot.
+     * \~
+     *
+     * @return \~english false if it cannot be asked for  \~spanish false si no se puede pedir  \~
+     */
+    bool prep_datagram(const Op &op, void *sqe, uint32_t slot) noexcept;
+
+    /// \~english What a datagram operation came to, from the kernel's @p res.
+    /// \~spanish En que quedo una operacion de datagramas, por el @p res del nucleo.  \~
+    int32_t finish_datagram(const Op &op, int32_t res, uint32_t slot) noexcept;
+
+    /// \~english Closes every datagram socket and gives their messages back.
+    /// \~spanish Cierra todos los sockets de datagramas y devuelve sus mensajes.  \~
+    void release_datagrams() noexcept;
+
+    DatagramSockets dgram_;
+
+    /// \~english Allocated with the first datagram socket.
+    /// \~spanish Se reserva con el primer socket de datagramas.  \~
+    DgramMsg *msgs_ = nullptr;
+
+    DatagramCounts dgram_counts_;
 
     Ring *ring_ = nullptr;
 

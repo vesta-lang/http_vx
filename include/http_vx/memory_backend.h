@@ -57,6 +57,7 @@
 #define HTTP_VX_MEMORY_BACKEND_H
 
 #include "http_vx/buffer_pool.h"
+#include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
 #include <cstddef>
@@ -81,6 +82,31 @@ namespace http_vx {
  * \~
  */
 constexpr size_t kMaxPending = 256;
+
+/// \~english How many datagrams wait to be received, and how many sent ones are kept.
+/// \~spanish Cuantos datagramas esperan a recibirse, y cuantos mandados se guardan.  \~
+constexpr size_t kMemoryDatagrams = 16;
+
+/// \~english The largest datagram the memory backend carries.
+/// \~spanish El datagrama mas grande que lleva el backend de memoria.  \~
+constexpr size_t kMemoryDatagramRoom = 2048;
+
+/**
+ * @brief
+ * \~english One datagram in the memory backend, either way.
+ * \~spanish Un datagrama en el backend de memoria, en cualquier sentido.
+ * \~
+ */
+struct MemoryDatagram {
+    DatagramHeader header;
+
+    /// \~english The socket it was sent on; -1 for one received.
+    /// \~spanish El socket por el que se mando; -1 para uno recibido.  \~
+    int32_t fd = -1;
+
+    size_t size = 0;
+    uint8_t bytes[kMemoryDatagramRoom];
+};
 
 /**
  * @brief
@@ -267,8 +293,52 @@ class MemoryBackend final : public Backend {
     /// \~spanish Cuantas esperan para acabar.  \~
     size_t pending() const noexcept { return pending_count_; }
 
+    /**
+     * @brief
+     * \~english The peer sends a datagram on @p path.
+     * \~spanish El otro extremo manda un datagrama por @p path.
+     * \~
+     *
+     * \~english
+     * It waits in order until a @c RecvFrom takes it, as it would in a socket's
+     * receive queue.  A @p flags without @c kDatagramLocalKnown stands in for a
+     * platform that could not say where it was sent.
+     * \~spanish
+     * Espera en orden hasta que lo coja un @c RecvFrom, como en la cola de
+     * recepcion de un socket.  Unos @p flags sin @c kDatagramLocalKnown hacen de
+     * una plataforma que no supo decir a donde se mando.
+     * \~
+     *
+     * @return \~english false if it does not fit  \~spanish false si no cabe  \~
+     */
+    bool feed_datagram(const DatagramPath &path, const uint8_t *p, size_t n,
+                       EcnMark ecn = EcnMark::NotEct,
+                       uint8_t flags = kDatagramLocalKnown |
+                                       kDatagramEcnKnown) noexcept;
+
+    /// \~english How many datagrams have been sent, in order.
+    /// \~spanish Cuantos datagramas se han mandado, en orden.  \~
+    size_t datagrams_out() const noexcept { return dgram_out_count_; }
+
+    /// \~english The @p i -th datagram sent, or null.
+    /// \~spanish El datagrama mandado numero @p i, o nulo.  \~
+    const MemoryDatagram *datagram_out(size_t i) const noexcept {
+        return i < dgram_out_count_ ? &dgram_out_[i] : nullptr;
+    }
+
+    /// \~english What happened to datagrams.  \~spanish Lo que les paso a los datagramas.  \~
+    const DatagramCounts &datagrams() const noexcept { return dgram_counts_; }
+
   private:
     Completion finish(const Op &op) noexcept;
+
+    /// \~english Finishes a @c RecvFrom or a @c SendTo.
+    /// \~spanish Acaba un @c RecvFrom o un @c SendTo.  \~
+    Completion finish_datagram(const Op &op) noexcept;
+
+    /// \~english Whether @p op has to keep waiting.
+    /// \~spanish Si @p op tiene que seguir esperando.  \~
+    bool waiting(const Op &op) const noexcept;
 
     BufferPool *pool_ = nullptr;
 
@@ -313,6 +383,19 @@ class MemoryBackend final : public Backend {
     size_t arrivals_count_ = 0;
 
     size_t closed_ = 0;
+
+    /// \~english The datagrams waiting to be received, as a ring.
+    /// \~spanish Los datagramas esperando a recibirse, en anillo.  \~
+    MemoryDatagram dgram_in_[kMemoryDatagrams];
+    size_t dgram_in_head_ = 0;
+    size_t dgram_in_count_ = 0;
+
+    /// \~english Every datagram sent, in order.
+    /// \~spanish Todos los datagramas mandados, en orden.  \~
+    MemoryDatagram dgram_out_[kMemoryDatagrams];
+    size_t dgram_out_count_ = 0;
+
+    DatagramCounts dgram_counts_;
 
     uint32_t failures_ = 0;
     int32_t failure_ = -1;

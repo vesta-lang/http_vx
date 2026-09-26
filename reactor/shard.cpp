@@ -145,6 +145,7 @@ void Shard::release() noexcept {
         queue_next_ = nullptr;
     }
 
+    datagrams_.release();
     conns_.release();
     pool_.release_all();
     wheel_.release();
@@ -875,6 +876,20 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
     size_t cap = cfg_.batch;
     if (cap > 64) cap = 64;
 
+    /* \~english
+     * The datagram side goes BEFORE the wait: a timer that is due may have
+     * something to send, and what is handed to the backend now goes out in
+     * the same batch the wait submits instead of one turn later.
+     * \~spanish
+     * El lado de datagramas va ANTES de esperar: un temporizador vencido puede
+     * tener algo que mandar, y lo que se le da ahora al backend sale en el mismo
+     * lote que entrega la espera en vez de una vuelta despues.
+     * \~ */
+    if (datagrams_.attached()) {
+        datagrams_.run_timers(now);
+        datagrams_.flush(now);
+    }
+
     const size_t made = io_->wait(done, cap, timeout_ms);
 
     for (size_t i = 0; i < made; ++i) {
@@ -884,13 +899,38 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
 
         case OpKind::Recv:
-        case OpKind::RecvFrom:
             on_read(done[i]);
             break;
 
         case OpKind::Send:
-        case OpKind::SendTo:
             on_write(done[i]);
+            break;
+
+        /* \~english
+         * Datagram completions go to the datagram side, and never to the
+         * connection code: @c conn on them names a socket, not a connection,
+         * and reading it as a connection would hand a datagram's buffer to
+         * whoever sits in that slot.  With no datagram side the buffer still
+         * goes back, which is the one thing that cannot be skipped.
+         * \~spanish
+         * Las finalizaciones de datagramas van al lado de datagramas, y nunca al
+         * codigo de conexiones: su @c conn nombra un socket, no una conexion, y
+         * leerlo como conexion le daria el buffer de un datagrama a quien este en
+         * esa casilla.  Sin lado de datagramas el buffer vuelve igual, que es lo
+         * unico que no se puede saltar.
+         * \~ */
+        case OpKind::RecvFrom:
+            if (datagrams_.attached())
+                datagrams_.on_received(done[i], now);
+            else if (done[i].buffer != kNoBuffer)
+                pool_.release(done[i].buffer);
+            break;
+
+        case OpKind::SendTo:
+            if (datagrams_.attached())
+                datagrams_.on_sent(done[i]);
+            else if (done[i].buffer != kNoBuffer)
+                pool_.release(done[i].buffer);
             break;
 
         case OpKind::Accept:
@@ -901,6 +941,15 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
         }
     }
+
+    /* \~english
+     * And what the datagrams just delivered made the service want to say is
+     * handed over now, so that the next wait sends it.
+     * \~spanish
+     * Y lo que los datagramas recien entregados le hicieron querer decir al
+     * servicio se entrega ahora, para que lo mande la espera siguiente.
+     * \~ */
+    if (datagrams_.attached()) datagrams_.flush(now);
 
     return made;
 }

@@ -135,8 +135,11 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
         c.result = 0;
         return c;
 
-    case OpKind::Recv:
-    case OpKind::RecvFrom: {
+    case OpKind::RecvFrom:
+    case OpKind::SendTo:
+        return finish_datagram(op);
+
+    case OpKind::Recv: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr) {
             c.result = -1;
@@ -193,8 +196,7 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
         return c;
     }
 
-    case OpKind::Send:
-    case OpKind::SendTo: {
+    case OpKind::Send: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr) {
             c.result = -1;
@@ -294,27 +296,7 @@ size_t MemoryBackend::wait(Completion *out, size_t cap,
     for (size_t k = 0; k < was; ++k) {
         const Op op = pending_[(pending_head_ + k) % kMaxPending];
 
-        const bool is_read = op.kind == OpKind::Recv ||
-                             op.kind == OpKind::RecvFrom ||
-                             op.kind == OpKind::Ready;
-
-        /* \~english
-         * An accept waits for a connection the way a read waits for bytes, and
-         * for the same reason: neither is something this end can make happen.
-         * Finishing one that nobody arrived for would be a backend inventing a
-         * client, and the loop above it would spin accepting nothing.
-         * \~spanish
-         * Una aceptacion espera una conexion igual que una lectura espera bytes, y
-         * por lo mismo: ninguna de las dos es algo que pueda provocar este
-         * extremo.  Acabar una a la que no llego nadie seria un backend
-         * inventandose un cliente, y el bucle de encima daria vueltas aceptando
-         * nada.
-         * \~ */
-        const bool waiting = is_read ? in_read_ >= in_len_ && !ended_
-                                     : op.kind == OpKind::Accept &&
-                                           arrivals_count_ == 0;
-
-        const bool ready = !waiting || failures_ != 0;
+        const bool ready = !waiting(op) || failures_ != 0;
 
         if (made < cap && ready) {
             out[made] = finish(op);

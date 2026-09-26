@@ -148,6 +148,21 @@ class StdioBackend final : public Backend {
     /// \~spanish Cuantas esperan para acabar.  \~
     size_t pending() const noexcept { return count_; }
 
+    /**
+     * \~english
+     * How many datagram operations were refused.  A pipe carries a stream and
+     * has no datagrams and no addresses, so a @c RecvFrom or a @c SendTo here
+     * FAILS -- it used to be read and written as a stream, which delivered
+     * bytes with no peer as if they were a datagram from nobody.
+     * \~spanish
+     * Cuantas operaciones de datagramas se rechazaron.  Una tuberia lleva un
+     * flujo y no tiene ni datagramas ni direcciones, asi que un @c RecvFrom o un
+     * @c SendTo aqui FALLA -- antes se leia y escribia como un flujo, que
+     * entregaba bytes sin otro extremo como si fueran un datagrama de nadie.
+     * \~
+     */
+    size_t refused_datagrams() const noexcept { return refused_datagrams_; }
+
   private:
     Completion finish(const Op &op) noexcept;
 
@@ -158,6 +173,8 @@ class StdioBackend final : public Backend {
     Op pending_[kStdioPending];
     size_t head_ = 0;
     size_t count_ = 0;
+
+    size_t refused_datagrams_ = 0;
 
     bool ended_ = false;
 };

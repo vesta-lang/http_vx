@@ -110,8 +110,11 @@ add_library(http_vx_core STATIC
         core/deadline_heap.cpp
         reactor/buffer_pool.cpp
         reactor/conn_table.cpp
+        reactor/datagram.cpp
         reactor/memory_backend.cpp
+        reactor/memory_datagram.cpp
         reactor/shard.cpp
+        reactor/shard_datagram.cpp
         reactor/stdio_backend.cpp
         reactor/timer_wheel.cpp
 )
@@ -382,7 +385,9 @@ target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
 # entrara aqui al lado con la condicion contraria.
 # ---------------------------------------------------------------------------
 if (WIN32)
-    add_library(http_vx_windows STATIC windows/iocp_backend.cpp)
+    add_library(http_vx_windows STATIC
+            windows/iocp_backend.cpp
+            windows/iocp_datagram.cpp)
     target_include_directories(http_vx_windows
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
@@ -401,8 +406,11 @@ endif ()
 # camino que esta roto y no lo sabe.
 if (UNIX)
     add_library(http_vx_linux STATIC
+            linux/datagram_linux.cpp
             linux/epoll_backend.cpp
-            linux/uring_backend.cpp)
+            linux/epoll_datagram.cpp
+            linux/uring_backend.cpp
+            linux/uring_datagram.cpp)
     target_include_directories(http_vx_linux
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
@@ -637,6 +645,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
     http_vx_add_test(test_response tests/test_response.cpp)
     http_vx_add_test(test_shard tests/test_shard.cpp)
+    http_vx_add_test(test_shard_datagram tests/test_shard_datagram.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
     http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
     http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
@@ -658,6 +667,14 @@ if (HTTP_VX_BUILD_TESTS)
         target_link_libraries(test_socket_backend PRIVATE http_vx_linux)
     endif ()
 
+    # Su mitad de datagramas (R26), con la misma regla: los mismos casos contra
+    # cada backend que haya, por IPv4 y por IPv6.
+    http_vx_add_test(test_socket_datagram tests/test_socket_datagram.cpp)
+    if (WIN32)
+        target_link_libraries(test_socket_datagram PRIVATE http_vx_windows)
+    else ()
+        target_link_libraries(test_socket_datagram PRIVATE http_vx_linux)
+    endif ()
 endif ()
 
 # ---------------------------------------------------------------------------

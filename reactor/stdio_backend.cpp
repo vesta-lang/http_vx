@@ -88,8 +88,20 @@ Completion StdioBackend::finish(const Op &op) noexcept {
          * \~ */
         return c;
 
-    case OpKind::Recv:
-    case OpKind::RecvFrom: {
+    case OpKind::RecvFrom:
+    case OpKind::SendTo:
+        /* \~english
+         * Refused, and counted.  A pipe has no datagrams, and answering as a
+         * stream would hand up bytes with no sender as if they were one.
+         * \~spanish
+         * Rechazado, y contado.  Una tuberia no tiene datagramas, y contestar
+         * como flujo entregaria bytes sin remitente como si fueran uno.
+         * \~ */
+        ++refused_datagrams_;
+        c.result = -1;
+        return c;
+
+    case OpKind::Recv: {
         if (b == nullptr || in_ < 0) {
             c.result = -1;
             return c;
@@ -144,8 +156,7 @@ Completion StdioBackend::finish(const Op &op) noexcept {
         return c;
     }
 
-    case OpKind::Send:
-    case OpKind::SendTo: {
+    case OpKind::Send: {
         if (b == nullptr || out_ < 0 || op.offset + op.length > b->size()) {
             c.result = -1;
             return c;

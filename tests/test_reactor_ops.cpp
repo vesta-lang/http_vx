@@ -496,9 +496,224 @@ void test_an_idle_read_does_not_hold_up_a_write() {
           "the response did not go out");
 }
 
+/// \~english A made-up address of @p len bytes, all @p fill.
+/// \~spanish Una direccion inventada de @p len bytes, todos @p fill.  \~
+http_vx::NetAddress made_up(uint8_t fill, uint8_t len) {
+    http_vx::NetAddress a;
+    std::memset(a.bytes, fill, len);
+    a.len = len;
+    return a;
+}
+
+/**
+ * @brief
+ * \~english A datagram comes back with who sent it and to where, not as a stream read.
+ * \~spanish Un datagrama vuelve con quien lo mando y a donde, no como una lectura de flujo.
+ * \~
+ *
+ * \~english
+ * Before, a @c RecvFrom was served as a @c Recv: it read the stream's bytes
+ * and no address came back at all.
+ * \~spanish
+ * Antes, un @c RecvFrom se servia como un @c Recv: leia los bytes del flujo y
+ * no volvia ninguna direccion.
+ * \~
+ */
+void test_a_datagram_comes_back_with_its_path() {
+    Shard s;
+
+    http_vx::DatagramPath path;
+    path.peer = made_up(0xAA, 16);
+    path.local = made_up(0xBB, 16);
+
+    check(s.io.feed_datagram(path, reinterpret_cast<const uint8_t *>("ping"), 4,
+                             http_vx::EcnMark::Ce),
+          "the datagram would not fit");
+
+    /* \~english
+     * Stream bytes waiting at the same time must not be what a datagram
+     * receive takes.
+     * \~spanish
+     * Unos bytes de flujo esperando a la vez no pueden ser lo que coge una
+     * recepcion de datagramas.
+     * \~ */
+    check(s.io.feed(reinterpret_cast<const uint8_t *>("stream"), 6),
+          "the stream bytes would not fit");
+
+    const uint32_t b = s.pool.acquire();
+
+    Op op;
+    op.kind = OpKind::RecvFrom;
+    op.buffer = b;
+    op.length = 1500;
+    check(s.io.submit(op), "the receive was not taken");
+
+    Completion done[4];
+    check(s.io.wait(done, 4, 0) == 1, "the receive did not finish");
+    check(done[0].ok() && done[0].result == 4, "the datagram's size is wrong");
+
+    Buffer *buf = s.pool.at(b);
+    http_vx::DatagramHeader h;
+    check(buf != nullptr && http_vx::datagram_header(*buf, h),
+          "the datagram came back without its header");
+    check(http_vx::same_net_address(h.path.peer, path.peer),
+          "the peer's address did not come back");
+    check(http_vx::same_net_address(h.path.local, path.local),
+          "the local address did not come back");
+    check(h.ecn == http_vx::EcnMark::Ce, "the ECN mark did not come back");
+    check(buf != nullptr && http_vx::datagram_size(*buf) == 4 &&
+              std::memcmp(http_vx::datagram_payload(*buf), "ping", 4) == 0,
+          "the payload is not the datagram's");
+}
+
+/**
+ * @brief
+ * \~english An empty datagram is not the end of anything, and a cut one is not delivered.
+ * \~spanish Un datagrama vacio no es el final de nada, y uno cortado no se entrega.
+ * \~
+ */
+void test_empty_and_cut_datagrams() {
+    Shard s;
+
+    http_vx::DatagramPath path;
+    path.peer = made_up(1, 16);
+
+    uint8_t big[64];
+    std::memset(big, 'x', sizeof big);
+
+    check(s.io.feed_datagram(path, nullptr, 0), "the empty one would not fit");
+    check(s.io.feed_datagram(path, big, sizeof big), "the big one would not fit");
+
+    uint32_t bufs[2];
+    for (int i = 0; i < 2; ++i) {
+        bufs[i] = s.pool.acquire();
+        Op op;
+        op.kind = OpKind::RecvFrom;
+        op.buffer = bufs[i];
+        op.length = 16;
+        check(s.io.submit(op), "a receive was not taken");
+    }
+
+    Completion done[4];
+    check(s.io.wait(done, 4, 0) == 2, "the receives did not finish");
+
+    check(done[0].ok() && done[0].result == 0, "the empty datagram failed");
+    check(!done[0].eof(), "an empty datagram was taken for the end of a stream");
+
+    check(!done[1].ok(), "a cut datagram was reported as a success");
+    check(done[1].truncated(), "a cut datagram was not said to be cut");
+    check(s.pool.at(bufs[1])->empty(), "a cut datagram was left in its buffer");
+    check(s.io.datagrams().truncated == 1, "the cut was not counted");
+
+    /* \~english
+     * And the cut result means nothing on any other kind.
+     * \~spanish
+     * Y el resultado de corte no quiere decir nada en ninguna otra clase.
+     * \~ */
+    Completion other;
+    other.kind = OpKind::Recv;
+    other.result = http_vx::kTruncated;
+    check(!other.truncated(), "a stream read was said to be a cut datagram");
+
+    other.kind = OpKind::RecvFrom;
+    other.result = -1;
+    check(!other.truncated(), "a failed receive was said to be a cut datagram");
+
+    /* \~english
+     * A send whose length is not the datagram's is refused, not sent short
+     * or long.
+     * \~spanish
+     * Un envio cuya longitud no es la del datagrama se rechaza, no se manda ni
+     * corto ni largo.
+     * \~ */
+    Buffer *out = s.pool.at(bufs[0]);
+    out->recycle();
+    uint8_t *room = http_vx::datagram_reserve(*out, 16);
+    std::memcpy(room, "12345", 5);
+    http_vx::DatagramHeader h;
+    h.path.peer = made_up(2, 16);
+    http_vx::datagram_commit(*out, h, 5);
+
+    Op send;
+    send.kind = OpKind::SendTo;
+    send.buffer = bufs[0];
+    send.length = 4;
+    check(s.io.submit(send), "the send was not taken");
+    check(s.io.wait(done, 4, 0) == 1 && !done[0].ok(),
+          "a send of the wrong length went out");
+    check(s.io.datagrams_out() == 0 && s.io.datagrams().send_errors == 1,
+          "the refused send was not counted");
+}
+
+/**
+ * @brief
+ * \~english The small rules a datagram buffer and an ECN byte are read by.
+ * \~spanish Las reglas pequenas con las que se leen un buffer de datagrama y un byte ECN.
+ * \~
+ */
+void test_the_datagram_helpers() {
+    /* \~english
+     * RFC 3168, 5: ECT(1) is 01 and ECT(0) is 10 -- the swap a pass-through
+     * would get wrong -- and only the two low bits count.
+     * \~spanish
+     * RFC 3168, 5: ECT(1) es 01 y ECT(0) es 10 -- el cambio que se equivocaria
+     * pasandolos tal cual -- y solo cuentan los dos bits bajos.
+     * \~ */
+    check(http_vx::ecn_from_tos(0x00) == http_vx::EcnMark::NotEct, "00 is not Not-ECT");
+    check(http_vx::ecn_from_tos(0x01) == http_vx::EcnMark::Ect1, "01 is not ECT(1)");
+    check(http_vx::ecn_from_tos(0x02) == http_vx::EcnMark::Ect0, "10 is not ECT(0)");
+    check(http_vx::ecn_from_tos(0xB7) == http_vx::EcnMark::Ce, "11 is not CE");
+
+    BufferPool pool;
+    pool.reset(1, 1 << 20);
+    Buffer *b = pool.at(pool.acquire());
+
+    uint8_t *room = http_vx::datagram_reserve(*b, 32);
+    check(room != nullptr, "an empty buffer had no room for a datagram");
+    http_vx::DatagramHeader h;
+    h.path.peer = made_up(7, 16);
+    std::memcpy(room, "abc", 3);
+    http_vx::datagram_commit(*b, h, 3);
+
+    check(http_vx::datagram_size(*b) == 3, "the payload's size is wrong");
+    check(http_vx::datagram_reserve(*b, 32) == nullptr,
+          "a second datagram was put behind the first");
+
+    http_vx::DatagramHeader back;
+    check(http_vx::datagram_header(*b, back) &&
+              http_vx::same_net_address(back.path.peer, h.path.peer),
+          "the header did not come back");
+
+    Buffer small;
+    check(!http_vx::datagram_header(small, back),
+          "a buffer with no datagram gave a header");
+
+    check(!http_vx::same_net_address(made_up(7, 16), made_up(7, 28)),
+          "addresses of two lengths were the same");
+    check(!http_vx::same_net_address(made_up(7, 16), made_up(8, 16)),
+          "two different addresses were the same");
+
+    /* \~english
+     * A closed socket is forgotten, and the one moved into its place is
+     * still found.
+     * \~spanish
+     * Un socket cerrado se olvida, y el que se mueve a su sitio se sigue
+     * encontrando.
+     * \~ */
+    http_vx::DatagramSockets set;
+    check(set.add(5, made_up(1, 16)) && set.add(6, made_up(2, 28)), "sockets not added");
+    set.remove(5);
+    check(set.find(5) < 0, "a removed socket is still found");
+    check(set.find(6) == 0 && set.bound(0).len == 28, "the other socket was lost");
+    check(!set.add(-1, made_up(1, 16)), "a socket that is none was added");
+}
+
 } // namespace
 
 int main() {
+    test_the_datagram_helpers();
+    test_a_datagram_comes_back_with_its_path();
+    test_empty_and_cut_datagrams();
     test_a_read_comes_back_with_the_bytes();
     test_a_completion_that_arrives_too_late();
     test_a_partial_write_names_what_is_left();

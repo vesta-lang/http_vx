@@ -66,6 +66,7 @@
 
 #include "http_vx/buffer_pool.h"
 #include "http_vx/conn_table.h"
+#include "http_vx/datagram_service.h"
 #include "http_vx/reactor_ops.h"
 #include "http_vx/timer_wheel.h"
 
@@ -443,6 +444,45 @@ class Shard {
     /// \~english The deadlines.  \~spanish Los plazos.  \~
     TimerWheel &deadlines() noexcept { return wheel_; }
 
+    /**
+     * @brief
+     * \~english Gives the shard a datagram side, driven by @p service.
+     * \~spanish Le da al fragmento un lado de datagramas, movido por @p service.
+     * \~
+     *
+     * \~english
+     * After @c reset, which is where the backend and the pool come from.  From
+     * here on @c poll also runs the service's timer, keeps receives posted on
+     * every socket added, and pulls what the service has to send -- and the
+     * @c now it is given is handed to the service as it is.
+     * \~spanish
+     * Despues de @c reset, que es de donde salen el backend y el pozo.  A partir
+     * de aqui @c poll tambien ejecuta el temporizador del servicio, mantiene
+     * puestas las recepciones de cada socket anadido, y saca lo que el servicio
+     * tenga que mandar -- y el @c now que recibe se le pasa al servicio tal cual.
+     * \~
+     *
+     * @return \~english false before @c reset or for a configuration that cannot work
+     *         \~spanish false antes de @c reset o para una configuracion que no puede funcionar  \~
+     */
+    bool attach_datagrams(DatagramService &service,
+                          const DatagramConfig &cfg) noexcept;
+
+    /**
+     * @brief
+     * \~english Starts receiving datagrams on @p fd, which the backend opened.
+     * \~spanish Empieza a recibir datagramas por @p fd, que abrio el backend.
+     * \~
+     *
+     * @param fd    \~english the socket  \~spanish el socket  \~
+     * @param bound \~english the address the backend bound it to
+     *              \~spanish la direccion a la que lo ato el backend  \~
+     */
+    bool add_datagram_socket(int32_t fd, const NetAddress &bound) noexcept;
+
+    /// \~english The datagram side.  \~spanish El lado de datagramas.  \~
+    ShardDatagrams &datagrams() noexcept { return datagrams_; }
+
     /// \~english Gives the memory back.  \~spanish Devuelve la memoria.  \~
     void release() noexcept;
 
@@ -531,6 +571,7 @@ class Shard {
     ConnTable conns_;
     BufferPool pool_;
     TimerWheel wheel_;
+    ShardDatagrams datagrams_;
 
     /**
      * \~english

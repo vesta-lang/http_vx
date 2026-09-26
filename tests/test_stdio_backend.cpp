@@ -487,9 +487,58 @@ void test_an_answer_goes_out_while_the_peer_waits() {
           "the peer did not get the answer while it was still waiting");
 }
 
+/**
+ * @brief
+ * \~english A datagram asked of a pipe is refused, and the stream is left alone.
+ * \~spanish Un datagrama pedido a una tuberia se rechaza, y el flujo no se toca.
+ * \~
+ *
+ * \~english
+ * A pipe has no datagrams and no senders.  It used to answer a @c RecvFrom as
+ * a read, taking the stream's bytes and handing them up as a datagram from
+ * nobody -- and the stream then missed them.
+ * \~spanish
+ * Una tuberia no tiene datagramas ni remitentes.  Antes contestaba un
+ * @c RecvFrom como una lectura, llevandose los bytes del flujo y entregandolos
+ * como un datagrama de nadie -- y al flujo le faltaban despues.
+ * \~
+ */
+void test_a_pipe_has_no_datagrams() {
+    int fds[2];
+    if (HTTP_VX_PIPE(fds) != 0) {
+        check(false, "the pipe could not be made");
+        return;
+    }
+    HTTP_VX_WRITE(fds[1], "abc", 3);
+
+    http_vx::BufferPool pool;
+    pool.reset(2, 1 << 20);
+    StdioBackend io(pool, fds[0], fds[1]);
+
+    http_vx::Op op;
+    op.kind = http_vx::OpKind::RecvFrom;
+    op.buffer = pool.acquire();
+    op.length = 64;
+    check(io.submit(op), "the datagram receive was not taken");
+
+    http_vx::Completion done[2];
+    check(io.wait(done, 2, 0) == 1, "the datagram receive was not answered");
+    check(!done[0].ok(), "a pipe delivered a datagram");
+    check(io.refused_datagrams() == 1, "the refusal was not counted");
+
+    op.kind = http_vx::OpKind::Recv;
+    check(io.submit(op), "the read was not taken");
+    check(io.wait(done, 2, 0) == 1 && done[0].result == 3,
+          "the stream lost the bytes the datagram receive was refused");
+
+    HTTP_VX_CLOSE(fds[0]);
+    HTTP_VX_CLOSE(fds[1]);
+}
+
 } // namespace
 
 int main() {
+    test_a_pipe_has_no_datagrams();
     test_an_answer_goes_out_while_the_peer_waits();
     test_a_request_over_descriptors();
     test_several_over_one_descriptor();

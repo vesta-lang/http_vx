@@ -37,20 +37,7 @@
  * Vista, porque es donde aparece `GetQueuedCompletionStatusEx`, y coger las
  * finalizaciones de una en una es justo lo que la R18 existe para evitar.
  * \~ */
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#ifndef WINVER
-#define WINVER 0x0600
-#endif
-
-#include <winsock2.h>
-
-#include <mswsock.h>
-#include <windows.h>
-#include <ws2tcpip.h>
-
-#include "http_vx/iocp_backend.h"
+#include "iocp_context.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -62,102 +49,11 @@ namespace http_vx {
 
 namespace {
 
-/**
- * @brief
- * \~english How much room `AcceptEx` needs for the two addresses.
- * \~spanish Cuanto sitio necesita `AcceptEx` para las dos direcciones.
- * \~
- *
- * \~english
- * Sixteen bytes more than the address on each side, and the sixteen are not
- * slack: `AcceptEx` is documented to require them and writing exactly the size
- * of a `sockaddr` fails with a message about a parameter rather than about a
- * buffer.  The address is the v6 one because it is the larger, so the same room
- * serves both families.
- *
- * \~spanish
- * Dieciseis bytes mas que la direccion en cada lado, y los dieciseis no son
- * holgura: `AcceptEx` los exige por documentacion, y darle exactamente el tamano
- * de un `sockaddr` falla con un mensaje sobre un parametro y no sobre un buffer.
- * La direccion es la de v6 por ser la mayor, asi que el mismo sitio sirve para
- * las dos familias.
- *
- * \~
- */
-constexpr size_t kAddressRoom = sizeof(sockaddr_in6) + 16;
-
 /// \~english What a socket handle is when there is none.
 /// \~spanish Lo que es un socket cuando no hay ninguno.  \~
 constexpr uintptr_t kNoSocket = static_cast<uintptr_t>(INVALID_SOCKET);
 
-/// \~english Turns a socket into the number the rest of the project uses.
-/// \~spanish Convierte un socket en el numero que usa el resto del proyecto.  \~
-int32_t as_fd(SOCKET s) noexcept { return static_cast<int32_t>(s); }
-
-/// \~english And back.  \~spanish Y al reves.  \~
-SOCKET as_socket(int32_t fd) noexcept { return static_cast<SOCKET>(fd); }
-
 } // namespace
-
-/**
- * @brief
- * \~english One operation the kernel is holding, and everything it must keep alive.
- * \~spanish Una operacion que tiene el nucleo, y todo lo que tiene que mantener vivo.
- * \~
- *
- * \~english
- * The `OVERLAPPED` goes FIRST, and that is not style: what a completion hands
- * back is a pointer to it, and this is turned back into the record around it by
- * a cast.  A field moved in front of it would turn every completion into a read
- * of the wrong object, and it would keep working for as long as the compiler
- * happened to lay things out kindly.
- *
- * \~spanish
- * El `OVERLAPPED` va PRIMERO, y no es estilo: lo que devuelve una finalizacion es
- * un puntero a el, y esto se vuelve a convertir en el registro que lo rodea con
- * un cast.  Un campo puesto delante convertiria cada finalizacion en la lectura
- * del objeto equivocado, y seguiria funcionando mientras el compilador colocara
- * las cosas por casualidad de forma amable.
- *
- * \~
- */
-struct IocpBackend::Context {
-    OVERLAPPED ov;
-
-    /// \~english What was asked for.  \~spanish Lo que se pidio.  \~
-    Op op;
-
-    /**
-     * \~english
-     * The socket an @c Accept is accepting INTO.  Windows wants it made before
-     * the accept is asked for, which is the opposite of every other platform
-     * and is the reason accepting needs a record at all.
-     * \~spanish
-     * El socket EN EL QUE acepta un @c Accept.  Windows lo quiere hecho antes de
-     * pedir la aceptacion, que es al reves que en cualquier otra plataforma y es
-     * la razon de que aceptar necesite un registro siquiera.
-     * \~
-     */
-    SOCKET sock;
-
-    /// \~english The next free record.  \~spanish El registro libre siguiente.  \~
-    uint32_t next;
-
-    /**
-     * \~english
-     * Where `AcceptEx` writes the two addresses.  Nobody here reads them --
-     * this server does not care who connected, and a connection that has to say
-     * will say it in a field -- but the call will not run without somewhere to
-     * put them.
-     * \~spanish
-     * Donde escribe `AcceptEx` las dos direcciones.  Aqui no las lee nadie --
-     * a este servidor no le importa quien se conecto, y una conexion que tenga
-     * que decirlo lo dira en una cabecera -- pero la llamada no corre sin un
-     * sitio donde ponerlas.
-     * \~
-     */
-    uint8_t addrs[2 * kAddressRoom];
-};
 
 IocpBackend::~IocpBackend() { release(); }
 
@@ -166,6 +62,8 @@ void IocpBackend::release() noexcept {
         closesocket(static_cast<SOCKET>(listener_));
         listener_ = kNoSocket;
     }
+
+    close_datagrams();
 
     /* \~english
      * The port is closed before the records are given back, and the order
@@ -516,7 +414,10 @@ bool IocpBackend::start_send(const Op &op, Context *c) noexcept {
 }
 
 bool IocpBackend::start_close(const Op &op) noexcept {
-    if (op.fd >= 0) closesocket(as_socket(op.fd));
+    if (op.fd >= 0) {
+        dgram_.remove(op.fd);
+        closesocket(as_socket(op.fd));
+    }
 
     /* \~english
      * Closing is the one operation that finishes where it is asked for: there
@@ -556,13 +457,19 @@ bool IocpBackend::submit(const Op &op) noexcept {
         break;
 
     case OpKind::Recv:
-    case OpKind::RecvFrom:
         started = start_recv(op, c);
         break;
 
     case OpKind::Send:
-    case OpKind::SendTo:
         started = start_send(op, c);
+        break;
+
+    case OpKind::RecvFrom:
+        started = start_recv_from(op, c);
+        break;
+
+    case OpKind::SendTo:
+        started = start_send_to(op, c);
         break;
 
     case OpKind::Close:
@@ -668,7 +575,9 @@ size_t IocpBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
         const BOOL fine =
             WSAGetOverlappedResult(on, &c->ov, &moved, FALSE, &flags);
 
-        if (fine == FALSE) {
+        if (c->op.kind == OpKind::RecvFrom || c->op.kind == OpKind::SendTo) {
+            done.result = finish_datagram(c, fine != FALSE, moved, flags);
+        } else if (fine == FALSE) {
             done.result = -1;
 
             if (c->op.kind == OpKind::Accept && c->sock != INVALID_SOCKET)
@@ -712,8 +621,7 @@ size_t IocpBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
              * llegaron.  El sitio se reservo al pedir la lectura; lo que no llego
              * no es parte de nada.
              * \~ */
-            if (moved != 0 && (c->op.kind == OpKind::Recv ||
-                               c->op.kind == OpKind::RecvFrom)) {
+            if (moved != 0 && c->op.kind == OpKind::Recv) {
                 Buffer *b = pool_ == nullptr ? nullptr : pool_->at(c->op.buffer);
                 if (b != nullptr) b->commit(moved);
             }

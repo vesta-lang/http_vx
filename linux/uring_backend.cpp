@@ -176,6 +176,19 @@ void UringBackend::release() noexcept {
         listener_ = -1;
     }
 
+    /* \~english
+     * Before the ring goes: the sockets are closed while the kernel can still
+     * finish what it holds on them, and their messages are freed only after
+     * the ring -- the one thing that could still write into them -- is gone.
+     * \~spanish
+     * Antes de que se vaya el anillo: los sockets se cierran mientras el nucleo
+     * todavia puede acabar lo que tiene sobre ellos, y sus mensajes se liberan
+     * solo despues, cuando ya no esta el anillo -- lo unico que podria seguir
+     * escribiendo en ellos.
+     * \~ */
+    for (size_t i = 0; i < dgram_.count(); ++i) close(dgram_.fd(i));
+    dgram_.clear();
+
     if (ring_ != nullptr) {
         if (ring_->sqes != nullptr) munmap(ring_->sqes, ring_->sqes_size);
         if (ring_->rings != nullptr) munmap(ring_->rings, ring_->rings_size);
@@ -188,6 +201,8 @@ void UringBackend::release() noexcept {
         close(fd_);
         fd_ = -1;
     }
+
+    release_datagrams();
 
     if (slots_ != nullptr) {
         for (uint32_t i = 0; i < slot_count_; ++i) slots_[i].~Slot();
@@ -497,8 +512,12 @@ bool UringBackend::submit(const Op &op) noexcept {
         sqe->poll32_events = POLLIN;
         break;
 
-    case OpKind::Recv:
-    case OpKind::RecvFrom: {
+    case OpKind::RecvFrom:
+    case OpKind::SendTo:
+        made = prep_datagram(op, sqe, static_cast<uint32_t>(slot - slots_));
+        break;
+
+    case OpKind::Recv: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr || op.fd < 0) {
             made = false;
@@ -528,8 +547,7 @@ bool UringBackend::submit(const Op &op) noexcept {
         break;
     }
 
-    case OpKind::Send:
-    case OpKind::SendTo: {
+    case OpKind::Send: {
         Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
         if (b == nullptr || op.fd < 0 || op.offset + op.length > b->size()) {
             made = false;
@@ -549,6 +567,7 @@ bool UringBackend::submit(const Op &op) noexcept {
             made = false;
             break;
         }
+        dgram_.remove(op.fd);
         sqe->opcode = IORING_OP_CLOSE;
         sqe->fd = op.fd;
         break;
@@ -709,11 +728,12 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
              * nada.
              * \~ */
             done.result = res < 0 ? -1 : 0;
+        } else if (op.kind == OpKind::RecvFrom || op.kind == OpKind::SendTo) {
+            done.result = finish_datagram(op, res, static_cast<uint32_t>(which));
         } else {
             done.result = res;
 
-            if (res > 0 && (op.kind == OpKind::Recv ||
-                            op.kind == OpKind::RecvFrom)) {
+            if (res > 0 && op.kind == OpKind::Recv) {
                 Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
                 if (b != nullptr) b->commit(static_cast<size_t>(res));
             }
