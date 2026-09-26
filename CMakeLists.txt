@@ -151,6 +151,7 @@ add_library(http_vx_proto STATIC
 
         proto/h3/qpack.cpp
         proto/h3/qpack_decoder.cpp
+        proto/h3/qpack_encoder.cpp
         proto/h3/qpack_table.cpp
 )
 target_include_directories(http_vx_proto
@@ -532,6 +533,7 @@ if (HTTP_VX_BUILD_TESTS)
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_qpack tests/test_qpack.cpp)
+    http_vx_add_test(test_qpack_encoder tests/test_qpack_encoder.cpp)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
