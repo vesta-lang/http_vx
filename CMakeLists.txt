@@ -262,6 +262,7 @@ target_link_libraries(http_vx_h3 PUBLIC http_vx_proto http_vx_quic http_vx_core 
 add_library(http_vx_h3_service STATIC
         proto/h3/service.cpp
         proto/h3/service_requests.cpp
+        proto/h3/service_datagrams.cpp
         proto/h3/service_route.cpp
 )
 target_include_directories(http_vx_h3_service
@@ -428,10 +429,10 @@ endif ()
 # Va aqui y no al lado de `http_vx_serve` porque es lo unico del proyecto que
 # enlaza una libreria de plataforma, y esas se definen justo arriba.
 # ---------------------------------------------------------------------------
-add_executable(http_vx_listen serve/listen.cpp serve/tls_setup.cpp)
+add_executable(http_vx_listen serve/listen.cpp serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp)
 target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_listen PRIVATE http_vx_tls_stream http_vx_proto http_vx_core)
+target_link_libraries(http_vx_listen PRIVATE http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core)
 # HTTPS con los proveedores que haya; sin ninguno, `--tls` se niega a arrancar (R24).
 if (TARGET http_vx_crypto_openssl)
     target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_openssl)
@@ -626,6 +627,8 @@ if (HTTP_VX_BUILD_TESTS)
     target_link_libraries(test_h3_frame PRIVATE http_vx_h3)
     http_vx_add_test(test_h3_connection tests/test_h3_connection.cpp)
     target_link_libraries(test_h3_connection PRIVATE http_vx_h3)
+    http_vx_add_test(test_http3_datagrams tests/test_http3_datagrams.cpp)
+    target_link_libraries(test_http3_datagrams PRIVATE http_vx_h3_service)
     http_vx_add_test(test_quic_fuzz tests/test_quic_fuzz.cpp)
     target_link_libraries(test_quic_fuzz PRIVATE http_vx_h3_service)
     http_vx_add_test(test_quic_routes tests/test_quic_routes.cpp)

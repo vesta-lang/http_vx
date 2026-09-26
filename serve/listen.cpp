@@ -86,6 +86,8 @@
  */
 
 #include "serve/greeting.h"
+#include "serve/h3_setup.h"
+#include "serve/report.h"
 #include "serve/tls_setup.h"
 
 #include "http_vx/http2_service.h"
@@ -215,6 +217,25 @@ struct Reactors {
         return true;
 #endif
     }
+
+    /// \~english A UDP socket on the backend chosen, for HTTP/3; -1, with error, if it cannot be had.
+    /// \~spanish Un socket UDP en el backend elegido, para HTTP/3; -1, con error, si no se puede tener.  \~
+    int32_t open_udp(const char *host, uint16_t on, http_vx::NetAddress &bound) {
+#ifdef _WIN32
+        const int32_t fd = iocp.open_datagram(host, on, bound);
+        if (fd < 0) error = iocp.last_error();
+#else
+        int32_t fd = -1;
+        if (io == &uring) {
+            fd = uring.open_datagram(host, on, bound);
+            if (fd < 0) error = uring.last_error();
+        } else {
+            fd = epoll.open_datagram(host, on, bound);
+            if (fd < 0) error = epoll.last_error();
+        }
+#endif
+        return fd;
+    }
 };
 
 /**
@@ -274,6 +295,8 @@ struct Options {
     const char *cert = nullptr;
     const char *key = nullptr;
     const char *provider = nullptr;
+    /// \~english HTTP/3 on UDP, same address and port.  \~spanish HTTP/3 sobre UDP, misma direccion y puerto.  \~
+    bool h3 = false;
     const char *error = nullptr;
 
     /// \~english Reads @p argv; a flag without its values is an error, said.
@@ -293,6 +316,8 @@ struct Options {
                     return;
                 }
                 provider = argv[++i];
+            } else if (std::strcmp(argv[i], "--h3") == 0) {
+                h3 = true;
             } else if (count < 3) {
                 positional[count++] = argv[i];
             } else {
@@ -301,6 +326,9 @@ struct Options {
             }
         }
         if (provider != nullptr && cert == nullptr) error = "--tls-provider without --tls";
+        // \~english HTTP/3 is always encrypted: QUIC carries TLS 1.3 inside it (RFC 9001).
+        // \~spanish HTTP/3 va siempre cifrado: QUIC lleva TLS 1.3 dentro (RFC 9001).  \~
+        if (h3 && cert == nullptr) error = "--h3 needs --tls: QUIC has no unencrypted form";
     }
 };
 
@@ -449,6 +477,31 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "http_vx: listening on %s:%u, %s backend\n", host,
                  static_cast<unsigned>(reactors.port), reactors.io->name());
 
+    // \~english HTTP/3: the same identity as TLS over TCP, on UDP at the port TCP got.
+    // \~spanish HTTP/3: la misma identidad que TLS sobre TCP, sobre UDP en el puerto que obtuvo TCP.  \~
+    serve::H3Setup h3(now_us);
+    if (opt.h3) {
+        http_vx::NetAddress bound;
+        const int32_t udp = reactors.open_udp(host, reactors.port, bound);
+        if (udp < 0) {
+            std::fprintf(stderr, "http_vx: cannot open UDP on %s:%u (error %d)\n", host,
+                         static_cast<unsigned>(reactors.port), reactors.error);
+            return 1;
+        }
+        http_vx::DatagramConfig dcfg;
+        dcfg.receives = 16;
+        if (!h3.start(tls_setup, greeting, cfg.connections) || !shard.attach_datagrams(h3.datagrams(), dcfg) ||
+            !shard.add_datagram_socket(udp, bound)) {
+            std::fprintf(stderr, "http_vx: cannot serve HTTP/3: %s\n",
+                         h3.why() != nullptr ? h3.why() : "the shard would not take the datagram side");
+            return 1;
+        }
+        std::fprintf(stderr, "http_vx: HTTP/3 on udp %s:%u, 0-RTT after the replay window (%llu s)\n", host,
+                     static_cast<unsigned>(reactors.port),
+                     static_cast<unsigned long long>(serve::H3Setup::kReplayWindowMs / 1000));
+    }
+    serve::Report report;
+
     uint64_t last = now_ticks();
 
     for (;;) {
@@ -469,7 +522,11 @@ int main(int argc, char **argv) {
          * amontonan son las que dejaron de hablar.
          * \~ */
         tls_service.set_clock(now_us());
-        shard.poll(now_ticks(), 250);
+        // \~english QUIC's timers are finer than a tick: the wait ends when the next one is due.
+        // \~spanish Los temporizadores de QUIC son mas finos que un tic: la espera acaba cuando vence el siguiente.  \~
+        shard.poll(now_ticks(), opt.h3 ? h3.datagrams().wait_ms(250) : 250);
+        if (opt.cert != nullptr) report.tls(tls_service);
+        if (opt.h3) report.h3(h3.service());
 
         const uint64_t now = now_ticks();
         if (now != last) {
