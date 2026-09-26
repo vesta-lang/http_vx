@@ -78,47 +78,6 @@ Pseudo pseudo_of(const uint8_t *name, size_t len) noexcept {
     return Pseudo::None;
 }
 
-constexpr uint64_t bit(FieldId id) noexcept {
-    return uint64_t{1} << static_cast<unsigned>(id);
-}
-
-/**
- * @brief
- * \~english The fields HTTP/2 has no place for.
- * \~spanish Las cabeceras para las que HTTP/2 no tiene sitio.
- * \~
- *
- * \~english
- * They all describe a single hop of a single connection -- how it is framed,
- * whether it is kept, what it might turn into -- and HTTP/2 answers all of
- * those itself, at the frame layer, for the whole connection at once.  A
- * message that carries one is a message from HTTP/1.1 wearing HTTP/2's
- * clothes, and forwarding it would let an intermediary be told two different
- * things about the same connection by the same peer.
- *
- * `proxy-connection` is in here, which is why it is in @c FieldId at all: it
- * was never a real field, it was a mistake that spread, and the only reason to
- * recognise it is to be able to refuse it by name.
- *
- * \~spanish
- * Todas describen un salto de una conexion -- como se trocea, si se conserva,
- * en que puede convertirse -- y HTTP/2 contesta a todo eso el mismo, en la capa
- * de tramas, para la conexion entera de una vez.  Un mensaje que lleve una es
- * un mensaje de HTTP/1.1 disfrazado de HTTP/2, y reenviarlo dejaria que a un
- * intermediario le dijeran dos cosas distintas sobre la misma conexion el mismo
- * extremo.
- *
- * `proxy-connection` esta aqui, que es la unica razon de que este en
- * @c FieldId: no fue nunca una cabecera de verdad, fue una equivocacion que se
- * extendio, y el unico motivo de reconocerla es poder rechazarla por su nombre.
- *
- * \~
- */
-constexpr uint64_t kForbiddenInH2 =
-    bit(FieldId::Connection) | bit(FieldId::KeepAlive) |
-    bit(FieldId::TransferEncoding) | bit(FieldId::Upgrade) |
-    bit(FieldId::ProxyConnection);
-
 /**
  * @brief
  * \~english Puts @p n bytes into @p out and says where they landed.
@@ -156,8 +115,7 @@ void Decoder::reset(const Limits &limits) noexcept {
     limits_ = limits;
     table_.reset(limits.header_table_size);
     list_size_ = 0;
-    seen_ordinary_ = false;
-    pseudo_seen_ = 0;
+    why_ = nullptr;
 }
 
 ErrorCode Decoder::take_string(const uint8_t *p, size_t n, size_t &at,
@@ -248,9 +206,7 @@ ErrorCode Decoder::take_indexed_name(uint64_t index, Buffer &out,
 
 ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
                         Request &req) noexcept {
-    const uint8_t *base = out.data();
-    const uint8_t *name = base + f.name.off;
-
+    (void)req;
     /* \~english
      * What it costs once it is written out, counted the specification's way.
      * This is the limit the bomb runs into: a thousand mentions of a remembered
@@ -266,132 +222,30 @@ ErrorCode Decoder::keep(const Buffer &out, const Reading &f,
     if (list_size_ > limits_.max_header_list_size)
         return ErrorCode::EnhanceYourCalm;
 
-    if (f.name.len == 0) return ErrorCode::ProtocolError;
-
-    if (name[0] == ':') {
-        const Pseudo which = pseudo_of(name, f.name.len);
-
-        /* \~english
-         * A colon is reserved for the protocol, so a name with one that nobody
-         * has defined is a name from a version this end does not speak.
-         * \~spanish
-         * Los dos puntos estan reservados para el protocolo, asi que un nombre
-         * con ellos que nadie ha definido es un nombre de una version que este
-         * extremo no habla.
-         * \~ */
-        if (which == Pseudo::None) return ErrorCode::ProtocolError;
-
-        /* \~english
-         * They all come before the ordinary fields.  It is not a style rule:
-         * a recipient decides what to do with a message from them, and one
-         * that arrived after the fields would be deciding after acting.
-         * \~spanish
-         * Todas van antes que las cabeceras corrientes.  No es una regla de
-         * estilo: quien recibe decide que hacer con un mensaje a partir de
-         * ellas, y una que llegara detras de las cabeceras estaria decidiendo
-         * despues de actuar.
-         * \~ */
-        if (seen_ordinary_) return ErrorCode::ProtocolError;
-
-        /* \~english
-         * And once each.  Twice is two answers to one question, which is the
-         * same shape as a message with two content lengths.
-         * \~spanish
-         * Y una vez cada una.  Dos veces son dos respuestas a una pregunta, que
-         * es la misma forma que un mensaje con dos longitudes de contenido.
-         * \~ */
-        const uint8_t mark = static_cast<uint8_t>(1u << static_cast<unsigned>(which));
-        if ((pseudo_seen_ & mark) != 0) return ErrorCode::ProtocolError;
-        pseudo_seen_ |= mark;
-
-        switch (which) {
-        case Pseudo::Method:
-            req.method_text = f.value;
-            req.method = method_id_of(
-                reinterpret_cast<const char *>(base + f.value.off), f.value.len);
-            break;
-        case Pseudo::Path:
-            req.target = f.value;
-            break;
-        case Pseudo::Authority:
-            req.authority = f.value;
-            break;
-        case Pseudo::Scheme:
-            req.scheme = f.value;
-            break;
-        case Pseudo::Status:
-            /* \~english
-             * A status is what a response carries.  In a request it is a peer
-             * answering a question nobody asked.
-             * \~spanish
-             * Un estado es lo que lleva una respuesta.  En una peticion es un
-             * extremo contestando una pregunta que no hizo nadie.
-             * \~ */
-            return ErrorCode::ProtocolError;
-        case Pseudo::None:
-            break;
-        }
-
-        return ErrorCode::NoError;
-    }
-
-    seen_ordinary_ = true;
-
     /* \~english
-     * Lower case, and it is a refusal rather than a folding.  HTTP/2 requires
-     * it on the wire, so a capital is a message that is wrong -- and folding
-     * it would make this server accept what the peer beside it refuses, which
-     * is where two recipients start disagreeing about a message.
-     *
+     * What the line means for the message is judged where HTTP/3's is judged
+     * too (request_builder.h): the rules are the same, and two copies of them
+     * would sooner or later disagree.  A line that breaks one makes the
+     * message malformed: a stream error, PROTOCOL_ERROR (RFC 9113, 8.1.1).
      * \~spanish
-     * En minusculas, y es un rechazo y no un plegado.  HTTP/2 lo exige en el
-     * cable, asi que una mayuscula es un mensaje que esta mal -- y plegarla
-     * haria que este servidor aceptara lo que rechaza el de al lado, que es por
-     * donde dos receptores empiezan a discrepar sobre un mensaje.
+     * Lo que significa la linea para el mensaje se juzga donde se juzga tambien
+     * la de HTTP/3 (request_builder.h): las reglas son las mismas, y dos copias
+     * de ellas acabarian discrepando.  Una linea que rompe una deja el mensaje
+     * mal formado: error de flujo, PROTOCOL_ERROR (RFC 9113, 8.1.1).
      * \~ */
-    for (uint32_t i = 0; i < f.name.len; ++i) {
-        if (name[i] >= 'A' && name[i] <= 'Z') return ErrorCode::ProtocolError;
-        if (!is_tchar(name[i])) return ErrorCode::ProtocolError;
-    }
-
-    if (f.id != FieldId::Unknown && (kForbiddenInH2 & bit(f.id)) != 0)
+    const char *bad = builder_.add(out.data(), f.name, f.value, f.id);
+    if (bad != nullptr) {
+        why_ = bad;
         return ErrorCode::ProtocolError;
-
-    /* \~english
-     * `TE` survives, and only saying `trailers`.  It is the one connection
-     * field HTTP/2 keeps, because what it asks for -- that trailers are
-     * acceptable -- is about the message and not about the hop.
-     * \~spanish
-     * `TE` sobrevive, y solo diciendo `trailers`.  Es la unica cabecera de
-     * conexion que conserva HTTP/2, porque lo que pide -- que se admitan
-     * remolques -- es del mensaje y no del salto.
-     * \~ */
-    if (f.id == FieldId::TE) {
-        const char *want = "trailers";
-        if (f.value.len != 8) return ErrorCode::ProtocolError;
-        const uint8_t *v = base + f.value.off;
-        for (int i = 0; i < 8; ++i)
-            if (v[i] != static_cast<uint8_t>(want[i]))
-                return ErrorCode::ProtocolError;
     }
-
-    Field out_field{};
-    out_field.name_off = f.name.off;
-    out_field.name_len = static_cast<uint16_t>(f.name.len);
-    out_field.value_off = f.value.off;
-    out_field.value_len = static_cast<uint16_t>(f.value.len);
-    out_field.id = f.id;
-    req.fields.add(out_field);
-
     return ErrorCode::NoError;
 }
 
 ErrorCode Decoder::decode(const uint8_t *block, size_t n, Buffer &out,
                           Request &req) noexcept {
-    req.clear();
+    why_ = nullptr;
+    builder_.start(req, RequestBuilder::Options{});
     list_size_ = 0;
-    seen_ordinary_ = false;
-    pseudo_seen_ = 0;
 
     /* \~english
      * A size update may only come at the front of a block.  Once a field has
@@ -508,6 +362,13 @@ ErrorCode Decoder::decode(const uint8_t *block, size_t n, Buffer &out,
         if (k != ErrorCode::NoError) return k;
     }
 
+    // \~english The block is whole: what the request must carry, and CONNECT's form (RFC 9113, 8.3.1, 8.5).
+    // \~spanish El bloque esta entero: lo que debe llevar la peticion, y la forma de CONNECT (RFC 9113, 8.3.1, 8.5).  \~
+    const char *bad = builder_.finish(out.data());
+    if (bad != nullptr) {
+        why_ = bad;
+        return ErrorCode::ProtocolError;
+    }
     req.version = Version::Http2;
     return ErrorCode::NoError;
 }

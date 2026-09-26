@@ -126,6 +126,7 @@ add_library(http_vx_proto STATIC
         proto/semantics/field.cpp
         proto/semantics/fields.cpp
         proto/semantics/message.cpp
+        proto/semantics/request_builder.cpp
         proto/semantics/method.cpp
         proto/semantics/response.cpp
         proto/semantics/status.cpp
@@ -547,6 +548,7 @@ if (HTTP_VX_BUILD_TESTS)
     endif ()
     http_vx_add_test(test_h2_table tests/test_h2_table.cpp)
     http_vx_add_test(test_qpack tests/test_qpack.cpp)
+    http_vx_add_test(test_request_builder tests/test_request_builder.cpp)
     http_vx_add_test(test_qpack_encoder tests/test_qpack_encoder.cpp)
     http_vx_add_test(test_h3_frame tests/test_h3_frame.cpp)
     target_link_libraries(test_h3_frame PRIVATE http_vx_h3)

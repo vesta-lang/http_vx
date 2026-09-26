@@ -255,6 +255,10 @@ void test_the_bomb() {
      * \~ */
     uint8_t big[1200];
     size_t n = 0;
+    // \~english A request first: :method GET, :scheme https, :path / (RFC 9113, 8.3.1).  \~spanish Una peticion primero: :method GET, :scheme https, :path / (RFC 9113, 8.3.1).  \~
+    big[n++] = 0x82;
+    big[n++] = 0x87;
+    big[n++] = 0x84;
     big[n++] = 0x40;  // literal, con indexado incremental, nombre nuevo
     big[n++] = 0x01;  // nombre de un byte, sin Huffman
     big[n++] = 'x';
@@ -478,7 +482,7 @@ void test_field_rules() {
         Decoder d;
         d.reset(limits);
         out.clear();
-        const uint8_t ok[] = {0x00, 0x02, 't', 'e', 0x08, 't', 'r',
+        const uint8_t ok[] = {0x82, 0x87, 0x84, 0x00, 0x02, 't', 'e', 0x08, 't', 'r',
                               'a',  'i',  'l', 'e', 'r',  's'};
         check(d.decode(ok, sizeof(ok), out, req) == ErrorCode::NoError,
               "te: trailers was refused");
@@ -520,7 +524,7 @@ void test_size_updates() {
         Decoder d;
         d.reset(limits);
         out.clear();
-        const uint8_t first[] = {0x3F, 0xE1, 0x1F, 0x82};  // 4096, luego GET
+        const uint8_t first[] = {0x3F, 0xE1, 0x1F, 0x82, 0x87, 0x84};  // 4096, luego GET https /
         check(d.decode(first, sizeof(first), out, req) == ErrorCode::NoError,
               "a size update at the front of a block was refused");
         check(d.table().max_size() == 4096, "the limit did not change");
@@ -637,7 +641,40 @@ void test_between_messages() {
 
 } // namespace
 
+/**
+ * @brief
+ * \~english What a request must carry, and what its values may not, now checked here too (RFC 9113, 8.2.1, 8.3.1).
+ * \~spanish Lo que debe llevar una peticion, y lo que no pueden tener sus valores, ahora comprobado aqui tambien (RFC 9113, 8.2.1, 8.3.1).
+ * \~
+ */
+void test_request_rules() {
+    http_vx::h2::Limits limits;
+    http_vx::Buffer out;
+    http_vx::Request req;
+    {
+        Decoder d;
+        d.reset(limits);
+        const uint8_t only_method[] = {0x82};
+        check(d.decode(only_method, sizeof only_method, out, req) == ErrorCode::ProtocolError,
+              "a request with no :scheme and no :path was accepted (8.3.1)");
+        check(d.why() != nullptr && std::strstr(d.why(), "no :scheme") != nullptr, "and it says which is missing");
+    }
+    {
+        Decoder d;
+        d.reset(limits);
+        // \~english x-a: "a\rb" as a literal, after a whole request line.  \~spanish x-a: "a\rb" como literal, tras una linea de peticion entera.  \~
+        const uint8_t cr[] = {0x82, 0x87, 0x84, 0x00, 0x03, 'x', '-', 'a', 0x03, 'a', '\r', 'b'};
+        check(d.decode(cr, sizeof cr, out, req) == ErrorCode::ProtocolError, "a CR in a value was accepted (8.2.1)");
+        // \~english The same decoder, the next block: the old reason does not stay.
+        // \~spanish El mismo descodificador, el bloque siguiente: la razon vieja no se queda.  \~
+        const uint8_t ok[] = {0x82, 0x87, 0x84};
+        check(d.decode(ok, sizeof ok, out, req) == ErrorCode::NoError && d.why() == nullptr,
+              "a whole request line is fine, and says nothing");
+    }
+}
+
 int main() {
+    test_request_rules();
     test_the_specification_sequence();
     test_the_same_thing_in_huffman();
     test_the_bomb();

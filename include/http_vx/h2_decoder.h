@@ -68,6 +68,7 @@
 #include "http_vx/h2_limits.h"
 #include "http_vx/h2_table.h"
 #include "http_vx/message.h"
+#include "http_vx/request_builder.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -169,6 +170,10 @@ class Decoder {
     /// \~english What the connection remembers.  \~spanish Lo que recuerda la conexion.  \~
     DynamicTable &table() noexcept { return table_; }
 
+    /// \~english Why the last block made its message malformed; null otherwise.
+    /// \~spanish Por que el ultimo bloque dejo su mensaje mal formado; nulo si no.  \~
+    const char *why() const noexcept { return why_; }
+
     /// \~english Gives the memory back.  \~spanish Devuelve la memoria.  \~
     void release() noexcept { table_.release(); }
 
@@ -203,12 +208,9 @@ class Decoder {
     /// \~english How much the fields of this block are worth so far.
     /// \~spanish Cuanto valen hasta ahora las cabeceras de este bloque.  \~
     uint64_t list_size_ = 0;
-    /// \~english Whether an ordinary field has been seen in this block.
-    /// \~spanish Si en este bloque se ha visto ya una cabecera corriente.  \~
-    bool seen_ordinary_ = false;
-    /// \~english Which pieces of the request have already been given.
-    /// \~spanish Que piezas de la peticion se han dado ya.  \~
-    uint8_t pseudo_seen_ = 0;
+    /// \~english The rules of the message, shared with HTTP/3.  \~spanish Las reglas del mensaje, compartidas con HTTP/3.  \~
+    RequestBuilder builder_;
+    const char *why_ = nullptr;
 };
 
 } // namespace hpack

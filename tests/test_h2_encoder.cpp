@@ -56,6 +56,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -93,6 +94,19 @@ bool span_is(uint32_t off, uint32_t len, const http_vx::Buffer &out,
              const char *want) {
     if (len != std::strlen(want)) return false;
     return std::memcmp(out.data() + off, want, len) == 0;
+}
+
+/**
+ * @brief
+ * \~english Decodes @p block as a request: the three pseudo-header fields a request needs (RFC 9113, 8.3.1) go in front, from the static table.
+ * \~spanish Descodifica @p block como peticion: las tres pseudo-cabeceras que necesita una peticion (RFC 9113, 8.3.1) van delante, de la tabla estatica.
+ * \~
+ */
+ErrorCode decode_request(Decoder &d, const uint8_t *block, size_t n, http_vx::Buffer &out, http_vx::Request &req) {
+    // \~english :method GET, :scheme https, :path / (static 2, 7, 4).  \~spanish :method GET, :scheme https, :path / (estaticas 2, 7, 4).  \~
+    std::vector<uint8_t> all = {0x82, 0x87, 0x84};
+    all.insert(all.end(), block, block + n);
+    return d.decode(all.data(), all.size(), out, req);
 }
 
 bool field_is(const http_vx::Request &req, const http_vx::Buffer &out, size_t i,
@@ -220,7 +234,7 @@ void test_the_two_tables_stay_in_step() {
 
         http_vx::Buffer out;
         http_vx::Request req;
-        const ErrorCode ec = d.decode(block.data(), block.size(), out, req);
+        const ErrorCode ec = decode_request(d, block.data(), block.size(), out, req);
         check(ec == ErrorCode::NoError, "the block did not decode");
 
         check(req.fields.size() == 3, "three fields did not come out");
@@ -407,7 +421,7 @@ void test_huffman_only_when_it_helps() {
 
     http_vx::Buffer decoded;
     http_vx::Request req;
-    check(d.decode(out.data(), out.size(), decoded, req) == ErrorCode::NoError,
+    check(decode_request(d, out.data(), out.size(), decoded, req) == ErrorCode::NoError,
           "the block with the binary value did not decode");
     check(req.fields.size() == 1, "one field did not come out");
 
@@ -466,7 +480,7 @@ void test_a_field_too_big_empties_both() {
 
     http_vx::Buffer out;
     http_vx::Request req;
-    check(d.decode(block.data(), block.size(), out, req) == ErrorCode::NoError,
+    check(decode_request(d, block.data(), block.size(), out, req) == ErrorCode::NoError,
           "the block did not decode");
     check(field_is(req, out, 0, "x-small", "v"),
           "the small field did not arrive");
