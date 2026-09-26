@@ -216,12 +216,27 @@ add_library(http_vx_tls STATIC
         tls/quic.cpp
         tls/ticket.cpp
         tls/verify.cpp
+        tls/record.cpp
 )
 target_include_directories(http_vx_tls
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
 target_compile_options(http_vx_tls PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_tls PUBLIC http_vx_quic vesta_alloc)
+
+# TLS sobre TCP: el canal que lleva el saludo en registros (RFC 8446, 5) y el
+# servicio de flujo que descifra para HTTP/1.1 y HTTP/2.  Aparte de `http_vx_tls`
+# porque es lo unico de TLS que conoce los buffers y los servicios del reactor.
+add_library(http_vx_tls_stream STATIC
+        tls/channel.cpp
+        tls/channel_read.cpp
+        tls/stream_service.cpp
+)
+target_include_directories(http_vx_tls_stream
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_tls_stream PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_tls_stream PUBLIC http_vx_tls http_vx_core vesta_alloc)
 
 # ---------------------------------------------------------------------------
 # HTTP/3 (RFC 9114): tramas, flujos y conexion sobre `http_vx_quic`.  Aparte de
@@ -318,6 +333,7 @@ add_library(http_vx_chacha STATIC
 )
 target_include_directories(http_vx_chacha
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/common
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
         PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
 target_compile_options(http_vx_chacha PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_chacha PUBLIC vesta_alloc)
@@ -404,10 +420,19 @@ endif ()
 # Va aqui y no al lado de `http_vx_serve` porque es lo unico del proyecto que
 # enlaza una libreria de plataforma, y esas se definen justo arriba.
 # ---------------------------------------------------------------------------
-add_executable(http_vx_listen serve/listen.cpp)
+add_executable(http_vx_listen serve/listen.cpp serve/tls_setup.cpp)
 target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_listen PRIVATE http_vx_proto http_vx_core)
+target_link_libraries(http_vx_listen PRIVATE http_vx_tls_stream http_vx_proto http_vx_core)
+# HTTPS con los proveedores que haya; sin ninguno, `--tls` se niega a arrancar (R24).
+if (TARGET http_vx_crypto_openssl)
+    target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_openssl)
+    target_compile_definitions(http_vx_listen PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+endif ()
+if (TARGET http_vx_crypto_cng)
+    target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_cng)
+    target_compile_definitions(http_vx_listen PRIVATE HTTP_VX_HAVE_CNG=1)
+endif ()
 
 if (WIN32)
     target_link_libraries(http_vx_listen PRIVATE http_vx_windows)
@@ -561,6 +586,20 @@ if (HTTP_VX_BUILD_TESTS)
         target_link_libraries(test_tls_verify PRIVATE http_vx_crypto_cng)
         target_compile_definitions(test_tls_verify PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
+    # TLS sobre TCP: los registros contra el RFC 8448, el canal entre dos
+    # extremos, y el servicio con HTTP/1.1 y HTTP/2 de verdad dentro.
+    foreach (_tls_test test_tls_record test_tls_channel test_tls_service)
+        http_vx_add_test(${_tls_test} tests/${_tls_test}.cpp)
+        target_link_libraries(${_tls_test} PRIVATE http_vx_tls_stream http_vx_proto)
+        if (TARGET http_vx_crypto_openssl)
+            target_link_libraries(${_tls_test} PRIVATE http_vx_crypto_openssl)
+            target_compile_definitions(${_tls_test} PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+        endif ()
+        if (TARGET http_vx_crypto_cng)
+            target_link_libraries(${_tls_test} PRIVATE http_vx_crypto_cng)
+            target_compile_definitions(${_tls_test} PRIVATE HTTP_VX_HAVE_CNG=1)
+        endif ()
+    endforeach ()
     http_vx_add_test(test_quic_tls tests/test_quic_tls.cpp)
     target_link_libraries(test_quic_tls PRIVATE http_vx_tls)
     if (TARGET http_vx_crypto_openssl)
@@ -616,6 +655,7 @@ if (HTTP_VX_BUILD_TESTS)
     else ()
         target_link_libraries(test_socket_backend PRIVATE http_vx_linux)
     endif ()
+
 endif ()
 
 # ---------------------------------------------------------------------------

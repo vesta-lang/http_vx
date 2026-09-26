@@ -87,10 +87,27 @@ enum class Handshake : uint8_t {
     MessageHash = 254,
 };
 
-/// \~english The alerts this code can end a handshake with (6.2).  \~spanish Las alertas con las que este codigo puede acabar un saludo (6.2).  \~
+/**
+ * @brief
+ * \~english The alerts this code can end a handshake or a connection with (6.2).
+ * \~spanish Las alertas con las que este codigo puede acabar un saludo o una conexion (6.2).
+ * \~
+ *
+ * \~english
+ * None is 0, which on the wire is close_notify (6.1): a closure is not a
+ * failure, and the record layer (tls_record.h) keeps the two apart.
+ * \~spanish
+ * None es 0, que en el cable es close_notify (6.1): un cierre no es un fallo,
+ * y la capa de registros (tls_record.h) mantiene las dos cosas separadas.
+ * \~
+ */
 enum class Alert : uint8_t {
     None = 0,
     UnexpectedMessage = 10,
+    /// \~english A record that does not deprotect (5.2).  \~spanish Un registro que no se desprotege (5.2).  \~
+    BadRecordMac = 20,
+    /// \~english A record past the size limits (5.1, 5.2, 5.4).  \~spanish Un registro pasado de los limites de tamano (5.1, 5.2, 5.4).  \~
+    RecordOverflow = 22,
     HandshakeFailure = 40,
     BadCertificate = 42,
     UnsupportedCertificate = 43,

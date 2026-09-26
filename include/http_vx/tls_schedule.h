@@ -44,6 +44,7 @@
 #define HTTP_VX_TLS_SCHEDULE_H
 
 #include "http_vx/quic_crypto.h"
+#include "http_vx/wipe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,6 +58,7 @@ using quic::hash_size;
 
 /// \~english The longest hash output: SHA-384.  \~spanish La salida de resumen mas larga: SHA-384.  \~
 constexpr size_t kMaxHash = quic::kMaxSecret;
+
 
 /**
  * @brief

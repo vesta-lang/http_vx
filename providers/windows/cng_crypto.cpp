@@ -37,6 +37,7 @@
 #include "cng_crypto.h"
 
 #include "chacha20_poly1305.h"
+#include "http_vx/wipe.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -157,15 +158,6 @@ State *new_chacha_state(State::Kind kind, const uint8_t *key) noexcept {
     if (s == nullptr) return nullptr;
     util::vesta_memcpy(s->chacha_key, key, chacha::kKeySize);
     return s;
-}
-
-/// \~english Overwrites key bytes so that the optimizer cannot drop it.
-/// \~spanish Sobrescribe bytes de clave de forma que el optimizador no lo pueda quitar.  \~
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
 }
 
 /// \~english Opens @p id, optionally with a chaining mode; null if the system refuses.
@@ -375,7 +367,7 @@ void CngCrypto::forget(void *state) noexcept {
     // \~english Destroying a system key also wipes it; our own bytes we wipe.
     // \~spanish Destruir una clave del sistema tambien la borra; los bytes propios los borramos.  \~
     if (s->key != nullptr) BCryptDestroyKey(s->key);
-    wipe(s->chacha_key, sizeof s->chacha_key);
+    wipe_secret(s->chacha_key, sizeof s->chacha_key);
     util::host_free(s);
 }
 
@@ -472,7 +464,7 @@ bool CngCrypto::mask(void *hp, const uint8_t *sample, uint8_t *out) noexcept {
         uint8_t ks[chacha::kBlockSize];
         chacha::block(s->chacha_key, counter, sample + 4, ks);
         util::vesta_memcpy(out, ks, quic::kMaskSize);
-        wipe(ks, sizeof ks);
+        wipe_secret(ks, sizeof ks);
         return true;
     }
     if (s->kind != State::HpAes) return false;
@@ -686,7 +678,7 @@ void *CngCrypto::import_key(quic::Group g, const uint8_t *priv, size_t priv_len,
     BCRYPT_KEY_HANDLE k = nullptr;
     const bool imported = ok(BCryptImportKeyPair(static_cast<BCRYPT_ALG_HANDLE>(alg), nullptr, BCRYPT_ECCPRIVATE_BLOB,
                                                  &k, blob, static_cast<ULONG>(n), 0));
-    wipe(blob, sizeof blob);
+    wipe_secret(blob, sizeof blob);
     if (!imported) return nullptr;
     CngKey *w = wrap_key(k, false, g, quic::Scheme::EcdsaSecp256r1Sha256);
     if (w == nullptr) return nullptr;
@@ -712,8 +704,8 @@ void *CngCrypto::import_key(quic::Group g, const uint8_t *priv, size_t priv_len,
     for (size_t i = 0; pair && i < quic::kMaxShared; ++i)
         if (s1[i] != s2[i]) pair = false;
     forget_key(e);
-    wipe(s1, sizeof s1);
-    wipe(s2, sizeof s2);
+    wipe_secret(s1, sizeof s1);
+    wipe_secret(s2, sizeof s2);
     if (!pair) {
         forget_key(w);
         return nullptr;
@@ -801,9 +793,9 @@ void *CngCrypto::signing_key(quic::Scheme s, const uint8_t *pkcs8, size_t len) n
                 if (!ok(BCryptImportKeyPair(static_cast<BCRYPT_ALG_HANDLE>(ecdsa256_), nullptr,
                                             BCRYPT_ECCPRIVATE_BLOB, &k, blob, sizeof blob, 0)))
                     k = nullptr;
-                wipe(blob, sizeof blob);
+                wipe_secret(blob, sizeof blob);
             }
-            wipe(ec, ec_len);
+            wipe_secret(ec, ec_len);
             LocalFree(ec);
         }
     } else if (s == quic::Scheme::RsaPssRsaeSha256 && rsa_ != nullptr &&
@@ -817,11 +809,11 @@ void *CngCrypto::signing_key(quic::Scheme s, const uint8_t *pkcs8, size_t len) n
             if (!ok(BCryptImportKeyPair(static_cast<BCRYPT_ALG_HANDLE>(rsa_), nullptr, LEGACY_RSAPRIVATE_BLOB, &k,
                                         legacy, legacy_len, 0)))
                 k = nullptr;
-            wipe(legacy, legacy_len);
+            wipe_secret(legacy, legacy_len);
             LocalFree(legacy);
         }
     }
-    wipe(info, info_len);
+    wipe_secret(info, info_len);
     LocalFree(info);
     return wrap_key(k, true, quic::Group::X25519, s);
 }

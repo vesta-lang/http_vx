@@ -30,6 +30,15 @@
  * as bytes: reading them is the connection's.  No KeyUpdate (6), no
  * EndOfEarlyData (8.3), no post-handshake client authentication (4.4).
  *
+ * **The same handshake also runs over TCP** (`SessionConfig::over_tcp`),
+ * driven by the record layer of tls_channel.h, which maps the three levels
+ * onto plaintext, handshake and application records.  Then the rules that
+ * are QUIC's give way to RFC 8446's: the client's legacy_session_id is
+ * echoed (4.1.3, D.4), quic_transport_parameters is refused (RFC 9001, 8.2),
+ * ALPN is optional unless asked for, KeyUpdate belongs to the channel
+ * (4.6.3), and every failure is an alert.  0-RTT is not offered nor
+ * accepted over TCP.
+ *
  * **Secrets are handed out as they exist, both directions of a level
  * together.**  The server has both 1-RTT secrets once it writes its
  * Finished, and may send with them then; that it MUST NOT open 1-RTT packets
@@ -71,6 +80,15 @@
  * quic_transport_parameters tambien (8.2), que viajan como bytes: leerlos es
  * cosa de la conexion.  Sin KeyUpdate (6), sin EndOfEarlyData (8.3), sin
  * autenticacion del cliente tras el saludo (4.4).
+ *
+ * **El mismo saludo corre tambien sobre TCP** (`SessionConfig::over_tcp`),
+ * llevado por la capa de registros de tls_channel.h, que pone los tres niveles
+ * sobre registros en claro, del saludo y de aplicacion.  Entonces las reglas
+ * que son de QUIC dejan paso a las del RFC 8446: el legacy_session_id del
+ * cliente se devuelve (4.1.3, D.4), quic_transport_parameters se rechaza (RFC
+ * 9001, 8.2), ALPN es opcional salvo que se pida, KeyUpdate es cosa del canal
+ * (4.6.3), y cada fallo es una alerta.  Sobre TCP no se ofrece ni se acepta
+ * 0-RTT.
  *
  * **Los secretos se entregan en cuanto existen, las dos direcciones de un nivel
  * juntas.**  El servidor tiene los dos secretos 1-RTT cuando escribe su
@@ -129,6 +147,22 @@ using quic::Space;
  */
 struct SessionConfig {
     bool server = false;
+
+    /* \~english
+     * TLS over TCP, in records (RFC 8446, 5), instead of QUIC.  No transport
+     * parameters -- received ones are unsupported_extension (RFC 9001, 8.2)
+     * --, a non-empty legacy_session_id echoed (D.4), ALPN optional, and no
+     * 0-RTT: `early_data` is refused out loud.
+     * \~spanish
+     * TLS sobre TCP, en registros (RFC 8446, 5), en vez de QUIC.  Sin
+     * parametros de transporte -- los recibidos son unsupported_extension (RFC
+     * 9001, 8.2) --, un legacy_session_id no vacio devuelto (D.4), ALPN opcional,
+     * y sin 0-RTT: `early_data` se rechaza en voz alta.
+     * \~ */
+    bool over_tcp = false;
+    /// \~english Over TCP, a server refuses a ClientHello without ALPN: no_application_protocol.
+    /// \~spanish Sobre TCP, un servidor rechaza un ClientHello sin ALPN: no_application_protocol.  \~
+    bool require_alpn = false;
 
     /// \~english Application protocols: offered (client) or accepted, most preferred first (server).
     /// \~spanish Protocolos de aplicacion: ofrecidos (cliente) o aceptados, el preferido primero (servidor).  \~
@@ -308,6 +342,31 @@ public:
 
     /// \~english The level TLS reads at now.  \~spanish El nivel en el que lee TLS ahora.  \~
     Space reading() const noexcept { return reading_; }
+
+    /**
+     * @brief
+     * \~english Bytes of an unfinished message held at the level read now.
+     * \~spanish Bytes de un mensaje sin acabar guardados en el nivel que se lee ahora.
+     * \~
+     *
+     * \~english
+     * Over TCP a handshake message split across records must not have
+     * another kind of record between its pieces (RFC 8446, 5.1): the channel
+     * asks this to know whether one is open.
+     * \~spanish
+     * Sobre TCP un mensaje del saludo partido entre registros no puede tener
+     * otra clase de registro entre sus trozos (RFC 8446, 5.1): el canal pregunta
+     * esto para saber si hay uno abierto.
+     * \~
+     */
+    size_t buffered() const noexcept { return in_[static_cast<size_t>(reading_)].len; }
+
+    /// \~english The client's legacy_session_id, as sent; @p n is 0 when it was empty.
+    /// \~spanish El legacy_session_id del cliente, tal cual; @p n es 0 cuando vino vacio.  \~
+    const uint8_t *legacy_session_id(size_t &n) const noexcept {
+        n = session_id_len_;
+        return session_id_;
+    }
 
     /// \~english The bytes waiting to go out at @p s.  \~spanish Los bytes que esperan salir en @p s.  \~
     const uint8_t *output(Space s, size_t &n) const noexcept;
@@ -528,6 +587,10 @@ private:
     size_t share_count_ = 0;
 
     uint8_t random_[32] = {};
+    /* \~english Over TCP: the client's legacy_session_id, echoed by a server (4.1.3).
+     * \~spanish Sobre TCP: el legacy_session_id del cliente, que devuelve un servidor (4.1.3).  \~ */
+    uint8_t session_id_[32] = {};
+    uint8_t session_id_len_ = 0;
     Kept cookie_;
     /// \~english A CertificateRequest went by: the client answers with an empty Certificate.
     /// \~spanish Paso un CertificateRequest: el cliente responde con un Certificate vacio.  \~

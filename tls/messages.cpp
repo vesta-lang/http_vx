@@ -30,6 +30,8 @@ const char *alert_name(Alert a) noexcept {
     switch (a) {
     case Alert::None:                  return "none";
     case Alert::UnexpectedMessage:     return "unexpected_message";
+    case Alert::BadRecordMac:          return "bad_record_mac";
+    case Alert::RecordOverflow:        return "record_overflow";
     case Alert::HandshakeFailure:      return "handshake_failure";
     case Alert::BadCertificate:        return "bad_certificate";
     case Alert::UnsupportedCertificate: return "unsupported_certificate";

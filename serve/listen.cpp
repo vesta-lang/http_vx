@@ -24,6 +24,16 @@
  * curl http://127.0.0.1:8080/hello
  * @endcode
  *
+ * With `--tls CERT KEY` it serves HTTPS instead: TLS 1.3, and HTTP/2 or
+ * HTTP/1.1 as ALPN chooses (tls_service.h), with `--tls-provider cng|openssl`
+ * to say whose primitives.  A build with no provider refuses to start rather
+ * than serve in the clear (R24).  No 0-RTT over TCP.
+ *
+ * @code
+ * http_vx_listen --tls cert.pem key.pem 127.0.0.1 8443
+ * curl -k --http2 https://127.0.0.1:8443/hello
+ * @endcode
+ *
  * **Until this file there was no program in the project that opened a port.**
  * The backends were written and the tests drove them, and a test is a good
  * place to find out whether a socket works and a bad place to find out what a
@@ -48,6 +58,16 @@
  * curl http://127.0.0.1:8080/hola
  * @endcode
  *
+ * Con `--tls CERT CLAVE` sirve HTTPS en su lugar: TLS 1.3, y HTTP/2 o HTTP/1.1
+ * segun elija ALPN (tls_service.h), con `--tls-provider cng|openssl` para decir
+ * de quien son las primitivas.  Una construccion sin proveedor se niega a
+ * arrancar en vez de servir en claro (R24).  Sin 0-RTT sobre TCP.
+ *
+ * @code
+ * http_vx_listen --tls cert.pem clave.pem 127.0.0.1 8443
+ * curl -k --http2 https://127.0.0.1:8443/hola
+ * @endcode
+ *
  * **Hasta este fichero no habia en el proyecto ningun programa que abriera un
  * puerto.**  Los backends estaban escritos y los movian las pruebas, y una
  * prueba es un buen sitio para averiguar si un socket funciona y uno malo para
@@ -66,6 +86,10 @@
  */
 
 #include "serve/greeting.h"
+#include "serve/tls_setup.h"
+
+#include "http_vx/http2_service.h"
+#include "http_vx/tls_service.h"
 
 #ifdef _WIN32
 #include "http_vx/iocp_backend.h"
@@ -230,6 +254,56 @@ uint64_t now_ticks() {
         std::chrono::duration_cast<std::chrono::seconds>(since).count());
 }
 
+/// \~english The same steady clock in microseconds: ticket ages are measured in milliseconds.
+/// \~spanish El mismo reloj estable en microsegundos: las edades de los tickets se miden en milisegundos.  \~
+uint64_t now_us() {
+    using Clock = std::chrono::steady_clock;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
+}
+
+/**
+ * @brief
+ * \~english What the command line asked for: the positional host, port and backend, and TLS.
+ * \~spanish Lo que pidio la linea de ordenes: el anfitrion, el puerto y el backend posicionales, y TLS.
+ * \~
+ */
+struct Options {
+    const char *positional[3] = {nullptr, nullptr, nullptr};
+    size_t count = 0;
+    const char *cert = nullptr;
+    const char *key = nullptr;
+    const char *provider = nullptr;
+    const char *error = nullptr;
+
+    /// \~english Reads @p argv; a flag without its values is an error, said.
+    /// \~spanish Lee @p argv; una bandera sin sus valores es un error, que se dice.  \~
+    void parse(int argc, char **argv) {
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--tls") == 0) {
+                if (i + 2 >= argc) {
+                    error = "--tls needs a certificate file and a key file";
+                    return;
+                }
+                cert = argv[++i];
+                key = argv[++i];
+            } else if (std::strcmp(argv[i], "--tls-provider") == 0) {
+                if (i + 1 >= argc) {
+                    error = "--tls-provider needs a name: cng or openssl";
+                    return;
+                }
+                provider = argv[++i];
+            } else if (count < 3) {
+                positional[count++] = argv[i];
+            } else {
+                error = "too many arguments";
+                return;
+            }
+        }
+        if (provider != nullptr && cert == nullptr) error = "--tls-provider without --tls";
+    }
+};
+
 } // namespace
 
 /**
@@ -256,9 +330,15 @@ int main(int argc, char **argv) {
      * pone solo en la red de quien lo probo, y la diferencia entre las dos cosas
      * es un argumento que ha leido quien lo teclea.
      * \~ */
-    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    Options opt;
+    opt.parse(argc, argv);
+    if (opt.error != nullptr) {
+        std::fprintf(stderr, "http_vx: %s\n", opt.error);
+        return 1;
+    }
+    const char *host = opt.count > 0 ? opt.positional[0] : "127.0.0.1";
     const uint16_t port =
-        argc > 2 ? static_cast<uint16_t>(std::atoi(argv[2])) : 8080;
+        opt.count > 1 ? static_cast<uint16_t>(std::atoi(opt.positional[1])) : 8080;
 
     /* \~english
      * And WHICH backend, which is what R8 means by choosing it in
@@ -280,7 +360,7 @@ int main(int argc, char **argv) {
      * Un nombre que esta construccion no tiene no se cambia en silencio por uno
      * que si.  Falla, y lo dice.
      * \~ */
-    const char *want = argc > 3 ? argv[3] : "epoll";
+    const char *want = opt.count > 2 ? opt.positional[2] : "epoll";
 
     http_vx::ShardConfig cfg;
     cfg.connections = 1024;
@@ -312,6 +392,48 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* \~english
+     * HTTPS, when asked for: the same handler behind HTTP/1.1 and HTTP/2, and
+     * TLS in front choosing between them.  Asked for and impossible is a
+     * server that does not start -- never one that serves in the clear (R24).
+     * \~spanish
+     * HTTPS, cuando se pide: el mismo manejador detras de HTTP/1.1 y HTTP/2, y
+     * TLS delante eligiendo entre ellos.  Pedido e imposible es un servidor que
+     * no arranca -- nunca uno que sirve en claro (R24).
+     * \~ */
+    serve::TlsSetup tls_setup;
+    http_vx::Http2Service h2_service;
+    http_vx::TlsService tls_service;
+    http_vx::Service *front = &service;
+    if (opt.cert != nullptr) {
+        if (!tls_setup.load(opt.provider, opt.cert, opt.key)) {
+            std::fprintf(stderr, "http_vx: cannot serve TLS: %s\n", tls_setup.why());
+            return 1;
+        }
+        const http_vx::h2::Limits h2;
+        http_vx::TlsServiceConfig tcfg;
+        tcfg.crypto = tls_setup.crypto();
+        tcfg.http1 = &service;
+        tcfg.http2 = &h2_service;
+        tcfg.certificates = tls_setup.certificates();
+        tcfg.certificate_lens = tls_setup.certificate_lens();
+        tcfg.certificate_count = tls_setup.certificate_count();
+        tcfg.signing_key = tls_setup.signing_key();
+        tcfg.scheme = tls_setup.scheme();
+        tcfg.tickets = tls_setup.tickets();
+        tcfg.buffers = cfg.buffers;
+        if (!h2_service.reset(cfg.connections, 256, 1 << 20, greeting, h2) ||
+            !tls_service.reset(cfg.connections, tcfg)) {
+            std::fprintf(stderr, "http_vx: cannot serve TLS: %s\n",
+                         tls_service.why() != nullptr ? tls_service.why() : "no memory for HTTP/2");
+            return 1;
+        }
+        tls_service.set_clock(now_us());
+        front = &tls_service;
+        std::fprintf(stderr, "http_vx: TLS 1.3 with the %s provider, h2 and http/1.1 by ALPN, no 0-RTT\n",
+                     tls_setup.crypto()->name());
+    }
+
     if (!reactors.make(want, shard.buffers(), cfg.connections, host, port)) {
         std::fprintf(stderr,
                      "http_vx: cannot listen on %s:%u with %s (error %d)\n",
@@ -319,7 +441,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!shard.reset(cfg, *reactors.io, service, now_ticks())) {
+    if (!shard.reset(cfg, *reactors.io, *front, now_ticks())) {
         std::fprintf(stderr, "http_vx: no memory for the shard\n");
         return 1;
     }
@@ -346,6 +468,7 @@ int main(int argc, char **argv) {
          * servidor sin nada que hacer es justo cuando las conexiones que se
          * amontonan son las que dejaron de hablar.
          * \~ */
+        tls_service.set_clock(now_us());
         shard.poll(now_ticks(), 250);
 
         const uint64_t now = now_ticks();

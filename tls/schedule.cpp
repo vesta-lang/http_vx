@@ -25,15 +25,6 @@ namespace tls {
 
 namespace {
 
-/// \~english Clears secret bytes where the compiler cannot drop the store.
-/// \~spanish Borra bytes secretos donde el compilador no puede quitar la escritura.  \~
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
-}
-
 /// \~english The handshake type of the synthetic message after a HelloRetryRequest (4.4.1).
 /// \~spanish El tipo de mensaje del mensaje sintetico tras un HelloRetryRequest (4.4.1).  \~
 constexpr uint8_t kMessageHash = 254;
@@ -85,7 +76,7 @@ bool finished_data(Crypto &c, Hash h, const uint8_t *base_key, const uint8_t *tr
     const size_t hl = hash_size(h);
     const bool ok = expand_label(c, h, base_key, "finished", nullptr, 0, key, hl) &&
                     hmac(c, h, key, hl, transcript_hash, hl, out);
-    wipe(key, sizeof key);
+    wipe_secret(key, sizeof key);
     return ok;
 }
 
@@ -100,7 +91,7 @@ Transcript::~Transcript() {
     if (buf_ == nullptr) return;
     // \~english The messages carry the handshake's secrets' inputs: wiped, not just freed.
     // \~spanish Los mensajes llevan las entradas de los secretos del saludo: se borran, no solo se liberan.  \~
-    wipe(buf_, cap_);
+    wipe_secret(buf_, cap_);
     util::host_free(buf_);
 }
 
@@ -116,7 +107,7 @@ bool Transcript::add(const uint8_t *msg, size_t n) noexcept {
         if (grown == nullptr) return false;
         if (len_ != 0) util::vesta_memcpy(grown, buf_, len_);
         if (buf_ != nullptr) {
-            wipe(buf_, cap_);
+            wipe_secret(buf_, cap_);
             util::host_free(buf_);
         }
         buf_ = grown;
@@ -141,13 +132,13 @@ bool Transcript::replace_with_message_hash(Crypto &c, Hash h) noexcept {
     synthetic[1] = 0;
     synthetic[2] = 0;
     synthetic[3] = static_cast<uint8_t>(hl);
-    wipe(buf_, len_);
+    wipe_secret(buf_, len_);
     len_ = 0;
     return add(synthetic, 4 + hl);
 }
 
 KeySchedule::~KeySchedule() {
-    wipe(secret_, sizeof secret_);
+    wipe_secret(secret_, sizeof secret_);
 }
 
 bool KeySchedule::derive(const char *label, const uint8_t *transcript_hash, uint8_t *out) const noexcept {
@@ -169,7 +160,7 @@ bool KeySchedule::advance(const uint8_t *ikm, size_t ikm_len) noexcept {
     uint8_t salt[kMaxHash];
     bool ok = c_.digest(h_, nullptr, 0, empty) && derive("derived", empty, salt) &&
               c_.extract(h_, salt, hl, ikm, ikm_len, secret_);
-    wipe(salt, sizeof salt);
+    wipe_secret(salt, sizeof salt);
     return ok;
 }
 
@@ -221,7 +212,7 @@ bool KeySchedule::resumption(const uint8_t *client_finished_hash, uint8_t *out) 
     const bool ok = derive("res master", client_finished_hash, out);
     // \~english The last secret out: the Master Secret has nothing left to give (7.1: SHOULD be erased).
     // \~spanish El ultimo secreto: al Master Secret no le queda nada que dar (7.1: DEBERIA borrarse).  \~
-    wipe(secret_, sizeof secret_);
+    wipe_secret(secret_, sizeof secret_);
     stage_ = Stage::Done;
     return ok;
 }

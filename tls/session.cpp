@@ -14,6 +14,7 @@
  */
 
 #include "http_vx/tls_session.h"
+#include "http_vx/wipe.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -24,15 +25,6 @@ namespace http_vx {
 namespace tls {
 
 namespace {
-
-/// \~english Clears secret bytes where the compiler cannot drop the store.
-/// \~spanish Borra bytes secretos donde el compilador no puede quitar la escritura.  \~
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
-}
 
 /// \~english A suite's TLS number (B.4).  \~spanish El numero de TLS de un algoritmo (B.4).  \~
 uint16_t suite_of(Aead a) noexcept {
@@ -124,7 +116,7 @@ bool reserve(B &b, size_t need) noexcept {
     if (b.len != 0) util::vesta_memcpy(grown, b.p, b.len);
     if (b.p != nullptr) {
         // \~english Handshake bytes carry key shares and secrets' inputs.  \~spanish Los bytes del saludo llevan claves y entradas de secretos.  \~
-        wipe(b.p, b.cap);
+        wipe_secret(b.p, b.cap);
         util::host_free(b.p);
     }
     b.p = grown;
@@ -147,7 +139,7 @@ void drop_front(B &b, size_t n) noexcept {
 template <typename B>
 void release(B &b) noexcept {
     if (b.p == nullptr) return;
-    wipe(b.p, b.cap);
+    wipe_secret(b.p, b.cap);
     util::host_free(b.p);
     b = B{};
 }
@@ -175,17 +167,17 @@ Session::Session(Crypto &c, const SessionConfig &cfg) noexcept : c_(c), cfg_(cfg
 Session::~Session() {
     forget_shares();
     if (has_schedule_) schedule().~KeySchedule();
-    wipe(hs_client_, sizeof hs_client_);
-    wipe(hs_server_, sizeof hs_server_);
-    wipe(ap_client_, sizeof ap_client_);
-    wipe(ap_server_, sizeof ap_server_);
-    wipe(exporter_, sizeof exporter_);
-    wipe(resumption_, sizeof resumption_);
-    wipe(psk_, sizeof psk_);
-    wipe(early_secret_, sizeof early_secret_);
-    wipe(binder_key_, sizeof binder_key_);
+    wipe_secret(hs_client_, sizeof hs_client_);
+    wipe_secret(hs_server_, sizeof hs_server_);
+    wipe_secret(ap_client_, sizeof ap_client_);
+    wipe_secret(ap_server_, sizeof ap_server_);
+    wipe_secret(exporter_, sizeof exporter_);
+    wipe_secret(resumption_, sizeof resumption_);
+    wipe_secret(psk_, sizeof psk_);
+    wipe_secret(early_secret_, sizeof early_secret_);
+    wipe_secret(binder_key_, sizeof binder_key_);
     if (kept_ != nullptr) {
-        wipe(kept_, kKeptTickets * sizeof(Ticket));
+        wipe_secret(kept_, kKeptTickets * sizeof(Ticket));
         util::host_free(kept_);
     }
     for (size_t i = 0; i < quic::kSpaces; ++i) {
@@ -210,6 +202,24 @@ bool Session::fail_quic(uint64_t code, const char *why) noexcept {
         failure_.code = code;
         failure_.alert = Alert::None;
         failure_.why = why;
+        /* \~english
+         * Over TCP there are no QUIC errors, only alerts.  Bytes left at a
+         * level TLS moved past are a message that spans a key change:
+         * unexpected_message (RFC 8446, 5.1).  A message larger than this end
+         * buffers is the peer's field out of what is accepted:
+         * illegal_parameter, as the reference implementations answer it.
+         * \~spanish
+         * Sobre TCP no hay errores de QUIC, solo alertas.  Bytes que quedan en un
+         * nivel que TLS ya dejo atras son un mensaje que cruza un cambio de clave:
+         * unexpected_message (RFC 8446, 5.1).  Un mensaje mayor de lo que guarda
+         * este extremo es un campo del otro fuera de lo aceptado:
+         * illegal_parameter, como lo contestan las implementaciones de referencia.
+         * \~ */
+        if (cfg_.over_tcp && code < kCryptoError) {
+            const Alert a = code == kProtocolViolation ? Alert::UnexpectedMessage : Alert::IllegalParameter;
+            failure_.code = kCryptoError + static_cast<uint8_t>(a);
+            failure_.alert = a;
+        }
     }
     state_ = State::Failed;
     return false;
@@ -274,9 +284,9 @@ bool Session::binder(const uint8_t *psk, Hash h, const uint8_t *partial, size_t 
     uint8_t th[kMaxHash];
     const bool ok = ks.start(psk, hash_size(h)) && ks.binder_key(true, key) && c_.digest(h, buf, total, th) &&
                     finished_data(c_, h, key, th, out);
-    wipe(buf, total);
+    wipe_secret(buf, total);
     util::host_free(buf);
-    wipe(key, sizeof key);
+    wipe_secret(key, sizeof key);
     return ok || fail_provider("the provider could not compute a PSK binder");
 }
 
@@ -286,7 +296,7 @@ bool Session::take_ticket(Ticket &out) noexcept {
     for (size_t i = 1; i < kept_count_; ++i) kept_[i - 1] = kept_[i];
     --kept_count_;
     // \~english The slot freed held a PSK.  \~spanish La ranura liberada tenia una PSK.  \~
-    wipe(&kept_[kept_count_], sizeof(Ticket));
+    wipe_secret(&kept_[kept_count_], sizeof(Ticket));
     return true;
 }
 
@@ -356,9 +366,17 @@ bool Session::start() noexcept {
     if (state_ != State::Start) return fail(Alert::InternalError, "start() called twice");
     if (suite_count_ == 0 || group_count_ == 0)
         return fail(Alert::InternalError, "the provider supports no suite or no group to offer");
-    if (cfg_.alpn_count == 0) return fail(Alert::InternalError, "no application protocol to offer: QUIC requires ALPN");
-    if (cfg_.transport_params == nullptr)
-        return fail(Alert::InternalError, "no transport parameters to send: QUIC requires them");
+    if (cfg_.over_tcp) {
+        // \~english Over TCP: no transport parameters (RFC 9001, 8.2), and 0-RTT is not done.
+        // \~spanish Sobre TCP: sin parametros de transporte (RFC 9001, 8.2), y 0-RTT no se hace.  \~
+        if (cfg_.transport_params != nullptr)
+            return fail(Alert::InternalError, "transport parameters over TCP: they are QUIC's (RFC 9001, 8.2)");
+        if (cfg_.early_data) return fail(Alert::InternalError, "0-RTT over TCP is not supported by this end");
+    } else {
+        if (cfg_.alpn_count == 0) return fail(Alert::InternalError, "no application protocol to offer: QUIC requires ALPN");
+        if (cfg_.transport_params == nullptr)
+            return fail(Alert::InternalError, "no transport parameters to send: QUIC requires them");
+    }
     // \~english A server's chain is always checked, or not checked on purpose; never by default.
     // \~spanish La cadena de un servidor siempre se comprueba, o se deja sin comprobar a proposito; nunca por defecto.  \~
     if (cfg_.verifier == nullptr && !cfg_.trust_any_certificate)
@@ -413,7 +431,7 @@ bool Session::client_hello() noexcept {
     if (name_len != 0) write_server_name(w, cfg_.server_name, name_len);
     write_u16_list(w, ext::SupportedGroups, groups_, group_count_);
     write_u16_list(w, ext::SignatureAlgorithms, kSchemes, kSchemeCount);
-    write_alpn(w, cfg_.alpn, cfg_.alpn_count);
+    if (cfg_.alpn_count != 0) write_alpn(w, cfg_.alpn, cfg_.alpn_count);
     const uint16_t version = kTls13;
     write_supported_versions_client(w, &version, 1);
     const uint8_t *keys[2] = {share_pubs_[0], share_pubs_[1]};
@@ -422,7 +440,7 @@ bool Session::client_hello() noexcept {
     write_key_share_client(w, share_groups_, keys, lens, share_count_);
     // \~english The HelloRetryRequest's cookie goes back as it came (4.2.2).  \~spanish La cookie del HelloRetryRequest vuelve tal como vino (4.2.2).  \~
     if (cookie_.present) write_cookie(w, transcript_.bytes() + cookie_.at, cookie_.len);
-    write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
+    if (!cfg_.over_tcp) write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
 
     /* \~english
      * A ticket, if one is usable: after a retry only if its hash is the
@@ -560,8 +578,11 @@ void Session::sent(Space s, size_t n) noexcept {
 bool Session::handle(Handshake type, const uint8_t *m, size_t n) noexcept {
     // \~english QUIC has its own key update: a TLS one is 0x010a (RFC 9001, 6).
     // \~spanish QUIC tiene su propia actualizacion de claves: una de TLS es 0x010a (RFC 9001, 6).  \~
+    // \~english Over TCP a KeyUpdate is the channel's, and one that reaches the handshake came before a Finished (4.6.3).
+    // \~spanish Sobre TCP un KeyUpdate es del canal, y uno que llega al saludo vino antes de un Finished (4.6.3).  \~
     if (type == Handshake::KeyUpdate)
-        return fail(Alert::UnexpectedMessage, "a TLS KeyUpdate: QUIC updates keys itself (RFC 9001, 6)");
+        return fail(Alert::UnexpectedMessage, cfg_.over_tcp ? "a KeyUpdate before the Finished (RFC 8446, 4.6.3)"
+                                                            : "a TLS KeyUpdate: QUIC updates keys itself (RFC 9001, 6)");
     switch (state_) {
     case State::WaitClientHello:
     case State::WaitSecondClientHello:
@@ -588,8 +609,12 @@ bool Session::handle(Handshake type, const uint8_t *m, size_t n) noexcept {
         if (!cfg_.server && type == Handshake::NewSessionTicket) return on_new_session_ticket(m, n);
         // \~english No post-handshake client authentication in QUIC (RFC 9001, 4.4).
         // \~spanish Sin autenticacion del cliente tras el saludo en QUIC (RFC 9001, 4.4).  \~
+        // \~english Over TCP: post_handshake_auth was never offered (RFC 8446, 4.6.2).
+        // \~spanish Sobre TCP: nunca se ofrecio post_handshake_auth (RFC 8446, 4.6.2).  \~
         if (!cfg_.server && type == Handshake::CertificateRequest)
-            return fail_quic(kProtocolViolation, "a CertificateRequest after the handshake (RFC 9001, 4.4)");
+            return cfg_.over_tcp
+                       ? fail(Alert::UnexpectedMessage, "a CertificateRequest without post_handshake_auth (RFC 8446, 4.6.2)")
+                       : fail_quic(kProtocolViolation, "a CertificateRequest after the handshake (RFC 9001, 4.4)");
         break;
     default:
         break;
@@ -616,10 +641,23 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     // \~spanish 0-RTT sin proteccion contra repeticiones no se ofrece en silencio: se rechaza en voz alta (RFC 8446, 8).  \~
     if (cfg_.early_data && (cfg_.replay == nullptr || !cfg_.replay->ready() || cfg_.tickets == nullptr))
         return fail(Alert::InternalError, "0-RTT needs tickets and a replay guard (RFC 8446, 8)");
+    if (cfg_.early_data && cfg_.over_tcp) return fail(Alert::InternalError, "0-RTT over TCP is not supported by this end");
+    if (cfg_.over_tcp && cfg_.transport_params != nullptr)
+        return fail(Alert::InternalError, "transport parameters over TCP: they are QUIC's (RFC 9001, 8.2)");
     if (!ch.ext.has_supported_versions || !listed_in(m, ch.ext.versions, kTls13))
         return fail(Alert::ProtocolVersion, "the client does not offer TLS 1.3 (RFC 9001, 4.2)");
-    if (ch.session_id.len != 0)
+    if (!cfg_.over_tcp && ch.session_id.len != 0)
         return fail_quic(kProtocolViolation, "a non-empty legacy_session_id: no compatibility mode in QUIC (RFC 9001, 8.4)");
+    // \~english The second ClientHello keeps the first one's session ID: 4.1.2 lets it change nothing else.
+    // \~spanish El segundo ClientHello conserva el identificador de sesion del primero: 4.1.2 no le deja cambiar nada mas.  \~
+    if (second && (ch.session_id.len != session_id_len_ ||
+                   !same(m + ch.session_id.off, session_id_, session_id_len_)))
+        return fail(Alert::IllegalParameter, "the second ClientHello changed its legacy_session_id (RFC 8446, 4.1.2)");
+    // \~english Echoed as it came, whether or not it means anything to this end (4.1.3).
+    // \~spanish Se devuelve tal como vino, signifique algo para este extremo o no (4.1.3).  \~
+    session_id_len_ = static_cast<uint8_t>(ch.session_id.len);
+    util::vesta_memcpy_noinline(session_id_, m + ch.session_id.off, session_id_len_);
+    if (!second) early_offered_ = ch.ext.has_early_data;
     if (ch.ext.has_supported_groups != ch.ext.has_key_share)
         return fail(Alert::MissingExtension, "supported_groups and key_share go together (RFC 8446, 9.2)");
     if (!ch.ext.has_supported_groups) {
@@ -631,7 +669,9 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     }
     if (!ch.ext.has_signature_algorithms && !ch.ext.has_pre_shared_key)
         return fail(Alert::MissingExtension, "no signature_algorithms without a PSK (RFC 8446, 9.2)");
-    if (!ch.ext.has_transport_parameters)
+    if (cfg_.over_tcp && ch.ext.has_transport_parameters)
+        return fail(Alert::UnsupportedExtension, "quic_transport_parameters over TCP (RFC 9001, 8.2)");
+    if (!cfg_.over_tcp && !ch.ext.has_transport_parameters)
         return fail(Alert::MissingExtension, "no quic_transport_parameters (RFC 9001, 8.2)");
     if (second) {
         if (!same(m + ch.random.off, random_, sizeof random_))
@@ -654,8 +694,13 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     } else if (!choose_suite(m, ch.cipher_suites, chosen)) {
         return fail(Alert::HandshakeFailure, "no cipher suite in common (RFC 8446, 4.1.1)");
     }
-    if (!ch.ext.has_alpn) return fail(Alert::NoApplicationProtocol, "no ALPN: QUIC requires it (RFC 9001, 8.1)");
-    if (!choose_alpn(m, ch.ext.alpn))
+    // \~english Over TCP a client may offer no ALPN, and the server then chooses none -- unless it needs one.
+    // \~spanish Sobre TCP un cliente puede no ofrecer ALPN, y entonces el servidor no elige ninguno -- salvo que le haga falta.  \~
+    if (!ch.ext.has_alpn && cfg_.over_tcp && cfg_.require_alpn)
+        return fail(Alert::NoApplicationProtocol, "no ALPN, and this server serves only protocols chosen by it (RFC 7301, 3.2)");
+    if (!ch.ext.has_alpn && !cfg_.over_tcp)
+        return fail(Alert::NoApplicationProtocol, "no ALPN: QUIC requires it (RFC 9001, 8.1)");
+    if (ch.ext.has_alpn && !choose_alpn(m, ch.ext.alpn))
         return fail(Alert::NoApplicationProtocol, "no application protocol in common (RFC 7301, 3.2)");
 
     // \~english The client's first share in a group this end supports (4.2.8: in client preference order).
@@ -720,7 +765,7 @@ bool Session::on_client_hello(const uint8_t *m, size_t n) noexcept {
     }
     group_ = share_group;
     set_suite(chosen);
-    keep(msg_at, ch.ext.transport_parameters, peer_tp_);
+    if (ch.ext.has_transport_parameters) keep(msg_at, ch.ext.transport_parameters, peer_tp_);
     if (ch.ext.has_server_name && ch.ext.server_name.len != 0) keep(msg_at, ch.ext.server_name, server_name_);
     // \~english Decided with the ClientHello alone in the transcript: its early secret is over it (7.1).
     // \~spanish Se decide con el ClientHello solo en la transcripcion: su secreto temprano es sobre el (7.1).  \~
@@ -759,19 +804,19 @@ bool Session::accept_psk(const uint8_t *m, const ClientHello &ch, bool check_bin
         const size_t hl = hash_size(h);
         const uint8_t *b = m + ch.ext.psk_binders.off;
         if (b[0] != hl) {
-            wipe(&t, sizeof t);
+            wipe_secret(&t, sizeof t);
             return fail(Alert::DecryptError, "a PSK binder of the wrong length (RFC 8446, 4.2.11.2)");
         }
         uint8_t want[kMaxHash];
         const bool computed = binder(t.psk, h, m, ch.ext.psk_binders_at, want);
         const bool match = computed && same(want, b + 1, hl);
-        wipe(want, sizeof want);
+        wipe_secret(want, sizeof want);
         if (!computed) {
-            wipe(&t, sizeof t);
+            wipe_secret(&t, sizeof t);
             return false;
         }
         if (!match) {
-            wipe(&t, sizeof t);
+            wipe_secret(&t, sizeof t);
             return fail(Alert::DecryptError, "the PSK binder does not match (RFC 8446, 4.2.11.2)");
         }
         util::vesta_memcpy_noinline(psk_, t.psk, hl);
@@ -780,12 +825,12 @@ bool Session::accept_psk(const uint8_t *m, const ClientHello &ch, bool check_bin
         // \~english What 0-RTT is decided on: the ticket without its PSK, its age, and the binder that was checked.
         // \~spanish Sobre lo que se decide el 0-RTT: el ticket sin su PSK, su edad, y el binder que se comprobo.  \~
         taken_ = t;
-        wipe(taken_.psk, sizeof taken_.psk);
+        wipe_secret(taken_.psk, sizeof taken_.psk);
         const uint8_t *age = id + 2 + read16(id);
         obfuscated_age_ = uint32_t{age[0]} << 24 | uint32_t{age[1]} << 16 | uint32_t{age[2]} << 8 | age[3];
         util::vesta_memcpy_noinline(binder_key_, b + 1, sizeof binder_key_);
     }
-    wipe(&t, sizeof t);
+    wipe_secret(&t, sizeof t);
     return usable;
 }
 
@@ -869,7 +914,8 @@ bool Session::hello_retry(const ClientHello &) noexcept {
     const size_t msg = w.begin_message(Handshake::ServerHello);
     w.u16(kLegacyVersion);
     w.bytes(kHelloRetryRandom, 32);
-    w.u8(0);
+    w.u8(session_id_len_);
+    w.bytes(session_id_, session_id_len_);
     w.u16(suite_);
     w.u8(0);
     const size_t exts = w.open(2);
@@ -894,7 +940,7 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
     if (agreed != quic::Agreed::Ok) return fail_provider("the provider could not agree on a secret");
     uint8_t server_random[32];
     if (!c_.random(server_random, sizeof server_random)) {
-        wipe(shared, sizeof shared);
+        wipe_secret(shared, sizeof shared);
         return fail_provider("the provider gave no random bytes");
     }
 
@@ -906,7 +952,10 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
         const size_t msg = w.begin_message(Handshake::ServerHello);
         w.u16(kLegacyVersion);
         w.bytes(server_random, sizeof server_random);
-        w.u8(0);  // \~english the client's empty legacy_session_id, echoed  \~spanish el legacy_session_id vacio del cliente, devuelto  \~
+        // \~english The client's legacy_session_id, echoed: empty in QUIC, maybe not over TCP (4.1.3).
+        // \~spanish El legacy_session_id del cliente, devuelto: vacio en QUIC, quiza no sobre TCP (4.1.3).  \~
+        w.u8(session_id_len_);
+        w.bytes(session_id_, session_id_len_);
         w.u16(suite_);
         w.u8(0);
         const size_t exts = w.open(2);
@@ -919,7 +968,7 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
         w.end_message(msg);
         ok = commit(Space::Initial, w) && derive_handshake(shared, quic::kMaxShared);
     }
-    wipe(shared, sizeof shared);
+    wipe_secret(shared, sizeof shared);
     forget_shares();
     if (!ok) return false;
     reading_ = Space::Handshake;
@@ -929,8 +978,8 @@ bool Session::server_flight(const uint8_t *m, const ClientHello &, size_t share_
     if (!begin(Space::Handshake, 64 + 255 + cfg_.transport_params_len, w)) return false;
     size_t msg = w.begin_message(Handshake::EncryptedExtensions);
     size_t exts = w.open(2);
-    write_alpn(w, cfg_.alpn + alpn_index_, 1);
-    write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
+    if (alpn_.present) write_alpn(w, cfg_.alpn + alpn_index_, 1);
+    if (!cfg_.over_tcp) write_transport_parameters(w, cfg_.transport_params, cfg_.transport_params_len);
     // \~english Accepting early data is saying so here (4.2.10; RFC 9001, 4.6.2).
     // \~spanish Aceptar los datos tempranos es decirlo aqui (4.2.10; RFC 9001, 4.6.2).  \~
     if (early_accepted_) write_empty_extension(w, ext::EarlyData);
@@ -1065,7 +1114,7 @@ bool Session::on_server_hello(const uint8_t *m, size_t n) noexcept {
     if (agreed != quic::Agreed::Ok) return fail_provider("the provider could not agree on a secret");
     group_ = sh.ext.share_group;
     const bool ok = add(m, n) && derive_handshake(shared, quic::kMaxShared);
-    wipe(shared, sizeof shared);
+    wipe_secret(shared, sizeof shared);
     forget_shares();
     if (!ok) return false;
     reading_ = Space::Handshake;
@@ -1111,9 +1160,13 @@ bool Session::on_encrypted_extensions(const uint8_t *m, size_t n) noexcept {
     EncryptedExtensions ee;
     const Parsed p = parse_encrypted_extensions(m, n, ee);
     if (!p.ok()) return fail(p.alert, "the EncryptedExtensions do not parse (RFC 8446, 4.3.1)");
-    if (!ee.ext.has_transport_parameters)
+    if (cfg_.over_tcp && ee.ext.has_transport_parameters)
+        return fail(Alert::UnsupportedExtension, "quic_transport_parameters over TCP (RFC 9001, 8.2)");
+    if (!cfg_.over_tcp && !ee.ext.has_transport_parameters)
         return fail(Alert::MissingExtension, "no quic_transport_parameters (RFC 9001, 8.2)");
     // \~english No answer to what was not asked (4.2).  \~spanish Ninguna respuesta a lo que no se pregunto (4.2).  \~
+    if (ee.ext.has_alpn && cfg_.alpn_count == 0)
+        return fail(Alert::UnsupportedExtension, "an ALPN answer to a ClientHello without one (RFC 8446, 4.2)");
     if (ee.ext.has_server_name && cfg_.server_name == nullptr)
         return fail(Alert::UnsupportedExtension, "a server_name answer to a ClientHello without one (RFC 8446, 4.2)");
     if (ee.ext.has_early_data) {
@@ -1125,12 +1178,14 @@ bool Session::on_encrypted_extensions(const uint8_t *m, size_t n) noexcept {
             return fail(Alert::IllegalParameter, "early_data accepted without the PSK (RFC 8446, 4.2.10)");
         early_accepted_ = true;
     }
-    if (!ee.ext.has_alpn)
+    // \~english Over TCP a server may choose none: whether the client can live with that is its owner's to say.
+    // \~spanish Sobre TCP un servidor puede no elegir ninguno: si el cliente puede vivir con eso lo dice su dueno.  \~
+    if (!ee.ext.has_alpn && !cfg_.over_tcp)
         return fail(Alert::NoApplicationProtocol, "the server chose no application protocol (RFC 9001, 8.1)");
     // \~english Exactly one name, checked when read: its length byte, then the name.
     // \~spanish Exactamente un nombre, comprobado al leerlo: su byte de longitud, y luego el nombre.  \~
-    const Span name{ee.ext.alpn.off + 1, ee.ext.alpn.len - 1u};
-    bool offered = false;
+    const Span name{ee.ext.alpn.off + 1, ee.ext.has_alpn ? ee.ext.alpn.len - 1u : 0u};
+    bool offered = !ee.ext.has_alpn;
     for (size_t i = 0; i < cfg_.alpn_count && !offered; ++i) {
         size_t len = 0;
         while (cfg_.alpn[i][len] != '\0') ++len;
@@ -1140,8 +1195,8 @@ bool Session::on_encrypted_extensions(const uint8_t *m, size_t n) noexcept {
         return fail(Alert::NoApplicationProtocol, "the server chose a protocol that was not offered (RFC 9001, 8.1)");
     const size_t msg_at = transcript_.size();
     if (!add(m, n)) return false;
-    keep(msg_at, ee.ext.transport_parameters, peer_tp_);
-    keep(msg_at, name, alpn_);
+    if (ee.ext.has_transport_parameters) keep(msg_at, ee.ext.transport_parameters, peer_tp_);
+    if (ee.ext.has_alpn) keep(msg_at, name, alpn_);
     // \~english Resumed: no certificate, straight to the Finished (4.4).  \~spanish Reanudado: sin certificado, directo al Finished (4.4).  \~
     state_ = resumed_ ? State::WaitFinished : State::WaitCertificate;
     return true;
@@ -1269,7 +1324,7 @@ bool Session::on_finished(const uint8_t *m, size_t n) noexcept {
     uint8_t want[kMaxHash];
     if (!finished_for(cfg_.server, want)) return false;
     const bool match = same(want, m + 4, hl);
-    wipe(want, sizeof want);
+    wipe_secret(want, sizeof want);
     if (!match) return fail(Alert::DecryptError, "the peer's Finished does not match (RFC 8446, 4.4.4)");
     if (!add(m, n)) return false;
     uint8_t th[kMaxHash];
@@ -1321,7 +1376,9 @@ bool Session::on_new_session_ticket(const uint8_t *m, size_t n) noexcept {
     if (!p.ok()) return fail(p.alert, "the NewSessionTicket does not parse (RFC 8446, 4.6.1)");
     // \~english QUIC repurposes max_early_data_size as a flag: 0xffffffff or absent (RFC 9001, 4.6.1).
     // \~spanish QUIC reutiliza max_early_data_size como marca: 0xffffffff o ausente (RFC 9001, 4.6.1).  \~
-    if (nst.ext.has_early_data && nst.ext.max_early_data != 0xffffffffu)
+    // \~english Over TCP it is a real size, and moot: this end does no 0-RTT over TCP.
+    // \~spanish Sobre TCP es un tamano de verdad, y no importa: este extremo no hace 0-RTT sobre TCP.  \~
+    if (!cfg_.over_tcp && nst.ext.has_early_data && nst.ext.max_early_data != 0xffffffffu)
         return fail_quic(kProtocolViolation, "a NewSessionTicket early_data other than 0xffffffff (RFC 9001, 4.6.1)");
     // \~english A lifetime of zero: discarded at once (4.6.1).  \~spanish Una vida de cero: se tira en el acto (4.6.1).  \~
     if (nst.lifetime == 0) return true;
@@ -1412,7 +1469,7 @@ bool Session::issue_tickets() noexcept {
         const size_t n = cfg_.tickets->seal(t, sealed, sizeof sealed);
         const uint32_t lifetime = t.lifetime_s;
         const uint32_t age_add = t.age_add;
-        wipe(&t, sizeof t);
+        wipe_secret(&t, sizeof t);
         if (n == 0) return fail_provider("a ticket could not be sealed");
 
         Writer w(nullptr, 0);

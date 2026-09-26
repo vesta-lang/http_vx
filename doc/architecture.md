@@ -393,6 +393,22 @@ limite de la aritmetica de Poly1305.
 Los dos proveedores pasan los MISMOS casos -- una sola prueba, que corre contra
 cada proveedor que haya --, igual que los backends de E/S con la R8.
 
+### 9.2.1 Sobre TCP, el mismo corte
+
+HTTP/1.1 y HTTP/2 cifrados usan el MISMO saludo de TLS 1.3 que QUIC
+(`tls_session.h`, con `over_tcp`), llevado en registros (RFC 8446, 5) por
+`tls_channel.h`, y el MISMO proveedor de primitivas: el corte no se mueve.
+`tls_service.h` es un servicio de flujo mas: descifra para `Http1Service` o
+`Http2Service` -- los elige ALPN -- y cifra lo que contestan, sin que ellos ni
+el fragmento sepan que TLS esta ahi.  Tras el saludo una conexion guarda solo
+sus claves; el saludo se devuelve, y un buffer en claro solo se tiene con un
+mensaje a medias (R1).
+
+> **Sobre TCP NO hay 0-RTT.**  Los tickets que se emiten no lo permiten, y los
+> datos tempranos que se ofrezcan igualmente se rechazan y se saltan (RFC 8446,
+> 4.2.10).  Lo que compra -- una ida y vuelta -- ya lo da HTTP/3, y lo que
+> cuesta -- peticiones repetibles -- no se paga dos veces.
+
 ### 9.3 Sin proveedor no se degrada
 
 > **R24. Si se pide transporte cifrado y no hay proveedor, DEBE fallar

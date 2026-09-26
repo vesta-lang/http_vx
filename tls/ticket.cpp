@@ -14,6 +14,7 @@
  */
 
 #include "http_vx/tls_ticket.h"
+#include "http_vx/wipe.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -38,13 +39,6 @@ const uint8_t kLabel[] = {'h', 't', 't', 'p', '_', 'v', 'x', ' ', 't', 'i', 'c',
 constexpr size_t kFixed = 1 + 2 + 8 + 4 + 4;
 constexpr size_t kMaxPlain = kFixed + 1 + kMaxHash + 1 + 255 + 1 + 32;
 constexpr size_t kNonce = quic::kNonceSize;
-
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
-}
 
 void put(uint8_t *&p, uint64_t v, size_t n) noexcept {
     for (size_t i = 0; i < n; ++i) *p++ = static_cast<uint8_t>(v >> (8 * (n - 1 - i)));
@@ -90,7 +84,7 @@ size_t TicketSealer::seal(const TicketContents &t, uint8_t *out, size_t room) co
     if (room >= kNonce + n + quic::kTagSize && c_.random(out, kNonce) &&
         c_.seal(aead_, out, kLabel, sizeof kLabel, plain, n, out + kNonce))
         size = kNonce + n + quic::kTagSize;
-    wipe(plain, sizeof plain);
+    wipe_secret(plain, sizeof plain);
     return size;
 }
 
@@ -130,9 +124,9 @@ bool TicketSealer::open(const uint8_t *in, size_t n, TicketContents &t) const no
     } else {
         ok = false;
     }
-    wipe(plain, sizeof plain);
+    wipe_secret(plain, sizeof plain);
     if (!ok) {
-        wipe(&t, sizeof t);
+        wipe_secret(&t, sizeof t);
         t = TicketContents{};
     }
     return ok;

@@ -15,6 +15,8 @@
 
 #include "chacha20_poly1305.h"
 
+#include "http_vx/wipe.h"
+
 #include "util/mem/vesta_memcpy.h"
 #include "util/mem/vesta_memset.h"
 
@@ -53,29 +55,6 @@ inline void quarter(uint32_t *x, int a, int b, int c, int d) noexcept {
     x[c] += x[d]; x[b] ^= x[c]; x[b] = rotl(x[b], 12);
     x[a] += x[b]; x[d] ^= x[a]; x[d] = rotl(x[d], 8);
     x[c] += x[d]; x[b] ^= x[c]; x[b] = rotl(x[b], 7);
-}
-
-/**
- * @brief
- * \~english Overwrites secret bytes so that the optimizer cannot drop it.
- * \~spanish Sobrescribe bytes secretos de forma que el optimizador no lo pueda quitar.
- * \~
- *
- * \~english
- * Same reason as in `quic/protection.cpp`: zeroing memory that is about to
- * die is a dead store, and a keystream or a one-time key left on the stack is
- * a key left on the stack.
- * \~spanish
- * Por lo mismo que en `quic/protection.cpp`: poner a cero memoria que va a
- * morir es un almacen muerto, y un flujo de clave o una clave de un solo uso que
- * se queda en la pila es una clave que se queda en la pila.
- * \~
- */
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
 }
 
 constexpr uint32_t kMask26 = 0x3ffffff;
@@ -157,7 +136,7 @@ void aead_tag(const uint8_t *key, const uint8_t *nonce, const uint8_t *ad,
 
     Poly1305 p;
     poly1305_init(p, otk);
-    wipe(otk, sizeof otk);
+    wipe_secret(otk, sizeof otk);
 
     poly1305_update(p, ad, ad_len);
     pad16(p, ad_len);
@@ -206,8 +185,8 @@ void block(const uint8_t *key, uint32_t counter, const uint8_t *nonce,
     // \~spanish Se vuelve a sumar la entrada: sin eso las rondas se podrian deshacer.  \~
     for (int i = 0; i < 16; ++i) store32(out + 4 * i, x[i] + s[i]);
 
-    wipe(x, sizeof x);
-    wipe(s, sizeof s);
+    wipe_secret(x, sizeof x);
+    wipe_secret(s, sizeof s);
 }
 
 void xor_stream(const uint8_t *key, uint32_t counter, const uint8_t *nonce,
@@ -221,7 +200,7 @@ void xor_stream(const uint8_t *key, uint32_t counter, const uint8_t *nonce,
         out += take;
         n -= take;
     }
-    wipe(ks, sizeof ks);
+    wipe_secret(ks, sizeof ks);
 }
 
 void poly1305_init(Poly1305 &p, const uint8_t *key) noexcept {
@@ -361,7 +340,7 @@ void poly1305_finish(Poly1305 &p, uint8_t *tag) noexcept {
     f = static_cast<uint64_t>(w3) + p.pad[3] + (f >> 32);
     store32(tag + 12, static_cast<uint32_t>(f));
 
-    wipe(&p, sizeof p);
+    wipe_secret(&p, sizeof p);
 }
 
 void seal(const uint8_t *key, const uint8_t *nonce, const uint8_t *ad,
@@ -384,7 +363,7 @@ bool open(const uint8_t *key, const uint8_t *nonce, const uint8_t *ad,
     // \~spanish Se comparan todos los bytes, este donde este la primera diferencia.  \~
     uint8_t diff = 0;
     for (size_t i = 0; i < kTagSize; ++i) diff = static_cast<uint8_t>(diff | (want[i] ^ in[body + i]));
-    wipe(want, sizeof want);
+    wipe_secret(want, sizeof want);
     if (diff != 0) return false;
 
     xor_stream(key, 1, nonce, in, out, body);

@@ -14,6 +14,7 @@
  */
 
 #include "http_vx/quic_protection.h"
+#include "http_vx/wipe.h"
 
 #include "util/mem/vesta_memcpy.h"
 #include "util/mem/vesta_memset.h"
@@ -74,31 +75,6 @@ const VersionConstants *constants_of(uint32_t version) noexcept {
     for (const VersionConstants &v : kVersions)
         if (v.version == version) return &v;
     return nullptr;
-}
-
-/**
- * @brief
- * \~english Overwrites @p n bytes of key material so that no later read finds them.
- * \~spanish Sobrescribe @p n bytes de material de clave para que ninguna lectura posterior los encuentre.
- * \~
- *
- * \~english
- * A plain zeroing of memory that is about to die is a dead store, and an
- * optimizer is entitled to delete it -- which is how keys survive in freed
- * memory.  The out-of-line call and the empty asm that claims to read the
- * bytes are what keep the zeroing in the binary.
- * \~spanish
- * Poner a cero memoria que esta a punto de morir es un almacen muerto, y el
- * optimizador tiene derecho a borrarlo -- que es como sobreviven las claves en
- * memoria liberada.  La llamada fuera de linea y el asm vacio que dice leer los
- * bytes son lo que mantiene el borrado en el binario.
- * \~
- */
-void wipe(void *p, size_t n) noexcept {
-    util::vesta_memset_noinline(p, 0, n);
-#if defined(__GNUC__)
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-#endif
 }
 
 /// \~english The bits of the first byte header protection covers.
@@ -196,7 +172,7 @@ bool initial_secrets(Crypto &c, uint32_t version, const uint8_t *dcid,
                            client, 32) &&
               expand_label(c, Hash::Sha256, prk, sizeof prk, "server in",
                            server, 32);
-    wipe(prk, sizeof prk);
+    wipe_secret(prk, sizeof prk);
     return ok;
 }
 
@@ -245,7 +221,7 @@ bool prepare_keys(Crypto &c, KeyMaterial &m, PacketKeys &out) noexcept {
 
     // \~english The provider has its copy; this one is no longer needed.
     // \~spanish El proveedor tiene su copia; esta ya no hace falta.  \~
-    wipe(&m, sizeof m);
+    wipe_secret(&m, sizeof m);
 
     if (out.aead_state == nullptr || out.hp_state == nullptr) {
         forget_keys(c, out);
@@ -259,7 +235,7 @@ void forget_keys(Crypto &c, PacketKeys &k) noexcept {
     c.forget(k.hp_state);
     k.aead_state = nullptr;
     k.hp_state = nullptr;
-    wipe(k.iv, sizeof k.iv);
+    wipe_secret(k.iv, sizeof k.iv);
 }
 
 bool make_initial_keys(Crypto &c, uint32_t version, const uint8_t *dcid,
@@ -284,9 +260,9 @@ bool make_initial_keys(Crypto &c, uint32_t version, const uint8_t *dcid,
         if (!ok) forget_keys(c, read);
     }
 
-    wipe(client, sizeof client);
-    wipe(server, sizeof server);
-    wipe(&m, sizeof m);
+    wipe_secret(client, sizeof client);
+    wipe_secret(server, sizeof server);
+    wipe_secret(&m, sizeof m);
     return ok;
 }
 
