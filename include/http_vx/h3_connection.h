@@ -1,0 +1,328 @@
+/*
+ * http_vx -- servidor HTTP/1.1, HTTP/2 y HTTP/3
+ *
+ * Copyright (c) 2026 David Lopez T. (DesmonHak)
+ * Licencia: MIT (ver LICENSE).
+ */
+
+/**
+ * @file http_vx/h3_connection.h
+ * @brief
+ * \~english One HTTP/3 connection over a QUIC connection: streams in, messages out (RFC 9114, 4-8).
+ * \~spanish Una conexion HTTP/3 sobre una conexion QUIC: entran flujos, salen mensajes (RFC 9114, 4-8).
+ * \~
+ *
+ * \~english
+ * HTTP/3 has no byte stream of its own: it is what it puts on QUIC's.  Each
+ * endpoint opens three unidirectional streams -- its control stream, which
+ * starts with SETTINGS, and QPACK's encoder and decoder streams -- and every
+ * request lives on a client-initiated bidirectional stream of its own
+ * (6.1, 6.2).  This class keeps them apart and says what happened on them,
+ * one event at a time, in the order a caller can act on.
+ *
+ * **Sans-IO, like the rest.**  It reads and writes the streams of a
+ * quic::Connection that someone else feeds and drains; it never touches a
+ * socket or a clock of its own.
+ *
+ * **What is wrong is said, and scoped.**  A stream that breaks a rule of
+ * the message -- a malformed request, one cut short -- is a stream error:
+ * that stream is reset and the rest go on.  One that breaks the connection's
+ * -- a second control stream, DATA before HEADERS, a frame that does not add
+ * up -- closes the connection with its code (8).  Both leave the rule in
+ * words.
+ *
+ * **No server push.**  This end never sends MAX_PUSH_ID or PUSH_PROMISE;
+ * a push stream or a CANCEL_PUSH aimed at it is the error 4.6 and 7.2.3 name.
+ *
+ * \~spanish
+ * HTTP/3 no tiene flujo de bytes propio: es lo que pone en los de QUIC.  Cada
+ * extremo abre tres flujos unidireccionales -- su flujo de control, que empieza
+ * con SETTINGS, y los flujos del codificador y del descodificador de QPACK -- y
+ * cada peticion vive en un flujo bidireccional propio abierto por el cliente
+ * (6.1, 6.2).  Esta clase los separa y dice que paso en ellos, un evento cada
+ * vez, en el orden en que quien llama puede actuar.
+ *
+ * **Sin E/S, como el resto.**  Lee y escribe los flujos de una
+ * quic::Connection que otro alimenta y vacia; nunca toca un socket ni un reloj
+ * propios.
+ *
+ * **Lo que esta mal se dice, y con su alcance.**  Un flujo que rompe una regla
+ * del mensaje -- una peticion mal formada, una cortada -- es un error de flujo:
+ * ese flujo se reinicia y los demas siguen.  Uno que rompe la de la conexion --
+ * un segundo flujo de control, DATA antes de HEADERS, una trama que no cuadra --
+ * cierra la conexion con su codigo (8).  Los dos dejan la regla en palabras.
+ *
+ * **Sin server push.**  Este extremo nunca manda MAX_PUSH_ID ni PUSH_PROMISE;
+ * un flujo de push o un CANCEL_PUSH dirigido a el es el error que nombran 4.6 y
+ * 7.2.3.
+ * \~
+ */
+#ifndef HTTP_VX_H3_CONNECTION_H
+#define HTTP_VX_H3_CONNECTION_H
+
+#include "http_vx/buffer.h"
+#include "http_vx/h3_frame.h"
+#include "http_vx/message.h"
+#include "http_vx/qpack_decoder.h"
+#include "http_vx/qpack_encoder.h"
+#include "http_vx/quic_connection.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace http_vx {
+namespace h3 {
+
+/**
+ * @brief
+ * \~english What this end announces and keeps.  \~spanish Lo que anuncia y guarda este extremo.
+ * \~
+ */
+struct Config {
+    bool server = true;
+    /// \~english Sent in SETTINGS: QPACK's table and blocked streams, and the largest field section taken.
+    /// \~spanish Se manda en SETTINGS: la tabla y los flujos bloqueados de QPACK, y la mayor seccion de campos aceptada.  \~
+    Settings local;
+    /// \~english The most table this end's encoder uses, whatever the peer allows.
+    /// \~spanish La mayor tabla que usa el codificador de este extremo, permita lo que permita el otro.  \~
+    uint64_t encoder_capacity = 4096;
+    /// \~english Request streams followed at once; one more is refused with H3_REQUEST_REJECTED.
+    /// \~spanish Flujos de peticion seguidos a la vez; uno mas se rechaza con H3_REQUEST_REJECTED.  \~
+    size_t max_requests = 64;
+    /// \~english The most a frame other than DATA may hold (10.5).  \~spanish Lo mas que puede guardar una trama distinta de DATA (10.5).  \~
+    uint64_t max_held = FrameReader::kDefaultMaxHeld;
+};
+
+/**
+ * @brief
+ * \~english What poll() found.  \~spanish Lo que encontro poll().
+ * \~
+ */
+enum class EventKind : uint8_t {
+    None,
+    /// \~english Server: a request's header section; request() has it.  \~spanish Servidor: la seccion de cabecera de una peticion; request() la tiene.  \~
+    Request,
+    /// \~english Client: a response's header section, interim or final; response() has it.
+    /// \~spanish Cliente: la seccion de cabecera de una respuesta, provisional o final; response() la tiene.  \~
+    Response,
+    /// \~english Content bytes: data and len, valid until the next poll().  \~spanish Bytes de contenido: data y len, validos hasta el siguiente poll().  \~
+    Body,
+    /// \~english A trailer section: its fields joined the message's.  \~spanish Una seccion de remolques: sus campos se unieron a los del mensaje.  \~
+    Trailers,
+    /// \~english The message is whole: the peer ended the stream cleanly.  \~spanish El mensaje esta entero: el otro acabo el flujo limpiamente.  \~
+    End,
+    /// \~english The stream ended in error -- reset by the peer, or by this end over a rule; code says which.
+    /// \~spanish El flujo acabo en error -- reiniciado por el otro, o por este extremo por una regla; code dice cual.  \~
+    Reset,
+    /// \~english The peer sent GOAWAY; code is its identifier.  \~spanish El otro mando GOAWAY; code es su identificador.  \~
+    GoAway,
+    /// \~english The connection failed: failure() says why.  \~spanish La conexion fallo: failure() dice por que.  \~
+    Closed,
+};
+
+/**
+ * @brief
+ * \~english One event.  \~spanish Un evento.
+ * \~
+ */
+struct Event {
+    EventKind kind = EventKind::None;
+    uint64_t stream = 0;
+    uint64_t code = 0;
+    const uint8_t *data = nullptr;
+    size_t len = 0;
+};
+
+/**
+ * @brief
+ * \~english An HTTP/3 connection, either end.  \~spanish Una conexion HTTP/3, de cualquiera de los dos extremos.
+ * \~
+ */
+class Connection {
+public:
+    explicit Connection(quic::Connection &q) noexcept : q_(q) {}
+    ~Connection();
+    Connection(const Connection &) = delete;
+    Connection &operator=(const Connection &) = delete;
+
+    /**
+     * @brief
+     * \~english Ready to run: its own streams are opened as soon as the transport allows (6.2.1, 7.2.4.2).
+     * \~spanish Listo para funcionar: sus propios flujos se abren en cuanto el transporte lo permite (6.2.1, 7.2.4.2).
+     * \~
+     */
+    bool start(const Config &cfg) noexcept;
+
+    /**
+     * @brief
+     * \~english The next thing that happened; None when there is nothing more for now.
+     * \~spanish Lo siguiente que paso; None cuando por ahora no hay nada mas.
+     * \~
+     *
+     * \~english
+     * Call it after the QUIC connection took datagrams, until it gives None;
+     * then let the QUIC connection build its datagrams.  @p now_us is used
+     * only to close the connection when it fails.
+     * \~spanish
+     * Llamarlo despues de que la conexion QUIC tome datagramas, hasta que de
+     * None; despues dejar que la conexion QUIC construya sus datagramas.  @p
+     * now_us solo se usa para cerrar la conexion cuando falla.
+     * \~
+     */
+    Event poll(uint64_t now_us) noexcept;
+
+    /* \~english
+     * A message is read when its event comes: once its stream is gone from
+     * QUIC -- both directions over -- the next poll() lets it go.
+     * \~spanish
+     * Un mensaje se lee cuando llega su evento: cuando su flujo ya no esta en
+     * QUIC -- las dos direcciones acabadas -- el siguiente poll() lo suelta.
+     * \~ */
+    /// \~english Server: the request on @p stream, and the bytes its spans point into; null if none.
+    /// \~spanish Servidor: la peticion de @p stream, y los bytes a los que apuntan sus tramos; nulo si no hay.  \~
+    const Request *request(uint64_t stream, const Buffer *&bytes) const noexcept;
+    /// \~english Client: the last response section on @p stream; null if none.
+    /// \~spanish Cliente: la ultima seccion de respuesta de @p stream; nulo si no hay.  \~
+    const Response *response(uint64_t stream, const Buffer *&bytes) const noexcept;
+
+    /**
+     * @brief
+     * \~english Server: a response header section: interim (1xx) any number of times, then one final (4.1).
+     * \~spanish Servidor: una seccion de cabecera de respuesta: provisionales (1xx) las que sean, y una final (4.1).
+     * \~
+     */
+    bool respond(uint64_t stream, StatusCode status, const qpack::Line *fields, size_t count, bool end) noexcept;
+    /// \~english Content bytes on @p stream, in DATA frames; @p end closes it.  \~spanish Bytes de contenido en @p stream, en tramas DATA; @p end lo cierra.  \~
+    bool send_body(uint64_t stream, const uint8_t *p, size_t n, bool end) noexcept;
+
+    /// \~english Client: opens a request stream and sends its header section; the stream's ID, or ~0.
+    /// \~spanish Cliente: abre un flujo de peticion y manda su seccion de cabecera; el ID del flujo, o ~0.  \~
+    uint64_t send_request(const qpack::Line *lines, size_t count, bool end) noexcept;
+
+    /**
+     * @brief
+     * \~english Abandons @p stream: both directions stop, with @p code (4.1.1).
+     * \~spanish Abandona @p stream: se paran las dos direcciones, con @p code (4.1.1).
+     * \~
+     */
+    void cancel(uint64_t stream, uint64_t code) noexcept;
+
+    /// \~english Server: a graceful shutdown -- requests from here on are refused (5.2).
+    /// \~spanish Servidor: un cierre ordenado -- las peticiones desde aqui se rechazan (5.2).  \~
+    bool goaway() noexcept;
+
+    bool failed() const noexcept { return failure_.code != 0; }
+    const Failure &failure() const noexcept { return failure_; }
+    /// \~english Why the last stream reset by this end was; null if none.  \~spanish Por que fue el ultimo flujo reiniciado por este extremo; nulo si ninguno.  \~
+    const char *stream_why() const noexcept { return stream_why_; }
+    bool peer_settings_known() const noexcept { return peer_settings_; }
+    const Settings &peer_settings() const noexcept { return peer_; }
+    const qpack::Decoder &decoder() const noexcept { return decoder_; }
+    const qpack::Encoder &encoder() const noexcept { return encoder_; }
+
+private:
+    enum class Phase : uint8_t { Headers, Body, Trailers, Done };
+
+    /* \~english One request stream: its frames in, its message, and what waits to go out.
+     * \~spanish Un flujo de peticion: sus tramas de entrada, su mensaje, y lo que espera salir.  \~ */
+    struct Message {
+        uint64_t id = 0;
+        bool used = false;
+        Phase phase = Phase::Headers;
+        FrameReader reader;
+        /// \~english A HEADERS payload QPACK could not read yet (2.2.1).  \~spanish Una carga HEADERS que QPACK aun no pudo leer (2.2.1).  \~
+        Buffer blocked;
+        bool is_blocked = false;
+        Request request;
+        Response response;
+        Buffer fields;
+        uint64_t content_length = ~uint64_t{0};
+        uint64_t body_seen = 0;
+        /// \~english Client: the request was HEAD, so the response has no content (RFC 9110, 6.4.1).
+        /// \~spanish Cliente: la peticion fue HEAD, asi que la respuesta no tiene contenido (RFC 9110, 6.4.1).  \~
+        bool head_request = false;
+        bool final_response = false;
+        bool final_sent = false;
+        bool end_reported = false;
+        Buffer out;
+        bool out_fin = false;
+    };
+
+    /* \~english A stream this end opened, or a peer's unidirectional one, and what it is.
+     * \~spanish Un flujo que abrio este extremo, o uno unidireccional del otro, y que es.  \~ */
+    struct Uni {
+        uint64_t id = ~uint64_t{0};
+        uint64_t type = ~uint64_t{0};
+        bool discard = false;
+        /// \~english The stream type, gathered a byte at a time (6.2).  \~spanish El tipo de flujo, juntado byte a byte (6.2).  \~
+        uint8_t head[8] = {};
+        size_t head_len = 0;
+        FrameReader reader;
+        Buffer out;
+    };
+
+    bool fail(uint64_t code, const char *why) noexcept;
+    Event stream_error(Message &m, uint64_t code, const char *why) noexcept;
+    bool open_local() noexcept;
+    bool read_uni(quic::Stream &s, Uni &u) noexcept;
+    bool on_control(Uni &u, quic::Stream &s) noexcept;
+    bool on_control_frame(uint64_t type, const uint8_t *p, size_t n) noexcept;
+    Event read_message(quic::Stream &s, Message &m) noexcept;
+    Event on_headers(Message &m, const uint8_t *p, size_t n) noexcept;
+    Event on_trailers(Message &m, const uint8_t *p, size_t n) noexcept;
+    Event finish_headers(Message &m, qpack::Outcome o, const char *sink_why) noexcept;
+    Message *message(uint64_t id) noexcept;
+    const Message *message(uint64_t id) const noexcept;
+    Message *adopt(uint64_t id) noexcept;
+    void drop(Message &m) noexcept;
+    Uni *uni(uint64_t id) noexcept;
+    bool encode(Message &m, const qpack::Line *lines, size_t count, bool end) noexcept;
+    void flush() noexcept;
+    bool flush_one(Buffer &out, bool fin, uint64_t id) noexcept;
+    size_t encoder_room() noexcept;
+
+    quic::Connection &q_;
+    Config cfg_;
+    Failure failure_;
+    const char *stream_why_ = nullptr;
+    bool started_ = false;
+    bool closed_reported_ = false;
+
+    qpack::Decoder decoder_;
+    qpack::Encoder encoder_;
+    Settings peer_;
+    bool peer_settings_ = false;
+
+    /* \~english This end's three streams (control, QPACK encoder, QPACK decoder), then the peer's.
+     * \~spanish Los tres flujos de este extremo (control, codificador y descodificador de QPACK), y despues los del otro.  \~ */
+    static constexpr size_t kLocalUni = 3;
+    static constexpr size_t kPeerUni = 8;
+    Uni local_[kLocalUni];
+    Uni peer_uni_[kPeerUni];
+    bool peer_control_ = false;
+    bool peer_encoder_ = false;
+    bool peer_decoder_ = false;
+
+    Message *messages_ = nullptr;
+    size_t cursor_ = 0;
+
+    /* \~english Bytes handed out with a Body event, consumed at the next poll.
+     * \~spanish Bytes entregados con un evento Body, consumidos en el siguiente poll.  \~ */
+    uint64_t defer_stream_ = ~uint64_t{0};
+    size_t defer_n_ = 0;
+
+    /// \~english GOAWAY sent (server: the first stream refused) and received.  \~spanish GOAWAY mandado (servidor: el primer flujo rechazado) y recibido.  \~
+    uint64_t goaway_sent_ = ~uint64_t{0};
+    uint64_t goaway_received_ = ~uint64_t{0};
+    bool goaway_event_ = false;
+    uint64_t max_push_id_ = ~uint64_t{0};
+    /// \~english Server: the next client request stream not seen yet.  \~spanish Servidor: el siguiente flujo de peticion del cliente aun sin ver.  \~
+    uint64_t next_request_ = 0;
+    /// \~english The time of the last poll, for closing.  \~spanish La hora del ultimo poll, para cerrar.  \~
+    uint64_t now_ = 0;
+};
+
+} // namespace h3
+} // namespace http_vx
+
+#endif // HTTP_VX_H3_CONNECTION_H

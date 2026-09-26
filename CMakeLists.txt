@@ -220,6 +220,7 @@ target_link_libraries(http_vx_tls PUBLIC http_vx_quic vesta_alloc)
 # HTTP/3 comparte con HTTP/1.1 y HTTP/2 -- la semantica, QPACK -- sigue alli.
 # ---------------------------------------------------------------------------
 add_library(http_vx_h3 STATIC
+        proto/h3/connection.cpp
         proto/h3/frame.cpp
 )
 target_include_directories(http_vx_h3
@@ -553,6 +554,8 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_qpack_encoder tests/test_qpack_encoder.cpp)
     http_vx_add_test(test_h3_frame tests/test_h3_frame.cpp)
     target_link_libraries(test_h3_frame PRIVATE http_vx_h3)
+    http_vx_add_test(test_h3_connection tests/test_h3_connection.cpp)
+    target_link_libraries(test_h3_connection PRIVATE http_vx_h3)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
