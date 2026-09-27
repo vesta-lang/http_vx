@@ -262,6 +262,11 @@ suele pedirse **no es transporte**.
 > **R20. Los codecs DEBEN soportar respuestas de longitud indefinida con envio
 > incremental (SSE).**
 
+Como se produce ese cuerpo -- el servidor pide y la aplicacion rellena --, como
+se avisa desde otro hilo y que hace cada version esta en HVX-5
+([`respuestas-abiertas.md`](respuestas-abiertas.md)), con los requisitos R32 a
+R39.
+
 > **R21. La maquina de conexion DEBE admitir que una conexion deje de ser
 > peticion/respuesta** -- lo exigen `CONNECT` y WebSocket --.
 

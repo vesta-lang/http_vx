@@ -98,3 +98,4 @@ cuanto dependiera, dejaria de servir para lo demas.
 | --- | --- |
 | [`doc/architecture.md`](doc/architecture.md) | donde se corta y por que: el modelo de E/S, los fragmentos, la memoria, y lo que NO se hace |
 | [`doc/sin-red.md`](doc/sin-red.md) | servir HTTP sobre una tuberia, un socket de dominio o dos descriptores: donde estan las costuras, que reglas no se pueden romper, y como se sirve un recurso |
+| [`doc/respuestas-abiertas.md`](doc/respuestas-abiertas.md) | respuestas cuyo cuerpo sale a trozos (SSE, MCP): el servidor pide y la aplicacion rellena, como se avisa desde otro hilo sin cerrojos, y que hace cada version |
