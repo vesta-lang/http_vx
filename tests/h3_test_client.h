@@ -84,6 +84,9 @@ struct Seen {
     std::vector<std::pair<std::string, std::string>> fields;
     std::string body;
     bool ended = false;
+    /// \~english How many times the end was reported: never more than once.
+    /// \~spanish Cuantas veces se informo del final: nunca mas de una.  \~
+    int ends = 0;
     bool reset = false;
     uint64_t code = 0;
 
@@ -247,6 +250,7 @@ struct Client {
                 at(e.stream).body.append(reinterpret_cast<const char *>(e.data), e.len);
             } else if (e.kind == h3::EventKind::End) {
                 at(e.stream).ended = true;
+                ++at(e.stream).ends;
             } else if (e.kind == h3::EventKind::Reset) {
                 at(e.stream).reset = true;
                 at(e.stream).code = e.code;

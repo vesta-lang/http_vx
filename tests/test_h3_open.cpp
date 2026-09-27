@@ -93,12 +93,6 @@ void test_frames(Crypto &crypto, const Keys &k) {
     f.pending = "de";
     f.kick();
     w.settle();
-    // \~english Done with nothing more: the stream ends alone, with no frame.
-    // \~spanish Acabada sin nada mas: el flujo acaba solo, sin trama.  \~
-    f.finish = true;
-    f.kick();
-    w.settle();
-    check(f.gones == 1 && f.last == GoneReason::Finished && f.fills == 4, "the source is done, Finished");
 
     // \~english Read where QUIC left the bytes, before HTTP/3 takes them.
     // \~spanish Leido donde QUIC dejo los bytes, antes de que HTTP/3 los coja.  \~
@@ -118,13 +112,28 @@ void test_frames(Crypto &crypto, const Keys &k) {
     check(read_frame(p, n, at, type, len, width, payload) && type == h3::kData && payload == "de" && width == 2,
           "and the next fill, its own frame");
     check(at == n, "and nothing else: the fills that found nothing wrote no frame");
-    check(st != nullptr && st->recv->state() == RecvState::DataRecvd && st->recv->size_known() &&
-              st->recv->final_size() == n,
-          "the stream ended cleanly right after the last frame");
 
     c.hold = false;
     w.settle();
-    check(c.at(id).body == "firstabcde" && c.at(id).ended, "the client reads it all, and the end");
+    check(c.at(id).body == "firstabcde" && !c.at(id).ended, "the client reads it all, and no end yet");
+
+    /* \~english
+     * Done with nothing more: the stream ends alone, with no frame -- a FIN
+     * that arrives after the client read every byte, and still has to be
+     * heard as the end (RFC 9000, 3.2).
+     * \~spanish
+     * Acabada sin nada mas: el flujo acaba solo, sin trama -- un FIN que llega
+     * cuando el cliente ya leyo cada byte, y aun tiene que oirse como el final
+     * (RFC 9000, 3.2).
+     * \~ */
+    f.finish = true;
+    f.kick();
+    w.settle();
+    check(f.gones == 1 && f.last == GoneReason::Finished && f.fills == 4, "the source is done, Finished");
+    check(c.at(id).body == "firstabcde" && c.at(id).ended && c.at(id).ends == 1 && !c.at(id).reset,
+          "the client hears the end, once, and nothing after the last frame");
+    check(c.q->streams().find(id) == nullptr, "and the stream is gone once the end was taken");
+    check(!c.h->failed(), "the client saw no error");
 }
 
 void test_flow_control(Crypto &crypto, const Keys &k, bool connection) {

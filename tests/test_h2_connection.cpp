@@ -1559,6 +1559,167 @@ void test_connection_errors_say_why() {
     }
 }
 
+/**
+ * @brief
+ * \~english A GOAWAY payload: the last stream and the code.
+ * \~spanish La carga de un GOAWAY: el ultimo flujo y el codigo.
+ * \~
+ */
+void goaway(Session &s, uint32_t last, ErrorCode code, uint32_t on = 0, size_t len = 8) {
+    uint8_t p[8];
+    http_vx::h2::put_be32(p, last);
+    http_vx::h2::put_be32(p + 4, static_cast<uint32_t>(code));
+    s.p.frame(FrameType::Goaway, 0, on, p, len);
+}
+
+/**
+ * @brief
+ * \~english Where the GOAWAY waiting to go out starts; the pending size if there is none.
+ * \~spanish Donde empieza el GOAWAY que espera para salir; el tamano pendiente si no hay.
+ * \~
+ */
+size_t goaway_at(const Connection &c) {
+    size_t at = 0;
+    while (at + 9 <= c.pending_size()) {
+        FrameHeader h;
+        http_vx::h2::decode_frame_header(c.pending() + at, h);
+        if (h.type == static_cast<uint8_t>(FrameType::Goaway)) return at;
+        at += 9 + h.length;
+    }
+    return c.pending_size();
+}
+
+/**
+ * @brief
+ * \~english A peer's GOAWAY(NO_ERROR) lets what is open finish, and only then may this end leave (RFC 9113, 6.8).
+ * \~spanish Un GOAWAY(NO_ERROR) del otro deja acabar lo abierto, y solo entonces puede irse este extremo (RFC 9113, 6.8).
+ * \~
+ *
+ * \~english
+ * Stream 1 is answered-to-be when the GOAWAY arrives; stream 3 then begins a
+ * block past the concurrency limit, so it is refused and never enters the
+ * table -- and while its CONTINUATION is owed the connection still may not
+ * leave, because the peer is in the middle of a frame sequence the decoder
+ * has to see to the end (RFC 9113, 4.3).
+ * \~spanish
+ * El flujo 1 esta por contestar cuando llega el GOAWAY; el flujo 3 empieza
+ * luego un bloque por encima del tope de concurrencia, asi que se rechaza y no
+ * entra nunca en la tabla -- y mientras se deba su CONTINUATION la conexion
+ * tampoco puede irse, porque el otro esta a mitad de una secuencia de tramas
+ * que el descodificador tiene que ver hasta el final (RFC 9113, 4.3).
+ * \~
+ */
+void test_a_graceful_goaway_waits_for_what_is_open() {
+    Session s;
+    s.limits.max_concurrent_streams = 1;
+    s.c.reset(s.limits);
+    s.c.flushed(s.c.pending_size());
+    check(!s.c.may_leave() && !s.c.peer_leaving(), "a connection nobody is leaving may leave");
+
+    s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, kRequestBlock,
+              sizeof kRequestBlock);
+    goaway(s, 0, ErrorCode::NoError);
+
+    check(s.next().kind == EventKind::Request, "the request before the GOAWAY did not come out");
+    const Event g = s.next();
+    check(g.kind == EventKind::PeerLeaving && g.error == ErrorCode::NoError && s.c.peer_leaving(),
+          "a GOAWAY(NO_ERROR) was not reported as the peer leaving");
+    check(count_answers(s.c, FrameType::Goaway, 0) == 0, "a graceful GOAWAY was answered at once");
+    check(!s.c.may_leave(), "the connection may leave with stream 1 still to answer");
+
+    // \~english Three bytes of the block now, the rest in a CONTINUATION.  \~spanish Tres bytes del bloque ahora, el resto en una CONTINUATION.  \~
+    s.p.frame(FrameType::Headers, http_vx::h2::kEndStream, 3, kRequestBlock, 3);
+    check(s.next().kind == EventKind::None, "half a block came out as something");
+    s.c.streams().finish(1);
+    check(s.c.streams().count() == 0, "the refused stream was put in the table");
+    check(!s.c.may_leave(), "the connection may leave in the middle of a header block");
+
+    s.p.frame(FrameType::Continuation, http_vx::h2::kEndHeaders, 3, kRequestBlock + 3, sizeof kRequestBlock - 3);
+    const Event r = s.next();
+    check(r.kind == EventKind::StreamEnded && r.stream_id == 3 && r.error == ErrorCode::RefusedStream,
+          "the stream past the limit was not refused");
+    check(s.c.may_leave(), "nothing is open and the connection may not leave");
+
+    /* \~english
+     * This end's own GOAWAY: NO_ERROR, and the last stream it looked at is 3,
+     * the refused one included -- the peer learns 5 and up were never seen.
+     * \~spanish
+     * El GOAWAY de este extremo: NO_ERROR, y el ultimo flujo que miro es el 3,
+     * el rechazado incluido -- el otro sabe que del 5 en adelante no se vio
+     * nada.
+     * \~ */
+    s.c.flushed(s.c.pending_size());
+    s.c.leave();
+    const size_t at = goaway_at(s.c);
+    check(at == 0 && s.c.pending_size() == http_vx::h2::kGoawaySize, "leaving did not write one GOAWAY");
+    check(at < s.c.pending_size() && http_vx::h2::be32(s.c.pending() + at + 9) == 3 &&
+              http_vx::h2::be32(s.c.pending() + at + 13) == 0,
+          "the GOAWAY did not name stream 3 with NO_ERROR");
+    check(!s.c.may_leave(), "a connection that left may leave again");
+
+    const uint64_t was = s.c.consumed();
+    s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 5, kRequestBlock,
+              sizeof kRequestBlock);
+    check(s.c.read(s.p.view(), s.headers, s.req).kind == EventKind::None && s.c.consumed() == was,
+          "a connection that left went on reading");
+
+    // \~english The slot is reused for the next connection: nobody is leaving that one.
+    // \~spanish La ranura se reutiliza para la conexion siguiente: de esa no se va nadie.  \~
+    s.c.reset(s.limits);
+    check(!s.c.peer_leaving() && !s.c.may_leave(), "a reset connection still thought its peer was leaving");
+}
+
+/**
+ * @brief
+ * \~english A GOAWAY with an error ends at once, after a graceful one too; a malformed one is a connection error.
+ * \~spanish Un GOAWAY con error acaba en el acto, tambien detras de uno con calma; uno mal formado es un error de conexion.
+ * \~
+ */
+void test_a_goaway_with_an_error_ends_at_once() {
+    {
+        Session s;
+        s.p.frame(FrameType::Headers, http_vx::h2::kEndHeaders | http_vx::h2::kEndStream, 1, kRequestBlock,
+                  sizeof kRequestBlock);
+        goaway(s, 0, ErrorCode::InternalError);
+        check(s.next().kind == EventKind::Request, "the request before the GOAWAY did not come out");
+        const Event e = s.next();
+        check(e.kind == EventKind::Closed && e.error == ErrorCode::InternalError,
+              "a GOAWAY with an error did not end the connection with its code");
+        check(count_answers(s.c, FrameType::Goaway, 0) == 0, "a GOAWAY with an error was answered with another");
+        check(!s.c.peer_leaving() && !s.c.may_leave(), "a GOAWAY with an error was taken as a graceful one");
+    }
+    {
+        Session s;
+        goaway(s, 0, ErrorCode::NoError);
+        goaway(s, 0, ErrorCode::NoError);
+        goaway(s, 0, ErrorCode::ProtocolError);
+        check(s.next().kind == EventKind::PeerLeaving, "the first GOAWAY(NO_ERROR) was not the peer leaving");
+        check(s.next().kind == EventKind::PeerLeaving, "a second GOAWAY(NO_ERROR) was not the peer leaving");
+        const Event e = s.next();
+        check(e.kind == EventKind::Closed && e.error == ErrorCode::ProtocolError,
+              "an error after a graceful GOAWAY did not end the connection");
+        check(!s.c.may_leave() && count_answers(s.c, FrameType::Goaway, 0) == 0,
+              "a connection the peer ended may still leave, or answered");
+    }
+    {
+        Session s;
+        goaway(s, 0, ErrorCode::NoError, 0, 4);
+        check(closed_with(s, drain(s), ErrorCode::FrameSizeError, "eight bytes"),
+              "a GOAWAY shorter than eight bytes was not a connection error");
+        const size_t at = goaway_at(s.c);
+        check(at < s.c.pending_size() &&
+                  http_vx::h2::be32(s.c.pending() + at + 13) == static_cast<uint32_t>(ErrorCode::FrameSizeError),
+              "the GOAWAY this end wrote did not carry FRAME_SIZE_ERROR");
+    }
+    {
+        Session s;
+        goaway(s, 0, ErrorCode::NoError, 1);
+        const Event e = drain(s);
+        check(e.kind == EventKind::Closed && e.error == ErrorCode::ProtocolError && !s.c.peer_leaving(),
+              "a GOAWAY on a stream was not a connection error (RFC 9113, 6.8)");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1576,6 +1737,8 @@ int main() {
     test_a_refused_block_is_read_to_the_end();
     test_flow_control_refusals_say_why();
     test_connection_errors_say_why();
+    test_a_graceful_goaway_waits_for_what_is_open();
+    test_a_goaway_with_an_error_ends_at_once();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

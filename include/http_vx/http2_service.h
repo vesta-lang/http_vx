@@ -229,6 +229,24 @@ class Http2Service final : public Service, public KickTarget {
      */
     size_t bad_answers() const noexcept { return bad_answers_; }
 
+    /**
+     * @brief
+     * \~english How many GOAWAY(NO_ERROR) frames peers sent: graceful shutdowns that let their streams finish.
+     * \~spanish Cuantas tramas GOAWAY(NO_ERROR) mandaron los otros extremos: apagados con calma que dejan acabar sus flujos.
+     * \~
+     *
+     * \~english
+     * Counted because a connection that ends after one is not a failure and
+     * looks, from the outside, just like one that did: this is what tells
+     * them apart (RFC 9113, 6.8).
+     * \~spanish
+     * Se cuenta porque una conexion que acaba detras de uno no es un fallo y
+     * desde fuera se ve igual que una que lo fue: esto es lo que las
+     * distingue (RFC 9113, 6.8).
+     * \~
+     */
+    size_t graceful_goaways() const noexcept { return graceful_goaways_; }
+
     /// \~english The rule the last bad answer broke, or null if there has been none.
     /// \~spanish La regla que rompio la ultima respuesta mala, o nulo si no ha habido ninguna.  \~
     const char *last_bad_answer() const noexcept { return last_bad_answer_; }
@@ -453,6 +471,46 @@ class Http2Service final : public Service, public KickTarget {
     bool put_prefix(State &s, h2::Stream &st, uint32_t stream, const uint8_t *p,
                     size_t n, size_t &at, Buffer &out, size_t &left) noexcept;
 
+    /**
+     * \~english
+     * What is written while answering a read: bounded by the windows and
+     * @c kFillRoom alone, never by a caller's budget.
+     * \~spanish
+     * Lo que se escribe al contestar una lectura: acotado solo por las
+     * ventanas y @c kFillRoom, nunca por el presupuesto de quien llama.
+     * \~
+     */
+    static constexpr size_t kNoBudget = ~static_cast<size_t>(0);
+
+    /**
+     * @brief
+     * \~english Whether the connection goes on; once a leaving peer has nothing left, writes this end's GOAWAY and says no.
+     * \~spanish Si la conexion sigue; cuando a un extremo que se va no le queda nada, escribe el GOAWAY de este y dice que no.
+     * \~
+     *
+     * \~english
+     * Called at the end of every read and every @c on_writable, which are the
+     * only places a stream finishes.  The GOAWAY is written behind whatever
+     * the call already put in @p out, so the last response goes first; the
+     * caller then returns false and the shard sends it and closes (RFC 9113,
+     * 6.8).  A GOAWAY that does not fit @p left waits for the next
+     * @c on_writable, asked for here.
+     * \~spanish
+     * Se llama al final de cada lectura y de cada @c on_writable, que son los
+     * unicos sitios donde acaba un flujo.  El GOAWAY se escribe detras de lo que
+     * la llamada ya puso en @p out, asi que la ultima respuesta sale antes;
+     * luego quien llama devuelve false y el fragmento lo manda y cierra (RFC
+     * 9113, 6.8).  Un GOAWAY que no cabe en @p left espera al siguiente
+     * @c on_writable, que se pide aqui.
+     * \~
+     *
+     * @param s    \~english the connection  \~spanish la conexion  \~
+     * @param out  \~english where the GOAWAY goes  \~spanish donde va el GOAWAY  \~
+     * @param left \~english the budget left, or @c kNoBudget  \~spanish el presupuesto que queda, o @c kNoBudget  \~
+     * @return     \~english false if the connection is to end  \~spanish false si la conexion tiene que acabar  \~
+     */
+    bool still_needed(State &s, Buffer &out, size_t left) noexcept;
+
     /// \~english Asks for room on the connection if an open response wants it and the windows have some.
     /// \~spanish Pide sitio en la conexion si una respuesta abierta lo quiere y las ventanas tienen.  \~
     void wake_open(State &s) noexcept;
@@ -621,6 +679,7 @@ class Http2Service final : public Service, public KickTarget {
     size_t max_body_ = 0;
     size_t served_ = 0;
     size_t bad_answers_ = 0;
+    size_t graceful_goaways_ = 0;
     const char *last_bad_answer_ = nullptr;
 
     /// \~english The open responses, apart from @c works_ and @c bodies_ (HVX-5, 7.2).

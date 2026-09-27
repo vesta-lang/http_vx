@@ -303,6 +303,24 @@ Event Connection::stream_error(Message &m, uint64_t code, const char *why) noexc
     return e;
 }
 
+void Connection::abandon(quic::Stream &s, uint64_t code) noexcept {
+    if (s.recv == nullptr || s.recv->stop(code)) return;
+    /* \~english
+     * Too late to ask: every byte, or a reset, is already here (RFC 9000,
+     * 3.5).  Nobody will read it, so it is read now -- the connection's
+     * window gets the bytes back -- and its end taken, or the stream would
+     * wait forever for a reader and never be collected (3.2).
+     * \~spanish
+     * Demasiado tarde para pedirlo: ya estan aqui todos los bytes, o un
+     * reinicio (RFC 9000, 3.5).  Nadie lo va a leer, asi que se lee ahora -- la
+     * ventana de la conexion recupera los bytes -- y se recoge su final, o el
+     * flujo esperaria para siempre a un lector y nunca se recogeria (3.2).
+     * \~ */
+    const uint8_t *p = nullptr;
+    for (size_t n = s.recv->peek(p); n != 0; n = s.recv->peek(p)) q_.consume(s, n);
+    s.recv->read_end();
+}
+
 void Connection::cancel(uint64_t stream, uint64_t code) noexcept {
     Message *m = message(stream);
     if (m != nullptr) stream_error(*m, code, "cancelled by the application");
@@ -510,9 +528,15 @@ bool Connection::read_uni(quic::Stream &s, Uni &u) noexcept {
     // \~english The critical streams never end: closing one closes the connection (6.2.1; RFC 9204, 4.2).
     // \~spanish Los flujos criticos no acaban nunca: cerrar uno cierra la conexion (6.2.1; RFC 9204, 4.2).  \~
     const quic::RecvState st = s.recv->state();
-    const bool ended = st == quic::RecvState::ResetRecvd || st == quic::RecvState::ResetRead ||
-                       st == quic::RecvState::DataRead ||
-                       (s.recv->size_known() && s.recv->read_offset() == s.recv->final_size());
+    const bool ended = st == quic::RecvState::ResetRecvd || st == quic::RecvState::ResetRead || s.recv->at_end();
+    /* \~english
+     * The end is taken here, whatever it was: a stream that is not critical
+     * (one being thrown away) is then free to be collected (RFC 9000, 3.2).
+     * \~spanish
+     * El final se recoge aqui, fuera cual fuera: un flujo que no es critico
+     * (uno que se esta tirando) queda asi libre para recogerse (RFC 9000, 3.2).
+     * \~ */
+    if (ended) s.recv->read_end();
     const bool critical =
         u.type == kControlStream || u.type == qpack::kEncoderStreamType || u.type == qpack::kDecoderStreamType;
     if (ended && critical) return fail(kClosedCriticalStream, "a control or QPACK stream was closed (6.2.1; RFC 9204, 4.2)");
@@ -670,6 +694,7 @@ Event Connection::read_message(quic::Stream &s, Message &m) noexcept {
         // \~spanish Esperando a QPACK: el flujo no se lee -- salvo que el otro lo reinicie, que acaba la espera (RFC 9204, 2.2.2.2).  \~
         const quic::RecvState st = s.recv->state();
         if (st != quic::RecvState::ResetRecvd && st != quic::RecvState::ResetRead) return none;
+        s.recv->read_end();
         m.is_blocked = false;
         m.blocked.clear();
         decoder_.cancel_stream(m.id);
@@ -691,6 +716,15 @@ Event Connection::read_message(quic::Stream &s, Message &m) noexcept {
                 q_.consume(s, n);
                 continue;
             }
+            /* \~english
+             * And its end too, when it comes: already reported, or not wanted,
+             * it is still taken, or the stream would never be collected
+             * (RFC 9000, 3.2).
+             * \~spanish
+             * Y su final tambien, cuando llegue: ya informado, o no querido, se
+             * recoge igual, o el flujo no se recogeria nunca (RFC 9000, 3.2).
+             * \~ */
+            s.recv->read_end();
             return none;
         }
         if (n == 0) {
@@ -698,6 +732,7 @@ Event Connection::read_message(quic::Stream &s, Message &m) noexcept {
             if (st == quic::RecvState::ResetRecvd || st == quic::RecvState::ResetRead) {
                 // \~english Reset by the peer before the end: QPACK is told the stream is gone (RFC 9204, 2.2.2.2).
                 // \~spanish Reiniciado por el otro antes del final: se le dice a QPACK que el flujo ya no esta (RFC 9204, 2.2.2.2).  \~
+                s.recv->read_end();
                 decoder_.cancel_stream(m.id);
                 m.phase = Phase::Done;
                 m.end_reported = true;
@@ -707,9 +742,21 @@ Event Connection::read_message(quic::Stream &s, Message &m) noexcept {
                 e.code = s.recv->reset_code();
                 return e;
             }
-            const bool ended = st == quic::RecvState::DataRead ||
-                               (s.recv->size_known() && s.recv->read_offset() == s.recv->final_size());
-            if (!ended) return none;
+            if (!s.recv->at_end()) return none;
+            /* \~english
+             * Every byte read and the end here: taken now, once, whatever this
+             * end makes of it -- End, a stream error, or a connection error.
+             * The stream stays until then, so a FIN that arrived alone after
+             * the last DATA was read is reported like any other (RFC 9000,
+             * 3.2).
+             * \~spanish
+             * Todos los bytes leidos y el final aqui: se recoge ahora, una vez,
+             * haga lo que haga este extremo con el -- End, un error de flujo o
+             * uno de conexion.  El flujo sigue hasta entonces, asi que un FIN que
+             * llego solo tras leerse el ultimo DATA se informa como cualquier
+             * otro (RFC 9000, 3.2).
+             * \~ */
+            s.recv->read_end();
             if (!m.reader.at_boundary()) {
                 fail(kFrameError, "a stream that ends inside a frame (7.1)");
                 return none;
@@ -831,7 +878,7 @@ Event Connection::poll(uint64_t now_us) noexcept {
     for (const uint64_t seen = t.peer_opened(false); next_uni_ < seen && !failed(); ++next_uni_) {
         quic::Stream *s = t.find(next_uni_ * 4 + peer_uni_type);
         if (s == nullptr || s->recv == nullptr) continue;
-        if (uni(s->id) == nullptr) s->recv->stop(kStreamCreationError);
+        if (uni(s->id) == nullptr) abandon(*s, kStreamCreationError);
     }
     for (Uni &u : peer_uni_) {
         if (failed()) break;
@@ -907,7 +954,7 @@ Event Connection::poll(uint64_t now_us) noexcept {
             Message *m = (goaway_sent_ != kNone && s->id >= goaway_sent_) ? nullptr : adopt(s->id);
             if (m == nullptr) {
                 if (s->send != nullptr) s->send->reset(kRequestRejected);
-                if (s->recv != nullptr) s->recv->stop(kRequestRejected);
+                abandon(*s, kRequestRejected);
             }
         }
     }

@@ -192,6 +192,27 @@ struct Link {
         }
     }
 
+    /**
+     * @brief
+     * \~english Polls @p h one event at a time until one of kind @p k on @p stream, and stops there.
+     * \~spanish Hace poll de @p h evento a evento hasta uno de tipo @p k en @p stream, y se para ahi.
+     * \~
+     *
+     * \~english What the transport holds right after that event can then be looked at, before any later poll.
+     * \~spanish Asi se puede mirar lo que tiene el transporte justo despues de ese evento, antes de otro poll.  \~
+     *
+     * @return \~english whether that event came  \~spanish si llego ese evento  \~
+     */
+    bool poll_until(h3::Connection &h, std::vector<Rec> &into, h3::EventKind k, uint64_t stream) {
+        for (int guard = 0; guard < 1000; ++guard) {
+            const h3::Event e = h.poll(now);
+            if (e.kind == h3::EventKind::None) return false;
+            into.push_back(Rec{e.kind, e.stream, e.code, std::string(reinterpret_cast<const char *>(e.data), e.len)});
+            if (e.kind == k && e.stream == stream) return true;
+        }
+        return false;
+    }
+
     const Rec *find(const std::vector<Rec> &v, h3::EventKind k, uint64_t stream = ~uint64_t{0}) const {
         for (const Rec &r : v)
             if (r.kind == k && (stream == ~uint64_t{0} || r.stream == stream)) return &r;
@@ -205,6 +226,14 @@ struct Link {
         return s;
     }
 };
+
+/// \~english How many events of kind @p k came on @p stream.  \~spanish Cuantos eventos de tipo @p k llegaron en @p stream.  \~
+size_t count_of(const std::vector<Rec> &v, h3::EventKind k, uint64_t stream) {
+    size_t n = 0;
+    for (const Rec &r : v)
+        if (r.kind == k && r.stream == stream) ++n;
+    return n;
+}
 
 qpack::Line line(const char *name, const char *value) {
     qpack::Line l;
@@ -360,6 +389,10 @@ void stream_case(const std::vector<uint8_t> &v, bool fin, uint64_t code, const c
         Stream *s = k.qc.streams().find(id);
         check(s == nullptr || s->recv->state() == RecvState::ResetRecvd || s->recv->state() == RecvState::ResetRead,
               "the client sees the stream reset");
+        // \~english Whatever still arrives, and the end, are read and thrown away: the stream goes (RFC 9000, 3.2).
+        // \~spanish Lo que siga llegando, y el final, se leen y se tiran: el flujo se va (RFC 9000, 3.2).  \~
+        k.pump(4, false);
+        check(k.qs.streams().find(id) == nullptr, "the server kept a stream it was done with");
         return;
     }
     std::fprintf(stderr, "FAIL [%s]: %s: want a reset 0x%llx, got %s (%s)\n", current, what,
@@ -580,6 +613,17 @@ void test_server_limits() {
         check(s == nullptr || (s->recv->state() == RecvState::ResetRecvd && s->recv->reset_code() == h3::kRequestRejected) ||
                   s->recv->state() == RecvState::ResetRead,
               "it is reset with H3_REQUEST_REJECTED (4.1.1)");
+        /* \~english
+         * The whole request and its FIN came before it was rejected: too late
+         * to stop it, so it is thrown away here and its end taken -- or the
+         * stream, and a place in the peer's stream limit, would stay forever.
+         * \~spanish
+         * La peticion entera y su FIN llegaron antes de rechazarla: tarde para
+         * pararla, asi que se tira aqui y se recoge su final -- o el flujo, y un
+         * sitio en el limite de flujos del otro, se quedarian para siempre.
+         * \~ */
+        k.pump(4, false);
+        check(k.qs.streams().find(id) == nullptr, "the rejected stream stayed at the server");
     }
     {
         // \~english A section larger than announced is answered 431 (4.2.2).
@@ -900,9 +944,15 @@ void test_blocked() {
               "the request waits for its inserts");
         if (reset_it == 1) {
             k.qc.streams().find(id)->send->reset(h3::kRequestCancelled);
+            k.pump(3, false, false);
+            const bool reported = k.poll_until(k.hs, k.server_events, h3::EventKind::Reset, id);
+            const Stream *s = k.qs.streams().find(id);
+            check(reported && s != nullptr && s->recv->state() == RecvState::ResetRead,
+                  "the reset is taken from the transport as it is reported (RFC 9000, 3.2)");
             k.pump(3, false);
             const Rec *r = k.find(k.server_events, h3::EventKind::Reset, id);
             check(r != nullptr && r->code == h3::kRequestCancelled, "a reset ends the wait, and is reported");
+            check(count_of(k.server_events, h3::EventKind::Reset, id) == 1, "once");
             check(k.hs.decoder().blocked() == 0, "and the stream no longer counts as blocked (RFC 9204, 2.2.2.2)");
             continue;
         }
@@ -1148,6 +1198,201 @@ void test_stream_order() {
             if (s != nullptr && s->send->reset_code() != h3::kStreamCreationError) stopped = false;
         }
         check(stopped, "a unidirectional stream, kept or past what is kept, was not stopped (6.2)");
+
+        /* \~english
+         * A tenth, past what is kept, whose bytes and FIN all came before it
+         * was seen: too late to stop, so it is thrown away and its end taken.
+         * Then every one of them goes: the resets their stops asked for need
+         * nobody to hear them (RFC 9000, 3.5), and nothing waits for a reader.
+         * \~spanish
+         * Un decimo, pasado lo que se guarda, cuyos bytes y FIN llegaron todos
+         * antes de verlo: tarde para pararlo, asi que se tira y se recoge su
+         * final.  Despues se van todos: los reinicios que pidieron sus paradas no
+         * necesitan a nadie que los oiga (RFC 9000, 3.5), y nada espera a un
+         * lector.
+         * \~ */
+        const uint64_t tenth = raw(u, false, reserved, true);
+        u.pump(6, false);
+        bool gone = u.qs.streams().find(tenth) == nullptr;
+        for (const uint64_t id : ids)
+            if (u.qs.streams().find(id) != nullptr) gone = false;
+        check(gone, "a unidirectional stream this end is done with stayed");
+        check(!u.hs.failed(), "and nothing failed");
+    }
+}
+
+/**
+ * @brief
+ * \~english A message whose FIN comes alone, after its last DATA was read: End, once, on both sides (RFC 9000, 3.2; RFC 9114, 4.1).
+ * \~spanish Un mensaje cuyo FIN llega solo, tras leerse su ultimo DATA: End, una vez, en los dos lados (RFC 9000, 3.2; RFC 9114, 4.1).
+ * \~
+ *
+ * \~english
+ * In each case the other direction of the stream is already finished and
+ * acknowledged, so nothing but the end still to report keeps the stream: the
+ * transport must not collect it before HTTP/3 has taken that end.
+ * \~spanish
+ * En cada caso la otra direccion del flujo ya esta acabada y confirmada, asi que
+ * nada salvo el final aun por informar mantiene el flujo: el transporte no debe
+ * recogerlo antes de que HTTP/3 haya recogido ese final.
+ * \~
+ */
+void test_lone_fin() {
+    section("a response's FIN alone, after its body was read");
+    {
+        Link k;
+        k.start();
+        k.pump();
+        const std::vector<qpack::Line> req = get("/");
+        const uint64_t id = k.hc.send_request(req.data(), req.size(), true);
+        k.pump();
+        check(k.find(k.server_events, h3::EventKind::End, id) != nullptr, "the request ends");
+        check(k.hs.respond(id, 200, nullptr, 0, false), "the head");
+        check(k.hs.send_body(id, reinterpret_cast<const uint8_t *>("abc"), 3, false), "the body, not ended");
+        k.pump();
+        check(k.body(k.client_events, id) == "abc" && count_of(k.client_events, h3::EventKind::End, id) == 0,
+              "the client reads the body, and no end yet");
+        check(k.hs.send_body(id, nullptr, 0, true), "the end, alone");
+        k.pump(3, false);
+        const bool ended = k.poll_until(k.hc, k.client_events, h3::EventKind::End, id);
+        const Stream *s = k.qc.streams().find(id);
+        check(ended && s != nullptr && s->recv->state() == RecvState::DataRead,
+              "the end is taken from the transport as it is reported (RFC 9000, 3.2)");
+        k.pump();
+        check(count_of(k.client_events, h3::EventKind::End, id) == 1, "the client hears the end, once");
+        check(count_of(k.client_events, h3::EventKind::Reset, id) == 0, "and no reset");
+        check(k.qc.streams().find(id) == nullptr, "and the stream is gone once its end was taken");
+        check(!k.hc.failed() && !k.hs.failed(), "nothing failed");
+    }
+
+    section("a request's FIN alone, after its body, answered early");
+    {
+        Link k;
+        k.start();
+        k.pump();
+        const std::vector<qpack::Line> post = {line(":method", "POST"), line(":scheme", "https"),
+                                               line(":authority", "example.com"), line(":path", "/up")};
+        const uint64_t id = k.hc.send_request(post.data(), post.size(), false);
+        check(k.hc.send_body(id, reinterpret_cast<const uint8_t *>("abc"), 3, false), "the body, not ended");
+        k.pump();
+        check(k.find(k.server_events, h3::EventKind::Request, id) != nullptr && k.body(k.server_events, id) == "abc",
+              "the server reads the request and its body");
+        // \~english Answered before the request ended, as a server may (RFC 9114, 4.1).
+        // \~spanish Contestada antes de que acabe la peticion, como puede un servidor (RFC 9114, 4.1).  \~
+        check(k.hs.respond(id, 200, nullptr, 0, true), "an early, whole response");
+        k.pump();
+        check(count_of(k.client_events, h3::EventKind::End, id) == 1, "the client reads the response");
+        const Stream *s = k.qs.streams().find(id);
+        check(s != nullptr && s->send->state() == SendState::DataRecvd, "and the server's side is acknowledged");
+        check(k.hc.send_body(id, nullptr, 0, true), "the request's end, alone");
+        k.pump();
+        check(count_of(k.server_events, h3::EventKind::End, id) == 1, "the server hears the request's end, once");
+        check(k.qs.streams().find(id) == nullptr, "and the stream is gone once its end was taken");
+        check(!k.hc.failed() && !k.hs.failed(), "nothing failed");
+    }
+
+    section("a request's FIN alone, before its body was read");
+    {
+        Link k;
+        k.start();
+        k.pump();
+        const std::vector<qpack::Line> post = {line(":method", "POST"), line(":scheme", "https"),
+                                               line(":authority", "example.com"), line(":path", "/up")};
+        const uint64_t id = k.hc.send_request(post.data(), post.size(), false);
+        k.hc.send_body(id, reinterpret_cast<const uint8_t *>("abc"), 3, false);
+        k.pump(3, true, false);
+        k.hc.send_body(id, nullptr, 0, true);
+        k.pump(3, true, false);
+        const Stream *s = k.qs.streams().find(id);
+        check(s != nullptr && s->recv->state() == RecvState::DataRecvd && !s->recv->at_end(),
+              "everything arrived and nothing was read");
+        k.pump();
+        check(k.body(k.server_events, id) == "abc" && count_of(k.server_events, h3::EventKind::End, id) == 1,
+              "the body first, then the end, once");
+        size_t end_at = 0;
+        size_t body_at = 0;
+        for (size_t i = 0; i < k.server_events.size(); ++i) {
+            if (k.server_events[i].stream != id) continue;
+            if (k.server_events[i].kind == h3::EventKind::End) end_at = i;
+            if (k.server_events[i].kind == h3::EventKind::Body) body_at = i;
+        }
+        check(body_at < end_at, "the end came after the body");
+        check(!k.hc.failed() && !k.hs.failed(), "nothing failed");
+    }
+
+    section("a response reset after its head, the request done");
+    {
+        Link k;
+        k.start();
+        k.pump();
+        const std::vector<qpack::Line> req = get("/");
+        const uint64_t id = k.hc.send_request(req.data(), req.size(), true);
+        k.pump();
+        check(k.hs.respond(id, 200, nullptr, 0, false), "the head");
+        k.pump();
+        k.hs.cancel(id, h3::kInternalError);
+        k.pump(3, false);
+        const bool reported = k.poll_until(k.hc, k.client_events, h3::EventKind::Reset, id);
+        const Stream *s = k.qc.streams().find(id);
+        check(reported && s != nullptr && s->recv->state() == RecvState::ResetRead,
+              "the reset is reported, and taken from the transport as it is (RFC 9000, 3.2)");
+        k.pump();
+        check(count_of(k.client_events, h3::EventKind::Reset, id) == 1 &&
+                  count_of(k.client_events, h3::EventKind::End, id) == 0,
+              "once, and never as an end");
+        check(k.qc.streams().find(id) == nullptr, "and the stream is gone");
+    }
+
+    section("a FIN that overtook the data");
+    {
+        Link k;
+        k.start();
+        k.pump();
+        const std::vector<qpack::Line> post = {line(":method", "POST"), line(":scheme", "https"),
+                                               line(":authority", "example.com"), line(":path", "/up")};
+        const uint64_t id = k.hc.send_request(post.data(), post.size(), false);
+        k.pump();
+        check(k.find(k.server_events, h3::EventKind::Request, id) != nullptr, "the request");
+        /* \~english
+         * The FIN of a DATA frame of three bytes (two of header) arrives first,
+         * as a reordering network would deliver it: the size is known, the
+         * bytes before it are not here.
+         * \~spanish
+         * El FIN de una trama DATA de tres bytes (dos de cabecera) llega primero,
+         * como lo entregaria una red que reordena: el tamano se sabe, los bytes
+         * de delante no estan.
+         * \~ */
+        Stream *s = k.qs.streams().find(id);
+        uint64_t fresh = 0;
+        check(s != nullptr && s->recv->on_data(s->recv->highest() + 5, nullptr, 0, true, fresh) == StreamError::None,
+              "the early FIN is taken");
+        k.drain(k.hs, k.server_events);
+        check(count_of(k.server_events, h3::EventKind::End, id) == 0,
+              "no end while bytes before the FIN are missing");
+        check(k.hc.send_body(id, reinterpret_cast<const uint8_t *>("abc"), 3, false), "the missing DATA");
+        k.pump();
+        check(k.body(k.server_events, id) == "abc" && count_of(k.server_events, h3::EventKind::End, id) == 1,
+              "the body, then the end, once");
+        check(k.hc.send_body(id, nullptr, 0, true), "the client's own FIN, at the same size");
+        k.pump();
+        check(count_of(k.server_events, h3::EventKind::End, id) == 1 && !k.hs.failed(), "changes nothing");
+    }
+
+    section("a unidirectional stream of unknown type, ended");
+    {
+        Link k;
+        k.start(false);
+        k.pump(3, false);
+        // \~english A reserved type, a few bytes and the FIN in one go: nothing left to stop (RFC 9114, 6.2, 9).
+        // \~spanish Un tipo reservado, unos bytes y el FIN de una vez: nada que parar (RFC 9114, 6.2, 9).  \~
+        std::vector<uint8_t> v;
+        add_varint(v, 0x21);
+        const std::vector<uint8_t> junk = bytes("ignored");
+        v.insert(v.end(), junk.begin(), junk.end());
+        const uint64_t id = raw(k, false, v, true);
+        k.pump(4, false);
+        check(!k.hs.failed(), "an unknown stream type is not an error (6.2)");
+        check(k.qs.streams().find(id) == nullptr, "the stream was read, its end taken, and it went");
     }
 }
 
@@ -1165,6 +1410,7 @@ int main() {
     test_blocked();
     test_stream_order();
     test_stop_reading();
+    test_lone_fin();
     if (failures != 0) {
         std::fprintf(stderr, "h3 connection: %d failure(s)\n", failures);
         return 1;

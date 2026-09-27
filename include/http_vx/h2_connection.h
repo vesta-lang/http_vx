@@ -112,6 +112,14 @@ constexpr size_t kControlRoom = 1024;
 
 /**
  * @brief
+ * \~english How long a GOAWAY this end writes is: the frame header, the last stream and the code (RFC 9113, 6.8).
+ * \~spanish Cuanto mide un GOAWAY que escribe este extremo: la cabecera de trama, el ultimo flujo y el codigo (RFC 9113, 6.8).
+ * \~
+ */
+constexpr size_t kGoawaySize = kFrameHeaderSize + 8;
+
+/**
+ * @brief
  * \~english What came out of reading.
  * \~spanish Que salio de leer.
  * \~
@@ -210,6 +218,31 @@ enum class EventKind : uint8_t {
      * \~
      */
     StreamEnded,
+
+    /**
+     * \~english
+     * The peer sent GOAWAY with NO_ERROR: it is shutting down gracefully, and
+     * the connection CARRIES ON (RFC 9113, 6.8: GOAWAY "allows an endpoint to
+     * gracefully stop accepting new streams while still finishing processing
+     * of previously established streams").  Its last stream identifier names
+     * streams THIS end would have opened, and a server that pushes nothing
+     * opens none, so no request is cancelled by it.  Every stream goes on
+     * being read and answered; once none is left, @c may_leave says so and
+     * the caller ends the connection with @c leave.  A GOAWAY with any other
+     * code is @c Closed instead.
+     * \~spanish
+     * El otro extremo mando GOAWAY con NO_ERROR: se esta apagando con calma, y
+     * la conexion SIGUE (RFC 9113, 6.8: GOAWAY "allows an endpoint to
+     * gracefully stop accepting new streams while still finishing processing
+     * of previously established streams").  Su ultimo identificador de flujo
+     * nombra flujos que habria abierto ESTE extremo, y un servidor que no
+     * empuja nada no abre ninguno, asi que no cancela ninguna peticion.  Cada
+     * flujo se sigue leyendo y contestando; cuando no queda ninguno,
+     * @c may_leave lo dice y quien llama acaba la conexion con @c leave.  Un
+     * GOAWAY con cualquier otro codigo es @c Closed.
+     * \~
+     */
+    PeerLeaving,
 
     /**
      * \~english
@@ -468,6 +501,73 @@ class Connection {
 
     /**
      * @brief
+     * \~english Whether the peer said GOAWAY with NO_ERROR (@c EventKind::PeerLeaving).
+     * \~spanish Si el otro extremo dijo GOAWAY con NO_ERROR (@c EventKind::PeerLeaving).
+     * \~
+     * @return \~english whether it is leaving  \~spanish si se esta yendo  \~
+     */
+    bool peer_leaving() const noexcept { return peer_leaving_; }
+
+    /**
+     * @brief
+     * \~english Whether a peer that is leaving has nothing left on this connection.
+     * \~spanish Si un extremo que se va ya no tiene nada en esta conexion.
+     * \~
+     *
+     * \~english
+     * True once the peer said GOAWAY(NO_ERROR), no stream is left in the
+     * table and no header block is half read.  A stream stays in the table
+     * until its response has gone out whole -- a request whose body is still
+     * arriving, an answer waiting for a window and an open response all keep
+     * theirs -- so this is exactly "every stream already established has been
+     * finished" (RFC 9113, 6.8).  A block waiting for its CONTINUATION is a
+     * stream the peer has begun opening, and it is waited for too.
+     * \~spanish
+     * Verdad cuando el otro dijo GOAWAY(NO_ERROR), no queda ningun flujo en la
+     * tabla y no hay ningun bloque de cabeceras a medio leer.  Un flujo sigue
+     * en la tabla hasta que su respuesta ha salido entera -- una peticion cuyo
+     * cuerpo sigue llegando, una respuesta que espera una ventana y una
+     * respuesta abierta guardan el suyo --, asi que esto es exactamente "cada
+     * flujo ya establecido se ha terminado" (RFC 9113, 6.8).  Un bloque que
+     * espera su CONTINUATION es un flujo que el otro ha empezado a abrir, y
+     * tambien se le espera.
+     * \~
+     * @return \~english whether to @c leave now  \~spanish si hay que hacer @c leave ya  \~
+     */
+    bool may_leave() const noexcept;
+
+    /**
+     * @brief
+     * \~english Ends the connection gracefully: writes GOAWAY(NO_ERROR) and reads nothing more.
+     * \~spanish Acaba la conexion con calma: escribe GOAWAY(NO_ERROR) y no lee nada mas.
+     * \~
+     *
+     * \~english
+     * The answer to a peer's graceful GOAWAY once nothing is left: "a
+     * receiver of a GOAWAY that has no more use for the connection SHOULD
+     * still send a GOAWAY frame before terminating the connection" (RFC 9113,
+     * 6.8).  It names the highest stream this end looked at: every client
+     * stream up to it was processed or refused, and none after it was seen,
+     * so the peer may retry those on a new connection.  The caller makes room
+     * first (@c kGoawaySize);
+     * without it the GOAWAY is lost like @c fail's, and the connection ends
+     * all the same.
+     * \~spanish
+     * La respuesta a un GOAWAY con calma del otro cuando ya no queda nada: "a
+     * receiver of a GOAWAY that has no more use for the connection SHOULD
+     * still send a GOAWAY frame before terminating the connection" (RFC 9113,
+     * 6.8).  Nombra el flujo mayor que miro este extremo: cada flujo del
+     * cliente hasta el se proceso o se rechazo, y ninguno de despues se vio,
+     * asi que el otro puede reintentar esos por una conexion nueva.  Quien
+     * llama hace sitio antes
+     * (@c kGoawaySize); sin el, el GOAWAY se pierde como el de @c fail, y la
+     * conexion se acaba igual.
+     * \~
+     */
+    void leave() noexcept;
+
+    /**
+     * @brief
      * \~english Which rule the event just returned was a refusal for.
      * \~spanish Por que regla fue un rechazo el suceso recien devuelto.
      * \~
@@ -580,6 +680,33 @@ class Connection {
     /// \~english Ends the connection with @p code, keeps @p why for @c why, and writes the GOAWAY.
     /// \~spanish Acaba la conexion con @p code, guarda @p why para @c why, y escribe el GOAWAY.  \~
     Event fail(ErrorCode code, const char *why) noexcept;
+
+    /**
+     * @brief
+     * \~english Writes a GOAWAY with @p code, naming the last stream this end looked at.
+     * \~spanish Escribe un GOAWAY con @p code, nombrando el ultimo flujo que miro este extremo.
+     * \~
+     *
+     * \~english
+     * The one place a GOAWAY is written, for @c fail and @c leave alike, and
+     * both end the connection with it: this end writes at most ONE GOAWAY,
+     * which is how "Endpoints MUST NOT increase the value they send in the
+     * last stream identifier" (RFC 9113, 6.8) is kept -- there is no second
+     * value to compare.  A caller that ever writes a second one (an early
+     * GOAWAY of 2^31-1 before a server shutdown, 6.8) brings the comparison
+     * here with it.
+     * \~spanish
+     * El unico sitio donde se escribe un GOAWAY, para @c fail y @c leave por
+     * igual, y los dos acaban la conexion con el: este extremo escribe como
+     * mucho UN GOAWAY, que es como se cumple "Endpoints MUST NOT increase the
+     * value they send in the last stream identifier" (RFC 9113, 6.8) -- no hay
+     * un segundo valor con el que comparar.  Quien llegue a escribir un
+     * segundo (un GOAWAY temprano de 2^31-1 antes de apagar un servidor, 6.8)
+     * trae aqui la comparacion con el.
+     * \~
+     * @param code \~english why  \~spanish por que  \~
+     */
+    void put_goaway(ErrorCode code) noexcept;
 
     /// \~english Ends stream @p id with @p code, keeps @p why for @c why, and says so.
     /// \~spanish Acaba el flujo @p id con @p code, guarda @p why para @c why, y lo dice.  \~
@@ -725,6 +852,9 @@ class Connection {
     size_t control_len_ = 0;
 
     bool closed_ = false;
+
+    /// \~english The peer said GOAWAY(NO_ERROR) (RFC 9113, 6.8).  \~spanish El otro dijo GOAWAY(NO_ERROR) (RFC 9113, 6.8).  \~
+    bool peer_leaving_ = false;
 };
 
 } // namespace h2

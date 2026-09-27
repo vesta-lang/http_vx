@@ -292,6 +292,9 @@ void drive_streams(End &e) {
             buf.insert(buf.end(), p, p + n);
             c.consume(*st, n);
         }
+        // \~english The application takes the end once it read everything (RFC 9000, 3.2).
+        // \~spanish La aplicacion recoge el final cuando lo ha leido todo (RFC 9000, 3.2).  \~
+        st->recv->read_end();
         if (e.server && st->send != nullptr) {
             size_t &done = e.echoed[st->id];
             if (done < buf.size()) {
@@ -3097,6 +3100,76 @@ void test_stop_sending(Crypto &cr) {
     }
 }
 
+/**
+ * @brief
+ * \~english A FIN that comes alone after every byte was read: the stream waits for the application to take the end (RFC 9000, 3.2, 4.5).
+ * \~spanish Un FIN que llega solo tras leerse cada byte: el flujo espera a que la aplicacion recoja el final (RFC 9000, 3.2, 4.5).
+ * \~
+ *
+ * \~english
+ * The server's sending part is finished first, so nothing but the end the
+ * application has not taken keeps the stream: collected there, the end
+ * would be gone before anyone heard it.
+ * \~spanish
+ * La parte emisora del servidor se acaba antes, asi que nada salvo el final que
+ * la aplicacion no ha recogido mantiene el flujo: recogido ahi, el final se iria
+ * antes de que nadie lo oyera.
+ * \~
+ */
+void test_lone_fin(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/lone-fin", cr.name());
+    const ConnectionConfig cc = key_client();
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    // \~english The client's credit, as its transport parameters would give it: the server answers.
+    // \~spanish El credito del cliente, como lo darian sus parametros de transporte: el servidor contesta.  \~
+    sc.streams.peer_window_bidi_local = 1 << 20;
+    sc.peer_max_data = 1 << 20;
+    for (int contradict = 0; contradict < 2; ++contradict) {
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        say(k, "hello");
+        pump(k, 3);
+        check(heard(k) == "hello", "the request did not arrive");
+        Stream *srv = k.server.streams().find(0);
+        check(srv != nullptr, "stream 0 is not open at the server");
+        if (srv == nullptr) continue;
+        size_t took = 0;
+        srv->send->write(reinterpret_cast<const uint8_t *>("ok"), 2, took);
+        srv->send->finish();
+        // \~english Long enough for the client's delayed ACK to come back.
+        // \~spanish Lo bastante para que vuelva el ACK retrasado del cliente.  \~
+        pump(k, 12);
+        check(srv->send->state() == SendState::DataRecvd, "the server's answer was not acknowledged");
+
+        Stream *cli = k.client.streams().find(0);
+        check(cli != nullptr, "stream 0 is not open at the client");
+        if (cli == nullptr) continue;
+        cli->send->finish();
+        pump(k, 4);
+        srv = k.server.streams().find(0);
+        check(srv != nullptr && srv->recv->state() == RecvState::DataRecvd && srv->recv->at_end() &&
+                  srv->recv->final_size() == 5,
+              "a lone FIN after everything was read took the stream, and its end, away");
+        check_server_active(k, "a lone FIN at the size received closed the connection");
+        if (srv == nullptr) continue;
+
+        if (contradict == 1) {
+            // \~english A FIN at another size, while the end waits: FINAL_SIZE_ERROR (4.5).
+            // \~spanish Un FIN en otro tamano, mientras el final espera: FINAL_SIZE_ERROR (4.5).  \~
+            uint8_t f[32];
+            const size_t n = write_stream_header(f, sizeof f, 0, 4, 0, true, true);
+            to_server(cr, k, 1000, f, n);
+            check(server_closed_with(k, TransportError::FinalSizeError),
+                  "a lone FIN that moves the final size did not close with FINAL_SIZE_ERROR");
+            continue;
+        }
+        check(srv->recv->read_end() && !srv->recv->read_end(), "the end was not taken exactly once");
+        pump(k, 1);
+        check(k.server.streams().find(0) == nullptr, "a stream whose end was taken, and whose answer is done, stayed");
+        check_server_active(k, "taking the end broke the connection");
+    }
+}
+
 void run_all(Crypto &cr) {
     std::printf("-- %s --\n", cr.name());
     /* \~english
@@ -3138,6 +3211,7 @@ void run_all(Crypto &cr) {
     test_initial_rules(cr);
     test_key_update_rules(cr, Aead::Aes128Gcm);
     test_stop_sending(cr);
+    test_lone_fin(cr);
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
     test_cid_rules(cr);

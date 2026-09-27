@@ -393,6 +393,16 @@ private:
 
     bool fail(uint64_t code, const char *why) noexcept;
     Event stream_error(Message &m, uint64_t code, const char *why) noexcept;
+    /**
+     * @brief
+     * \~english Stops reading a stream nothing here will ever read: STOP_SENDING, or, if everything or a reset already came, the rest thrown away and its end taken.
+     * \~spanish Deja de leer un flujo que aqui nada leera nunca: STOP_SENDING, o, si ya llego todo o un reinicio, el resto tirado y su final recogido.
+     * \~
+     *
+     * @param s    \~english the stream  \~spanish el flujo  \~
+     * @param code \~english the STOP_SENDING's code  \~spanish el codigo del STOP_SENDING  \~
+     */
+    void abandon(quic::Stream &s, uint64_t code) noexcept;
     bool open_local() noexcept;
     bool read_uni(quic::Stream &s, Uni &u) noexcept;
     bool on_control(Uni &u, quic::Stream &s) noexcept;

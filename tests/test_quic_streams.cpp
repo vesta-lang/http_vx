@@ -75,7 +75,12 @@ void finish(Stream *s) {
         return;
     }
     uint64_t fresh = 0;
-    if (s->recv != nullptr) s->recv->on_data(0, nullptr, 0, true, fresh);
+    if (s->recv != nullptr) {
+        s->recv->on_data(0, nullptr, 0, true, fresh);
+        // \~english The application takes the end: only then is the part done (RFC 9000, 3.2).
+        // \~spanish La aplicacion recoge el final: solo entonces acaba la parte (RFC 9000, 3.2).  \~
+        s->recv->read_end();
+    }
     if (s->send != nullptr) {
         s->send->finish();
         StreamPiece p;
@@ -194,7 +199,61 @@ void test_closing_and_max_streams() {
     Stream *half = t.find(8);
     uint64_t fresh = 0;
     half->recv->on_data(0, nullptr, 0, true, fresh);
+    half->recv->read_end();
     check(t.collect() == 0 && t.find(8) != nullptr, "a stream still sending was collected");
+}
+
+/**
+ * @brief
+ * \~english A receiving part is done when the application took its end, not when the end arrived (RFC 9000, 3.2).
+ * \~spanish Una parte receptora acaba cuando la aplicacion recogio su final, no cuando llego el final (RFC 9000, 3.2).
+ * \~
+ */
+void test_end_untaken_is_not_collected() {
+    StreamTable t(server_config());
+    Stream *s = nullptr;
+    TransportError e;
+    frame(t, 8, FrameType::Stream, s, e);
+    uint64_t fresh = 0;
+    uint64_t released = 0;
+    const uint8_t data[4] = {1, 2, 3, 4};
+
+    // \~english Stream 0: every byte read, then the FIN alone; its sending part done.
+    // \~spanish Flujo 0: todos los bytes leidos, luego el FIN solo; su parte emisora acabada.  \~
+    Stream *a = t.find(0);
+    a->recv->on_data(0, data, sizeof data, false, fresh);
+    a->recv->consume(sizeof data);
+    a->recv->on_data(sizeof data, nullptr, 0, true, fresh);
+    a->send->reset(1);
+    a->send->on_reset_acked();
+    check(a->recv->state() == RecvState::DataRecvd && t.collect() == 0 && t.find(0) != nullptr,
+          "a stream whose lone FIN nobody took was collected, and its end with it");
+    // \~english Looked up again: a stream wrongly collected is gone, not to be touched.
+    // \~spanish Buscado de nuevo: un flujo recogido por error ya no esta, y no se toca.  \~
+    a = t.find(0);
+    check(a != nullptr && a->recv->read_end() && t.collect() == 1 && t.find(0) == nullptr,
+          "a stream whose end was taken was not collected");
+
+    // \~english Stream 4: reset by the peer; its end is the reset, and it has to be taken too.
+    // \~spanish Flujo 4: reiniciado por el otro; su final es el reinicio, y tambien hay que recogerlo.  \~
+    Stream *b = t.find(4);
+    b->recv->on_reset(0, 7, fresh, released);
+    b->send->reset(1);
+    b->send->on_reset_acked();
+    check(b->recv->state() == RecvState::ResetRecvd && t.collect() == 0 && t.find(4) != nullptr,
+          "a stream whose reset nobody took was collected");
+    b = t.find(4);
+    check(b != nullptr && b->recv->read_end() && t.collect() == 1, "a stream whose reset was taken was not collected");
+
+    // \~english Stream 8: the application stopped it; the reset answering it has nobody to tell (3.5).
+    // \~spanish Flujo 8: la aplicacion lo paro; el reinicio que lo contesta no tiene a quien decirselo (3.5).  \~
+    Stream *c = t.find(8);
+    check(c->recv->stop(1), "the stream could not be stopped");
+    c->recv->on_reset(0, 1, fresh, released);
+    c->send->reset(1);
+    c->send->on_reset_acked();
+    check(c->recv->state() == RecvState::ResetRead && t.collect() == 1,
+          "a stream the application stopped was not collected once reset");
 }
 
 /**
@@ -284,6 +343,7 @@ int main() {
     test_peer_streams();
     test_local_streams();
     test_closing_and_max_streams();
+    test_end_untaken_is_not_collected();
     test_against_a_model();
 
     if (failures != 0) {

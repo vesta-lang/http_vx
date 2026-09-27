@@ -143,6 +143,12 @@ struct Wire {
         const uint8_t cancel[4] = {0, 0, 0, 0x08};
         frame(FrameType::RstStream, 0, id, cancel, sizeof cancel);
     }
+
+    /// \~english A GOAWAY naming no server stream, with @p code.  \~spanish Un GOAWAY que no nombra ningun flujo del servidor, con @p code.  \~
+    void goaway(uint8_t code) {
+        const uint8_t p[8] = {0, 0, 0, 0, 0, 0, 0, code};
+        frame(FrameType::Goaway, 0, 0, p, sizeof p);
+    }
 };
 
 /// \~english What came back, frame by frame.  \~spanish Lo que volvio, trama a trama.  \~
@@ -209,6 +215,27 @@ struct Frames {
             if ((f[i].flags & kEndStream) != 0) ++ends;
         }
         return last != n && ends == 1 && (f[last].flags & kEndStream) != 0;
+    }
+
+    /// \~english The index of the first frame of type @p t on @p id, or @c n.  \~spanish El indice de la primera trama de tipo @p t en @p id, o @c n.  \~
+    size_t index(FrameType t, uint32_t id) const {
+        for (size_t i = 0; i < n; ++i)
+            if (f[i].type == static_cast<uint8_t>(t) && f[i].id == id) return i;
+        return n;
+    }
+
+    /// \~english The 32-bit word at @p off of the payload of frame @p i.  \~spanish La palabra de 32 bits en @p off de la carga de la trama @p i.  \~
+    uint32_t word(size_t i, size_t off) const {
+        const uint8_t *b = p + f[i].at + off;
+        return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
+               (static_cast<uint32_t>(b[2]) << 8) | b[3];
+    }
+
+    /// \~english Whether the GOAWAY is the last frame, alone, naming @p last with NO_ERROR.  \~spanish Si el GOAWAY es la ultima trama, solo, nombrando @p last con NO_ERROR.  \~
+    bool graceful_goaway_last(uint32_t last) const {
+        const size_t g = index(FrameType::Goaway, 0);
+        return n != 0 && g == n - 1 && count(FrameType::Goaway, 0) == 1 && f[g].len == 8 && word(g, 0) == last &&
+               word(g, 4) == 0;
     }
 
     /// \~english The largest DATA frame on @p id.  \~spanish La trama DATA mas grande de @p id.  \~
@@ -920,11 +947,83 @@ void test_shutdown() {
 
 /**
  * @brief
- * \~english A peer that leaves with GOAWAY takes its open responses with it: ConnectionClosed.
- * \~spanish Un extremo que se va con GOAWAY se lleva sus respuestas abiertas: ConnectionClosed.
+ * \~english A peer that leaves with GOAWAY(NO_ERROR) lets its open response finish, then this end says GOAWAY and closes.
+ * \~spanish Un extremo que se va con GOAWAY(NO_ERROR) deja acabar su respuesta abierta, y luego este dice GOAWAY y cierra.
+ * \~
+ *
+ * \~english
+ * RFC 9113, 6.8: GOAWAY "allows an endpoint to gracefully stop accepting new
+ * streams while still finishing processing of previously established
+ * streams".  A request the client sends after its own GOAWAY is served too:
+ * the rule not to open streams binds the receiver, which is this server.
+ * \~spanish
+ * RFC 9113, 6.8: GOAWAY "allows an endpoint to gracefully stop accepting new
+ * streams while still finishing processing of previously established
+ * streams".  Una peticion que el cliente manda despues de su propio GOAWAY se
+ * atiende tambien: la regla de no abrir flujos obliga al que lo recibe, que es
+ * este servidor.
  * \~
  */
-void test_goaway_closes() {
+void test_a_graceful_goaway_lets_it_finish() {
+    Server s;
+    check(s.start(), "the server would not start");
+    s.handler.before = "a";
+
+    Wire w;
+    w.hello();
+    w.request(1, "GET", "/open");
+    s.send(w);
+    s.run();
+    check(s.handler.opened[0].valid(), "the response was not opened");
+
+    Wire bye;
+    bye.goaway(0);
+    bye.request(3, "GET", "/whole");
+    s.send(bye);
+    s.run();
+
+    Frames f = s.frames();
+    check(s.source.gones == 0, "a graceful GOAWAY ended the open response");
+    check(s.io.closed() == 0, "a graceful GOAWAY closed the connection with a response open");
+    check(f.count(FrameType::Goaway, 0) == 0, "a GOAWAY went out with a response still open");
+    check(f.data(3) == "whole" && f.ended(3), "a request sent after the client's GOAWAY was not served");
+    check(s.service.graceful_goaways() == 1, "the graceful GOAWAY was not counted");
+
+    s.source.pending = "b";
+    s.source.kick();
+    s.run();
+    check(s.frames().data(1) == "ab" && s.source.gones == 0, "the open response was not filled after the GOAWAY");
+    check(s.io.closed() == 0 && s.frames().count(FrameType::Goaway, 0) == 0, "the connection left with a response open");
+
+    s.source.pending = "c";
+    s.source.finish = true;
+    s.source.kick();
+    s.run();
+
+    f = s.frames();
+    check(f.data(1) == "abc" && f.ended_last(1), "the open response did not end whole");
+    check(s.source.gones == 1 && s.source.last == GoneReason::Finished, "the open response did not end Finished");
+    check(f.graceful_goaway_last(3), "the last frame is not GOAWAY(NO_ERROR) naming stream 3");
+    check(s.io.closed() == 1, "the connection was not closed after its GOAWAY");
+}
+
+/**
+ * @brief
+ * \~english A GOAWAY with an error takes the open responses with it: ConnectionClosed, and no GOAWAY back.
+ * \~spanish Un GOAWAY con error se lleva las respuestas abiertas: ConnectionClosed, y ningun GOAWAY de vuelta.
+ * \~
+ *
+ * \~english
+ * ConnectionClosed and not PeerReset: the peer did not refuse this stream, it
+ * dropped the whole connection, and the source hears the same as for any
+ * other connection that ends under it.
+ * \~spanish
+ * ConnectionClosed y no PeerReset: el otro no rechazo este flujo, tiro la
+ * conexion entera, y la fuente oye lo mismo que con cualquier otra conexion
+ * que se acaba debajo de ella.
+ * \~
+ */
+void test_a_goaway_with_an_error_closes() {
     Server s;
     check(s.start(), "the server would not start");
 
@@ -935,11 +1034,40 @@ void test_goaway_closes() {
     s.run();
 
     Wire bye;
-    const uint8_t p[8] = {0, 0, 0, 1, 0, 0, 0, 0};
-    bye.frame(FrameType::Goaway, 0, 0, p, sizeof p);
+    bye.goaway(0x02);
     s.send(bye);
     s.run();
     check(s.source.gones == 1 && s.source.last == GoneReason::ConnectionClosed, "GOAWAY did not end it with ConnectionClosed");
+    check(s.frames().count(FrameType::Goaway, 0) == 0, "a GOAWAY with an error was answered with another");
+    check(s.io.closed() == 1 && s.service.graceful_goaways() == 0, "the connection was not closed, or counted graceful");
+}
+
+/**
+ * @brief
+ * \~english A GOAWAY with an error after a graceful one ends at once (RFC 9113, 6.8: circumstances may change).
+ * \~spanish Un GOAWAY con error detras de uno con calma acaba en el acto (RFC 9113, 6.8: las circunstancias pueden cambiar).
+ * \~
+ */
+void test_an_error_after_a_graceful_goaway_closes() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    Wire w;
+    w.hello();
+    w.request(1, "GET", "/open");
+    w.goaway(0);
+    s.send(w);
+    s.run();
+    check(s.source.gones == 0 && s.io.closed() == 0, "a graceful GOAWAY ended the connection");
+
+    Wire bye;
+    bye.goaway(0x01);
+    s.send(bye);
+    s.run();
+    check(s.source.gones == 1 && s.source.last == GoneReason::ConnectionClosed,
+          "an error after a graceful GOAWAY did not end it with ConnectionClosed");
+    check(s.io.closed() == 1 && s.frames().count(FrameType::Goaway, 0) == 0,
+          "an error after a graceful GOAWAY did not close at once, or was answered");
 }
 
 /**
@@ -1079,6 +1207,54 @@ void test_done_closes_the_stream() {
 
 /**
  * @brief
+ * \~english The GOAWAY after the last open response keeps to the budget: one that does not fit waits for the next call.
+ * \~spanish El GOAWAY detras de la ultima respuesta abierta cumple el presupuesto: uno que no cabe espera a la llamada siguiente.
+ * \~
+ */
+void test_the_goaway_waits_for_the_budget() {
+    Bare b;
+    check(b.start(), "the service would not start");
+
+    Wire w;
+    w.hello();
+    w.request(1, "GET", "/open");
+    check(b.send(w), "the connection ended");
+
+    Wire bye;
+    bye.goaway(0);
+    check(b.send(bye), "a graceful GOAWAY ended the connection with a response open");
+    check(b.frames().count(FrameType::Goaway, 0) == 0, "a GOAWAY went out with a response open");
+
+    b.source.pending = "end";
+    b.source.finish = true;
+    b.source.kick();
+    b.port.kicks.drain();
+    check(b.port.asked == 1, "a kick did not ask for room");
+
+    // \~english The last DATA takes the whole budget: no room is left for the GOAWAY.
+    // \~spanish El ultimo DATA se lleva todo el presupuesto: no queda sitio para el GOAWAY.  \~
+    b.port.asked = 0;
+    size_t was = b.out.size();
+    check(b.service.on_writable(b.c, b.out, kFrameHeaderSize + 3), "the connection ended before its GOAWAY fit");
+    check(b.out.size() - was == kFrameHeaderSize + 3 && b.frames().ended_last(1), "the last DATA did not go out");
+    check(b.frames().count(FrameType::Goaway, 0) == 0, "a GOAWAY went out past the budget");
+    check(b.port.asked != 0, "the GOAWAY that did not fit was not asked for again");
+
+    b.port.asked = 0;
+    was = b.out.size();
+    check(b.service.on_writable(b.c, b.out, http_vx::h2::kGoawaySize - 1), "the connection ended with no room for its GOAWAY");
+    check(b.out.size() == was && b.port.asked != 0, "a budget one byte short took the GOAWAY, or did not ask again");
+
+    check(!b.service.on_writable(b.c, b.out, http_vx::h2::kGoawaySize), "the GOAWAY that fit did not end the connection");
+    check(b.out.size() - was == http_vx::h2::kGoawaySize && b.frames().graceful_goaway_last(1),
+          "the GOAWAY did not go out alone, naming stream 1");
+
+    check(b.service.graceful_goaways() == 1, "the graceful GOAWAY was not counted");
+    check(b.start() && b.service.graceful_goaways() == 0, "a reset service kept the count of graceful GOAWAYs");
+}
+
+/**
+ * @brief
  * \~english Closing the connection by hand ends what is open with the port's closing reason.
  * \~spanish Cerrar la conexion a mano acaba lo abierto con el motivo de cierre de la puerta.
  * \~
@@ -1118,7 +1294,10 @@ int main() {
     test_other_requests_are_served();
     test_idle_timeout();
     test_shutdown();
-    test_goaway_closes();
+    test_a_graceful_goaway_lets_it_finish();
+    test_a_goaway_with_an_error_closes();
+    test_an_error_after_a_graceful_goaway_closes();
+    test_the_goaway_waits_for_the_budget();
     test_the_connection_window();
     test_the_budget_is_kept();
     test_a_short_fill_waits_for_its_kick();

@@ -314,8 +314,16 @@ size_t StreamTable::collect() noexcept {
         Stream &s = slots_[i];
         if (s.id == kNever) continue;
 
+        /* \~english
+         * Only the terminal states the application reached (3.2): "Data
+         * Recvd" and "Reset Recvd" still hold an end it has not heard, and a
+         * stream collected there takes that end with it.
+         * \~spanish
+         * Solo los estados terminales a los que llego la aplicacion (3.2):
+         * "Data Recvd" y "Reset Recvd" aun guardan un final que no ha oido, y un
+         * flujo recogido ahi se lleva ese final con el.
+         * \~ */
         const bool recv_done = s.recv == nullptr || s.recv->state() == RecvState::DataRead ||
-                               s.recv->state() == RecvState::ResetRecvd ||
                                s.recv->state() == RecvState::ResetRead;
         const bool send_done = s.send == nullptr || s.send->state() == SendState::DataRecvd ||
                                s.send->state() == SendState::ResetRecvd;

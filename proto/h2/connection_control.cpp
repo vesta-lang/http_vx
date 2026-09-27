@@ -216,24 +216,107 @@ Event Connection::on_goaway(const View &v) noexcept {
         return fail(ErrorCode::FrameSizeError,
                     "a GOAWAY shorter than eight bytes (RFC 9113, 6.8)");
 
-    /* \~english
-     * The peer is leaving.  This end does not answer a GOAWAY -- there is
-     * nothing to say and the peer has already stopped listening -- so the
-     * connection ends without one being written, which is why this does
-     * not go through @c fail.
-     * \~spanish
-     * El otro extremo se va.  Este no contesta a un GOAWAY -- no hay nada
-     * que decir y el otro ya ha dejado de escuchar -- asi que la conexion se
-     * acaba sin escribir ninguno, que es la razon de que esto no pase por
-     * @c fail.
-     * \~ */
-    closed_ = true;
-
     const Span p = reader_.payload();
+    const ErrorCode code = static_cast<ErrorCode>(be32(v.at(v.origin + p.off) + 4));
+
+    /* \~english
+     * NO_ERROR is a graceful shutdown, and the connection carries on: GOAWAY
+     * "allows an endpoint to gracefully stop accepting new streams while
+     * still finishing processing of previously established streams" (RFC
+     * 9113, 6.8).  Its last stream identifier is "the last peer-initiated
+     * stream" from the SENDER's side -- here, a stream this server would have
+     * opened -- and this server opens none, so it cancels nothing.
+     *
+     * Streams the client opens AFTER its own GOAWAY are still served.  The
+     * RFC binds the RECEIVER: "Receivers of a GOAWAY frame MUST NOT open
+     * additional streams" -- and the receiver is this end, which opens none
+     * anyway.  Nothing forbids the sender from opening one (a request already
+     * in flight when it decided to leave is the ordinary case), and refusing
+     * it would lose a request the client sent in good faith.  So nothing
+     * about reading changes; only the end does, see @c may_leave.
+     *
+     * A second GOAWAY(NO_ERROR) says the same again.  One with any other code
+     * -- first or after a graceful one ("an endpoint that sends GOAWAY with
+     * NO_ERROR during graceful shutdown could subsequently encounter a
+     * condition that requires immediate termination", 6.8) -- ends the
+     * connection at once, and this end writes no GOAWAY of its own: the peer
+     * has stopped listening.
+     * \~spanish
+     * NO_ERROR es un apagado con calma, y la conexion sigue: GOAWAY "allows
+     * an endpoint to gracefully stop accepting new streams while still
+     * finishing processing of previously established streams" (RFC 9113,
+     * 6.8).  Su ultimo identificador de flujo es "the last peer-initiated
+     * stream" visto desde quien lo MANDA -- aqui, un flujo que habria abierto
+     * este servidor -- y este servidor no abre ninguno, asi que no cancela
+     * nada.
+     *
+     * Los flujos que abre el cliente DESPUES de su propio GOAWAY se siguen
+     * atendiendo.  El RFC obliga al que lo RECIBE: "Receivers of a GOAWAY
+     * frame MUST NOT open additional streams" -- y el que lo recibe es este
+     * extremo, que no abre ninguno igualmente.  Nada le prohibe abrir uno al
+     * que lo manda (una peticion ya en vuelo cuando decidio irse es el caso
+     * corriente), y rechazarla perderia una peticion que el cliente mando de
+     * buena fe.  Asi que la lectura no cambia; solo cambia el final, ver
+     * @c may_leave.
+     *
+     * Un segundo GOAWAY(NO_ERROR) dice lo mismo otra vez.  Uno con cualquier
+     * otro codigo -- el primero o detras de uno con calma ("an endpoint that
+     * sends GOAWAY with NO_ERROR during graceful shutdown could subsequently
+     * encounter a condition that requires immediate termination", 6.8) --
+     * acaba la conexion en el acto, y este extremo no escribe GOAWAY propio:
+     * el otro ha dejado de escuchar.
+     * \~ */
     Event e;
+    e.error = code;
+    if (code == ErrorCode::NoError) {
+        peer_leaving_ = true;
+        e.kind = EventKind::PeerLeaving;
+        return e;
+    }
+
+    closed_ = true;
     e.kind = EventKind::Closed;
-    e.error = static_cast<ErrorCode>(be32(v.at(v.origin + p.off) + 4));
     return e;
+}
+
+void Connection::put_goaway(ErrorCode code) noexcept {
+    /* \~english
+     * A GOAWAY carries the last stream this end actually looked at, so the
+     * peer knows which of its requests were seen and which it may send again
+     * on a new connection.  Reporting zero -- or the highest possible -- would
+     * be telling it either that nothing was served or that everything was, and
+     * both are answers it would act on.
+     * \~spanish
+     * Un GOAWAY lleva el ultimo flujo que este extremo llego a mirar, para que
+     * el otro sepa cuales de sus peticiones se vieron y cuales puede volver a
+     * mandar por una conexion nueva.  Decir cero -- o el mayor posible -- seria
+     * decirle o que no se sirvio nada o que se sirvio todo, y las dos son
+     * respuestas sobre las que actuaria.
+     * \~ */
+    uint8_t payload[kGoawaySize - kFrameHeaderSize];
+    put_be32(payload, streams_.highest_seen());
+    put_be32(payload + 4, static_cast<uint32_t>(code));
+
+    /* \~english
+     * Both callers end the connection whatever happens here, and both made
+     * sure of the room first; if it was not there, the peer loses only the
+     * courtesy of the reason (see @c fail).
+     * \~spanish
+     * Los dos que llaman acaban la conexion pase lo que pase aqui, y los dos se
+     * aseguraron antes del sitio; si no estaba, el otro solo pierde la
+     * cortesia del motivo (ver @c fail).
+     * \~ */
+    static_cast<void>(put_frame(FrameType::Goaway, 0, 0, payload, sizeof payload));
+}
+
+bool Connection::may_leave() const noexcept {
+    return peer_leaving_ && !closed_ && streams_.count() == 0 &&
+           !reader_.awaiting_continuation();
+}
+
+void Connection::leave() noexcept {
+    closed_ = true;
+    put_goaway(ErrorCode::NoError);
 }
 
 } // namespace h2

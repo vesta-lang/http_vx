@@ -238,6 +238,16 @@ public:
      * \~spanish Quita cada flujo cuyas partes han terminado las dos, y lo cuenta como cerrado.
      * \~
      *
+     * \~english
+     * A receiving part has finished once the application took its end
+     * (`RecvStream::read_end`): "Data Read" or "Reset Read", never "Data
+     * Recvd" or "Reset Recvd" (RFC 9000, 3.2).
+     * \~spanish
+     * Una parte receptora ha terminado cuando la aplicacion recogio su final
+     * (`RecvStream::read_end`): "Data Read" o "Reset Read", nunca "Data Recvd"
+     * ni "Reset Recvd" (RFC 9000, 3.2).
+     * \~
+     *
      * @return \~english how many were removed  \~spanish cuantos se quitaron  \~
      */
     size_t collect() noexcept;

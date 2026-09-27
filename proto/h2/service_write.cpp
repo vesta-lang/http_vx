@@ -168,6 +168,33 @@ bool Http2Service::resume(State &s, Work *w, Buffer &out) noexcept {
     return true;
 }
 
+bool Http2Service::still_needed(State &s, Buffer &out, size_t left) noexcept {
+    if (!s.conn.may_leave()) return true;
+
+    /* \~english
+     * What the connection still owes goes out ahead of the GOAWAY, and both
+     * within the budget: a GOAWAY that does not fit whole waits for the next
+     * call rather than overrunning a TLS record.  No stream is left, so
+     * nothing will write in between; the next call is asked for here, since
+     * nobody else is going to ask.
+     * \~spanish
+     * Lo que aun debe la conexion sale delante del GOAWAY, y los dos dentro del
+     * presupuesto: un GOAWAY que no cabe entero espera a la llamada siguiente
+     * en vez de pasarse de un registro TLS.  No queda ningun flujo, asi que
+     * nadie escribira entre medias; la llamada siguiente se pide aqui, porque no
+     * la va a pedir nadie mas.
+     * \~ */
+    if (left < s.conn.pending_size() + h2::kGoawaySize) {
+        if (port_ != nullptr) port_->want_writable(s.handle);
+        return true;
+    }
+
+    if (!flush_control(s, out)) return false;
+    s.conn.leave();
+    static_cast<void>(flush_control(s, out));
+    return false;
+}
+
 bool Http2Service::drain(State &s, Buffer &out) noexcept {
     uint32_t i = s.works;
 

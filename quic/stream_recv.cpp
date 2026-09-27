@@ -213,12 +213,20 @@ StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, b
     if (all_received()) {
         state_ = RecvState::DataRecvd;
 
-        // \~english A FIN that arrives after everything was read leaves nothing to read.
-        // \~spanish Un FIN que llega cuando ya se leyo todo no deja nada que leer.  \~
-        if (read_ == final_) {
-            state_ = RecvState::DataRead;
-            release_all();
-        }
+        /* \~english
+         * A FIN that arrives after everything was read leaves no byte to
+         * read, but it is still an end the application has not heard: the
+         * stream stays in "Data Recvd" until `read_end` (3.2).  Going to "Data
+         * Read" here let the stream be collected with the end untold.  Only
+         * the memory goes now.
+         * \~spanish
+         * Un FIN que llega cuando ya se leyo todo no deja ningun byte que leer,
+         * pero sigue siendo un final que la aplicacion no ha oido: el flujo
+         * sigue en "Data Recvd" hasta `read_end` (3.2).  Pasar aqui a "Data
+         * Read" dejaba recoger el flujo con el final sin decir.  Solo la
+         * memoria se va ya.
+         * \~ */
+        if (read_ == final_) release_all();
     }
     return StreamError::None;
 }
@@ -252,7 +260,16 @@ StreamError RecvStream::on_reset(uint64_t final_size, uint64_t error_code,
     // \~spanish Contado como recibido, sin leerse nunca: la conexion lo recupera.  \~
     released = final_size - read_;
     reset_code_ = error_code;
-    state_ = RecvState::ResetRecvd;
+    /* \~english
+     * The application that asked for this reset with STOP_SENDING already gave
+     * the stream up (3.5): nobody is left to be told, so it is read as it
+     * arrives.  Any other reset waits in "Reset Recvd" for `read_end`.
+     * \~spanish
+     * La aplicacion que pidio este reinicio con STOP_SENDING ya abandono el
+     * flujo (3.5): no queda nadie a quien decirselo, asi que se lee al llegar.
+     * Cualquier otro reinicio espera en "Reset Recvd" a `read_end`.
+     * \~ */
+    state_ = stopped_ ? RecvState::ResetRead : RecvState::ResetRecvd;
     buffered_ = 0;
     release_all();
     return StreamError::None;
@@ -288,11 +305,21 @@ void RecvStream::consume(size_t n) noexcept {
     read_ = to;
     buffered_ -= n;
 
-    if (size_known_ && read_ == final_ &&
-        (state_ == RecvState::DataRecvd || state_ == RecvState::SizeKnown)) {
+    // \~english The last byte read: the memory goes, the end waits for `read_end` (3.2).
+    // \~spanish Leido el ultimo byte: la memoria se va, el final espera a `read_end` (3.2).  \~
+    if (state_ == RecvState::DataRecvd && read_ == final_) release_all();
+}
+
+bool RecvStream::read_end() noexcept {
+    if (state_ == RecvState::DataRecvd && read_ == final_) {
         state_ = RecvState::DataRead;
-        release_all();
+        return true;
     }
+    if (state_ == RecvState::ResetRecvd) {
+        state_ = RecvState::ResetRead;
+        return true;
+    }
+    return false;
 }
 
 bool RecvStream::wants_update() const noexcept {

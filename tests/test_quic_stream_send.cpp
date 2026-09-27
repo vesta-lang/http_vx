@@ -323,6 +323,9 @@ void test_end_to_end() {
             if (rx.wants_update()) tx.on_max_stream_data(rx.advertise());
         }
 
+        // \~english Everything read: the receiving application takes the end (RFC 9000, 3.2).
+        // \~spanish Todo leido: la aplicacion receptora recoge el final (RFC 9000, 3.2).  \~
+        rx.read_end();
         if (out != msg || tx.state() != SendState::DataRecvd || rx.state() != RecvState::DataRead ||
             tx.chunks_held() != 0 || rx.chunks_held() != 0) {
             std::fprintf(stderr, "FAIL: %zu bytes: got %zu, sender state %d, receiver state %d, chunks %zu/%zu\n",

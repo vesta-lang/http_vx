@@ -92,6 +92,20 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
             break;
         }
 
+        /* \~english
+         * A graceful GOAWAY: counted, and nothing else changes here.  What is
+         * open is finished as if it had not come, and @c still_needed below
+         * ends the connection once nothing is (RFC 9113, 6.8).
+         * \~spanish
+         * Un GOAWAY con calma: se cuenta, y aqui no cambia nada mas.  Lo
+         * abierto se acaba como si no hubiera llegado, y @c still_needed de
+         * abajo acaba la conexion cuando ya no hay nada (RFC 9113, 6.8).
+         * \~ */
+        if (e.kind == h2::EventKind::PeerLeaving) {
+            ++graceful_goaways_;
+            continue;
+        }
+
         if (e.kind == h2::EventKind::StreamEnded) {
             Work *w = find_work(s, e.stream_id);
             if (w != nullptr) drop_work(s, w);
@@ -351,7 +365,9 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
     const uint64_t done = s.conn.consumed();
     if (done > in.origin()) in.consume(static_cast<size_t>(done - in.origin()));
 
-    return alive;
+    // \~english A peer that is leaving may have just seen its last stream finish (RFC 9113, 6.8).
+    // \~spanish A un extremo que se va se le puede acabar de terminar su ultimo flujo (RFC 9113, 6.8).  \~
+    return alive && still_needed(s, out, kNoBudget);
 }
 
 } // namespace http_vx

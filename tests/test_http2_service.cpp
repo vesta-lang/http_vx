@@ -199,6 +199,13 @@ struct Seen {
     bool ended_on[8] = {};
     bool goaway = false;
 
+    /// \~english How many GOAWAYs, what the last one said, and which frame it was.
+    /// \~spanish Cuantos GOAWAY, que dijo el ultimo, y que trama fue.  \~
+    size_t goaways = 0;
+    uint32_t goaway_last = 0;
+    uint32_t goaway_code = 0;
+    size_t goaway_frame = 0;
+
     /// \~english The first header block of each stream, as it went out.
     /// \~spanish El primer bloque de cabeceras de cada flujo, tal como salio.  \~
     uint8_t block_on[8][512] = {};
@@ -263,6 +270,18 @@ struct Seen {
 
             case FrameType::Goaway:
                 goaway = true;
+                ++goaways;
+                goaway_frame = frames;
+                if (len >= 8) {
+                    goaway_last = (static_cast<uint32_t>(payload[0] & 0x7F) << 24) |
+                                  (static_cast<uint32_t>(payload[1]) << 16) |
+                                  (static_cast<uint32_t>(payload[2]) << 8) |
+                                  static_cast<uint32_t>(payload[3]);
+                    goaway_code = (static_cast<uint32_t>(payload[4]) << 24) |
+                                  (static_cast<uint32_t>(payload[5]) << 16) |
+                                  (static_cast<uint32_t>(payload[6]) << 8) |
+                                  static_cast<uint32_t>(payload[7]);
+                }
                 break;
 
             default:
@@ -528,6 +547,19 @@ struct Server {
 void hello(Wire &w) {
     w.text("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     w.frame(FrameType::Settings, 0, 0, nullptr, 0);
+}
+
+/// \~english A GOAWAY naming no server stream, with @p code.
+/// \~spanish Un GOAWAY que no nombra ningun flujo del servidor, con @p code.  \~
+void goaway(Wire &w, ErrorCode code) {
+    const uint8_t p[8] = {0, 0, 0, 0, 0, 0, 0, static_cast<uint8_t>(code)};
+    w.frame(FrameType::Goaway, 0, 0, p, sizeof p);
+}
+
+/// \~english Whether the last frame is this end's only GOAWAY, NO_ERROR, naming @p last.
+/// \~spanish Si la ultima trama es el unico GOAWAY de este extremo, NO_ERROR, nombrando @p last.  \~
+bool left_gracefully(const Seen &got, uint32_t last) {
+    return got.goaways == 1 && got.goaway_frame == got.frames && got.goaway_last == last && got.goaway_code == 0;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1418,6 +1450,172 @@ void test_a_request_with_no_work_left_is_refused() {
     check(s.service.in_hand() == 4, "the four requests that found work were not kept");
 }
 
+/**
+ * @brief
+ * \~english A graceful GOAWAY while a body is still arriving: the request is still answered whole, then this end leaves.
+ * \~spanish Un GOAWAY con calma mientras sigue llegando un cuerpo: la peticion se contesta entera igual, y luego este extremo se va.
+ * \~
+ *
+ * \~english
+ * RFC 9113, 6.8: the sender of a GOAWAY "might gracefully shut down a
+ * connection by sending a GOAWAY frame, maintaining the connection in an
+ * 'open' state until all in-progress streams complete".  So the body goes on
+ * being read, the handler is asked, and only after the answer's END_STREAM
+ * does this end write its own GOAWAY -- NO_ERROR, naming stream 1 -- and the
+ * shard close the socket.
+ * \~spanish
+ * RFC 9113, 6.8: quien manda un GOAWAY "might gracefully shut down a
+ * connection by sending a GOAWAY frame, maintaining the connection in an
+ * 'open' state until all in-progress streams complete".  Asi que el cuerpo se
+ * sigue leyendo, se le pregunta al manejador, y solo detras del END_STREAM de
+ * la respuesta escribe este extremo su propio GOAWAY -- NO_ERROR, nombrando el
+ * flujo 1 -- y el fragmento cierra el socket.
+ * \~
+ */
+void test_a_graceful_goaway_lets_a_body_finish() {
+    Server s;
+    check(s.start(), "the server would not start");
+    std::memcpy(s.handler.reply, "done", 4);
+    s.handler.reply_size = 4;
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+    uint8_t block[256];
+    const size_t n = request_block(block, "POST", "/upload");
+    w.frame(FrameType::Headers, kEndHeaders, 1, block, n);
+    w.frame(FrameType::Data, 0, 1, reinterpret_cast<const uint8_t *>("one"), 3);
+    goaway(w, ErrorCode::NoError);
+    s.send(w);
+    s.run();
+
+    Seen got = s.seen();
+    check(!got.goaway && s.io.closed() == 0, "a graceful GOAWAY ended the connection with a body arriving");
+    check(s.handler.calls == 0 && s.service.in_hand() == 1, "the request in progress was dropped or answered early");
+    check(s.service.graceful_goaways() == 1, "the graceful GOAWAY was not counted");
+
+    Wire rest;
+    rest.frame(FrameType::Data, kEndStream, 1, reinterpret_cast<const uint8_t *>("two"), 3);
+    s.send(rest);
+    s.run();
+
+    got = s.seen();
+    check(s.handler.calls == 1 && std::strcmp(s.handler.last_body, "onetwo") == 0,
+          "the body that finished after the GOAWAY did not reach the handler");
+    check(got.headers_on[1] == 1 && got.data_bytes_on[1] == 4 && got.ended_on[1], "the answer did not go out whole");
+    check(left_gracefully(got, 1), "the last frame is not this end's GOAWAY(NO_ERROR) naming stream 1");
+    check(s.io.closed() == 1, "the connection was not closed after its GOAWAY");
+    check(s.service.in_hand() == 0, "the request was never let go of");
+}
+
+/**
+ * @brief
+ * \~english A graceful GOAWAY while an answer waits for a window: the rest still goes out when the window opens.
+ * \~spanish Un GOAWAY con calma mientras una respuesta espera una ventana: el resto sale igual cuando se abre.
+ * \~
+ */
+void test_a_graceful_goaway_lets_an_answer_finish() {
+    Server s;
+    check(s.start(), "the server would not start");
+    std::memset(s.handler.reply, 'x', 40);
+    s.handler.reply_size = 40;
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    w.text("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    const uint8_t small[6] = {0x00, 0x04, 0x00, 0x00, 0x00, 0x0A};
+    w.frame(FrameType::Settings, 0, 0, small, sizeof small);
+    uint8_t block[256];
+    const size_t n = request_block(block, "GET", "/big");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, block, n);
+    goaway(w, ErrorCode::NoError);
+    s.send(w);
+    s.run();
+
+    Seen got = s.seen();
+    check(got.data_bytes_on[1] == 10 && !got.ended_on[1], "the answer did not stop at the window");
+    check(!got.goaway && s.io.closed() == 0, "a graceful GOAWAY ended the connection with an answer waiting");
+
+    Wire more;
+    const uint8_t plus[4] = {0x00, 0x00, 0x00, 0x40};
+    more.frame(FrameType::WindowUpdate, 0, 1, plus, sizeof plus);
+    s.send(more);
+    s.run();
+
+    got = s.seen();
+    check(got.data_bytes_on[1] == 40 && got.ended_on[1], "the rest of the answer did not follow the window");
+    check(left_gracefully(got, 1), "the last frame is not this end's GOAWAY(NO_ERROR) naming stream 1");
+    check(s.io.closed() == 1, "the connection was not closed after its GOAWAY");
+}
+
+/**
+ * @brief
+ * \~english A graceful GOAWAY with nothing open: GOAWAY back at once, naming the last stream seen, and closed.
+ * \~spanish Un GOAWAY con calma sin nada abierto: GOAWAY de vuelta en el acto, nombrando el ultimo flujo visto, y cerrada.
+ * \~
+ */
+void test_a_graceful_goaway_on_a_quiet_connection() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+    uint8_t block[256];
+    const size_t n = request_block(block, "GET", "/a");
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 1, block, n);
+    w.frame(FrameType::Headers, kEndHeaders | kEndStream, 3, block, n);
+    s.send(w);
+    s.run();
+    check(!s.seen().goaway && s.io.closed() == 0, "a connection nobody is leaving was ended");
+
+    Wire bye;
+    goaway(bye, ErrorCode::NoError);
+    s.send(bye);
+    s.run();
+
+    const Seen got = s.seen();
+    check(s.handler.calls == 2 && got.ended_on[1] && got.ended_on[3], "the two requests were not answered");
+    check(left_gracefully(got, 3), "the GOAWAY did not name stream 3 with NO_ERROR, last");
+    check(s.io.closed() == 1, "the connection was not closed after its GOAWAY");
+}
+
+/**
+ * @brief
+ * \~english A GOAWAY with an error while a body is arriving ends everything at once, and nothing answers it.
+ * \~spanish Un GOAWAY con error mientras llega un cuerpo lo acaba todo en el acto, y nada le contesta.
+ * \~
+ */
+void test_a_goaway_with_an_error_ends_at_once() {
+    Server s;
+    check(s.start(), "the server would not start");
+
+    const ConnHandle c = s.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+
+    Wire w;
+    hello(w);
+    uint8_t block[256];
+    const size_t n = request_block(block, "POST", "/upload");
+    w.frame(FrameType::Headers, kEndHeaders, 1, block, n);
+    goaway(w, ErrorCode::InternalError);
+    w.frame(FrameType::Data, kEndStream, 1, reinterpret_cast<const uint8_t *>("late"), 4);
+    s.send(w);
+    s.run();
+
+    const Seen got = s.seen();
+    check(s.handler.calls == 0, "a request was answered after a GOAWAY with an error");
+    check(!got.goaway && s.io.closed() == 1, "a GOAWAY with an error did not close at once, or was answered");
+    check(s.service.graceful_goaways() == 0 && s.service.in_hand() == 0,
+          "a GOAWAY with an error was counted graceful, or its request kept");
+}
+
 } // namespace
 
 int main() {
@@ -1437,6 +1635,10 @@ int main() {
     test_a_header_list_too_large_is_431();
     test_an_answer_with_nowhere_to_wait_is_not_refused();
     test_a_request_with_no_work_left_is_refused();
+    test_a_graceful_goaway_lets_a_body_finish();
+    test_a_graceful_goaway_lets_an_answer_finish();
+    test_a_graceful_goaway_on_a_quiet_connection();
+    test_a_goaway_with_an_error_ends_at_once();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

@@ -89,7 +89,29 @@ const char *stream_error_name(StreamError e) noexcept;
 /// \~spanish El error de transporte con el que @p e cierra la conexion.  \~
 TransportError transport_error_of(StreamError e) noexcept;
 
-/// \~english The receiving states of RFC 9000, 3.2.  \~spanish Los estados de recepcion del RFC 9000, 3.2.  \~
+/**
+ * @brief
+ * \~english The receiving states of RFC 9000, 3.2.
+ * \~spanish Los estados de recepcion del RFC 9000, 3.2.
+ * \~
+ *
+ * \~english
+ * The two terminal states are reached only when the APPLICATION learns how
+ * the stream ended, never by the transport alone: "Data Read" once it has
+ * read every byte and been told of the end, "Reset Read" once it has been
+ * told of the reset (3.2).  Until then the stream stays in "Data Recvd" or
+ * "Reset Recvd", and cannot be collected: a FIN that arrives alone after the
+ * application read everything is still an end the application has to hear.
+ * \~spanish
+ * Los dos estados terminales se alcanzan solo cuando la APLICACION sabe como
+ * acabo el flujo, nunca por el transporte solo: "Data Read" cuando ha leido
+ * todos los bytes y se le ha dicho el final, "Reset Read" cuando se le ha dicho
+ * el reinicio (3.2).  Hasta entonces el flujo sigue en "Data Recvd" o "Reset
+ * Recvd", y no se puede recoger: un FIN que llega solo despues de que la
+ * aplicacion lo leyera todo sigue siendo un final que la aplicacion tiene que
+ * oir.
+ * \~
+ */
 enum class RecvState : uint8_t { Recv, SizeKnown, DataRecvd, DataRead, ResetRecvd, ResetRead };
 
 /**
@@ -163,6 +185,41 @@ public:
     /// \~spanish La aplicacion leyo @p n bytes de lo que dio `peek`.  \~
     void consume(size_t n) noexcept;
 
+    /**
+     * @brief
+     * \~english Every byte up to the final size was read: only the end itself is left, or it was read too.
+     * \~spanish Se leyo cada byte hasta el tamano final: solo queda el propio final, o tambien se leyo.
+     * \~
+     *
+     * @return \~english true in "Data Recvd" with nothing left to read, and in "Data Read"
+     *         \~spanish true en "Data Recvd" sin nada que leer, y en "Data Read"  \~
+     */
+    bool at_end() const noexcept {
+        return (state_ == RecvState::DataRecvd || state_ == RecvState::DataRead) && read_ == final_;
+    }
+
+    /**
+     * @brief
+     * \~english The application takes the end: "Data Recvd" with everything read becomes "Data Read", "Reset Recvd" becomes "Reset Read" (3.2).
+     * \~spanish La aplicacion recoge el final: "Data Recvd" con todo leido pasa a "Data Read", "Reset Recvd" a "Reset Read" (3.2).
+     * \~
+     *
+     * \~english
+     * The only way into a terminal state, so the end is taken exactly once:
+     * true on the call that makes the transition, false before there is an
+     * end to take (bytes still unread, or nothing ended) and on every call
+     * after.  Only then may the stream be collected.
+     * \~spanish
+     * La unica entrada a un estado terminal, asi que el final se recoge
+     * exactamente una vez: true en la llamada que hace la transicion, false
+     * antes de que haya un final que recoger (bytes aun sin leer, o nada acabo)
+     * y en cada llamada despues.  Solo entonces se puede recoger el flujo.
+     * \~
+     *
+     * @return \~english whether this call took the end  \~spanish si esta llamada recogio el final  \~
+     */
+    bool read_end() noexcept;
+
     RecvState state() const noexcept { return state_; }
     uint64_t read_offset() const noexcept { return read_; }
     uint64_t highest() const noexcept { return highest_; }
@@ -211,11 +268,15 @@ public:
      * \~english
      * Only in "Recv" or "Size Known": past them everything or a reset has
      * arrived, and asking is pointless.  What still arrives is still counted
-     * for flow control; reading it is up to the application.
+     * for flow control; reading it is up to the application.  The reset that
+     * answers it goes straight to "Reset Read": the application already gave
+     * the stream up, so there is nobody left to tell (3.5).
      * \~spanish
      * Solo en "Recv" o "Size Known": despues ya llego todo o un reinicio, y pedir
      * no tiene sentido.  Lo que siga llegando cuenta igual para el control de
-     * flujo; leerlo es cosa de la aplicacion.
+     * flujo; leerlo es cosa de la aplicacion.  El reinicio que lo contesta pasa
+     * directo a "Reset Read": la aplicacion ya abandono el flujo, asi que no
+     * queda nadie a quien decirselo (3.5).
      * \~
      *
      * @return \~english false if the stream is past those states, or it was already asked

@@ -77,6 +77,7 @@ constexpr size_t kLargestAnswer =
 void Connection::reset(const Limits &limits) noexcept {
     limits_ = limits;
     closed_ = false;
+    peer_leaving_ = false;
 
     reader_ = FrameReader(limits);
     reader_.reset(0, true);
@@ -263,23 +264,6 @@ Event Connection::fail(ErrorCode code, const char *why) noexcept {
     why_ = why;
 
     /* \~english
-     * A GOAWAY carries the last stream this end actually looked at, so the
-     * peer knows which of its requests were seen and which it may send again
-     * on a new connection.  Reporting zero -- or the highest possible -- would
-     * be telling it either that nothing was served or that everything was, and
-     * both are answers it would act on.
-     * \~spanish
-     * Un GOAWAY lleva el ultimo flujo que este extremo llego a mirar, para que
-     * el otro sepa cuales de sus peticiones se vieron y cuales puede volver a
-     * mandar por una conexion nueva.  Decir cero -- o el mayor posible -- seria
-     * decirle o que no se sirvio nada o que se sirvio todo, y las dos son
-     * respuestas sobre las que actuaria.
-     * \~ */
-    uint8_t payload[8];
-    put_be32(payload, streams_.highest_seen());
-    put_be32(payload + 4, static_cast<uint32_t>(code));
-
-    /* \~english
      * The room was kept by @c read, so this goes in.  If it did not -- which
      * is @c no_room's case -- nothing is lost that a return could save: the
      * connection is over either way and the caller is told so below, with
@@ -290,7 +274,7 @@ Event Connection::fail(ErrorCode code, const char *why) noexcept {
      * la conexion se acaba igual y a quien llama se le dice abajo, con @c why;
      * el otro extremo solo pierde la cortesia del motivo.
      * \~ */
-    static_cast<void>(put_frame(FrameType::Goaway, 0, 0, payload, sizeof payload));
+    put_goaway(code);
 
     Event e;
     e.kind = EventKind::Closed;

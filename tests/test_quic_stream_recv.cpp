@@ -76,8 +76,9 @@ void test_in_order_across_chunks() {
     check(s.chunks_held() == 1, "chunks read past were not freed");
 
     check(s.on_data(10000, nullptr, 0, true, fresh) == StreamError::None && fresh == 0 &&
-              s.state() == RecvState::DataRead && s.chunks_held() == 0,
-          "an empty FIN at the end did not finish the stream and free it");
+              s.state() == RecvState::DataRecvd && s.at_end() && s.chunks_held() == 0,
+          "an empty FIN at the end did not wait for the application with its memory freed");
+    check(s.read_end() && s.state() == RecvState::DataRead, "taking the end did not finish the stream");
 }
 
 /// \~english The property: shuffled, duplicated, overlapping segments reassemble exactly.
@@ -145,8 +146,8 @@ void test_reassembly_property() {
         }
         drain(s, out);
 
-        if (out != msg || s.state() != RecvState::DataRead || s.chunks_held() != 0 ||
-            charged != size) {
+        if (out != msg || !s.at_end() || !s.read_end() || s.state() != RecvState::DataRead ||
+            s.chunks_held() != 0 || charged != size) {
             std::fprintf(stderr, "FAIL: a %zu-byte message came out %zu bytes, state %d, %zu chunks, %llu charged\n",
                          size, out.size(), static_cast<int>(s.state()), s.chunks_held(),
                          static_cast<unsigned long long>(charged));
@@ -248,6 +249,11 @@ void test_reset() {
               "data past a reset's final size was taken");
         check(s.on_reset(1400, 7, fresh, released) == StreamError::FinalSize,
               "a second reset with another final size was taken");
+        check(!s.at_end() && s.read_end() && s.state() == RecvState::ResetRead && !s.read_end(),
+              "the reset was not taken exactly once (3.2)");
+        check(s.on_reset(1500, 7, fresh, released) == StreamError::None && fresh == 0 && released == 0 &&
+                  s.state() == RecvState::ResetRead,
+              "the same reset again, once read, changed something");
     }
     {
         RecvStream s(4096);
@@ -301,6 +307,105 @@ void test_stop() {
         s.on_reset(50, 1, fresh, released);
         s.on_stop_lost();
         check(!s.stop_pending(), "a reset arrived: a lost STOP_SENDING is not sent again (3.5)");
+        check(s.state() == RecvState::ResetRead && !s.read_end(),
+              "the reset a stop asked for waited for an application that gave the stream up (3.5)");
+    }
+    {
+        // \~english Not stopped: the reset waits for the application.  \~spanish Sin parar: el reinicio espera a la aplicacion.  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 10, false, fresh);
+        s.on_reset(50, 1, fresh, released);
+        check(s.state() == RecvState::ResetRecvd, "a reset nobody asked for did not wait to be taken");
+    }
+}
+
+/**
+ * @brief
+ * \~english The end is the application's to take, once, whenever the FIN came (RFC 9000, 3.2, 4.5).
+ * \~spanish El final lo recoge la aplicacion, una vez, llegue cuando llegue el FIN (RFC 9000, 3.2, 4.5).
+ * \~
+ */
+void test_end() {
+    std::vector<uint8_t> b(100, 7);
+    std::vector<uint8_t> out;
+    uint64_t fresh = 0;
+    const uint8_t *p = nullptr;
+    {
+        // \~english The FIN alone after every byte was read: an end still to tell.
+        // \~spanish El FIN solo tras leerse cada byte: un final aun por decir.  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 100, false, fresh);
+        check(drain(s, out) == 100 && s.state() == RecvState::Recv && !s.at_end() && !s.read_end(),
+              "a stream with no FIN had an end to take");
+        check(s.on_data(100, nullptr, 0, true, fresh) == StreamError::None && fresh == 0,
+              "a lone FIN at the size already received was refused or charged");
+        check(s.state() == RecvState::DataRecvd && s.at_end() && s.peek(p) == 0 && s.chunks_held() == 0,
+              "a lone FIN after everything was read did not wait in \"Data Recvd\", nothing to read, memory freed");
+        check(s.on_data(100, nullptr, 0, true, fresh) == StreamError::None && fresh == 0 &&
+                  s.state() == RecvState::DataRecvd,
+              "the same lone FIN twice, before the end was taken, changed something");
+        check(s.read_end() && s.state() == RecvState::DataRead, "the end was not taken");
+        check(!s.read_end() && s.state() == RecvState::DataRead, "the end was taken twice");
+        check(s.on_data(100, nullptr, 0, true, fresh) == StreamError::None && fresh == 0 &&
+                  s.state() == RecvState::DataRead && s.at_end(),
+              "the same lone FIN once more, after the end was taken, changed something");
+        check(s.on_data(90, b.data(), 10, true, fresh) == StreamError::None && fresh == 0,
+              "a late retransmission of the last bytes with the FIN was refused");
+    }
+    {
+        // \~english The FIN alone before the bytes were read: the end comes after them.
+        // \~spanish El FIN solo antes de leerse los bytes: el final llega despues de ellos.  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 100, false, fresh);
+        s.on_data(100, nullptr, 0, true, fresh);
+        check(s.state() == RecvState::DataRecvd && !s.at_end() && !s.read_end() &&
+                  s.state() == RecvState::DataRecvd,
+              "the end was taken with bytes still unread");
+        check(s.peek(p) == 100, "the bytes were not there to read");
+        s.consume(60);
+        check(!s.at_end() && !s.read_end(), "the end was taken with 40 bytes unread");
+        s.consume(40);
+        check(s.at_end() && s.chunks_held() == 0 && s.read_end() && s.state() == RecvState::DataRead,
+              "reading the last byte did not leave the end to take");
+    }
+    {
+        // \~english The FIN with the data, read at once: as always.
+        // \~spanish El FIN con los datos, leido de una vez: como siempre.  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 100, true, fresh);
+        check(s.state() == RecvState::DataRecvd && fresh == 100, "the FIN with the data did not end the receiving");
+        check(drain(s, out) == 100 && s.at_end() && s.read_end() && s.state() == RecvState::DataRead,
+              "reading it all did not end the stream");
+    }
+    {
+        // \~english A FIN past what arrived: the size is known, the hole still to come.
+        // \~spanish Un FIN mas alla de lo que llego: el tamano se sabe, el hueco aun por llegar.  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 50, false, fresh);
+        drain(s, out);
+        check(s.on_data(80, nullptr, 0, true, fresh) == StreamError::None && fresh == 30 &&
+                  s.state() == RecvState::SizeKnown && !s.at_end() && !s.read_end(),
+              "a lone FIN past the data received was not charged, or ended the stream");
+        s.on_data(50, b.data(), 30, false, fresh);
+        check(fresh == 0 && s.state() == RecvState::DataRecvd && drain(s, out) == 30 && s.read_end(),
+              "the hole filled did not end the stream");
+    }
+    {
+        // \~english A lone FIN that contradicts what arrived: FINAL_SIZE_ERROR (4.5).
+        // \~spanish Un FIN solo que contradice lo que llego: FINAL_SIZE_ERROR (4.5).  \~
+        RecvStream s(4096);
+        s.on_data(0, b.data(), 100, false, fresh);
+        drain(s, out);
+        check(s.on_data(99, nullptr, 0, true, fresh) == StreamError::FinalSize,
+              "a lone FIN below the data received was taken");
+        s.on_data(100, nullptr, 0, true, fresh);
+        check(s.on_data(101, nullptr, 0, true, fresh) == StreamError::FinalSize,
+              "a second lone FIN past the final size was taken");
+        check(s.on_data(99, nullptr, 0, true, fresh) == StreamError::FinalSize,
+              "a second lone FIN before the final size was taken");
+        s.read_end();
+        check(s.on_data(101, nullptr, 0, true, fresh) == StreamError::FinalSize,
+              "a lone FIN that moves the final size was taken once the end was read");
     }
 }
 
@@ -332,6 +437,7 @@ int main() {
     test_final_size();
     test_reset();
     test_stop();
+    test_end();
     test_fragments();
 
     if (failures != 0) {

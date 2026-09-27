@@ -70,6 +70,7 @@ bool Http2Service::reset(uint32_t connections, uint32_t requests,
     max_body_ = max_body;
     served_ = 0;
     bad_answers_ = 0;
+    graceful_goaways_ = 0;
     last_bad_answer_ = nullptr;
     open_full_ = 0;
 

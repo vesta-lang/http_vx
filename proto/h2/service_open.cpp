@@ -42,14 +42,6 @@ namespace {
 
 /**
  * @brief
- * \~english What is written while answering a read: bounded by the windows and @c kFillRoom alone.
- * \~spanish Lo que se escribe al contestar una lectura: acotado solo por las ventanas y @c kFillRoom.
- * \~
- */
-constexpr size_t kNoBudget = ~static_cast<size_t>(0);
-
-/**
- * @brief
  * \~english Writes the header of a DATA frame of @p n bytes on @p stream at @p at.
  * \~spanish Escribe la cabecera de una trama DATA de @p n bytes en @p stream en @p at.
  * \~
@@ -369,7 +361,10 @@ bool Http2Service::on_writable(ConnHandle c, Buffer &out, size_t budget) noexcep
     // \~english Whoever still wants room and has it -- a full fill, a kick the budget did not reach -- is asked again.
     // \~spanish A quien aun quiere sitio y lo tiene -- un relleno lleno, un aviso al que no llego el presupuesto -- se le vuelve a pedir.  \~
     if (s.opens.count != 0) wake_open(s);
-    return true;
+
+    // \~english The last open response of a peer that is leaving may just have finished (RFC 9113, 6.8).
+    // \~spanish La ultima respuesta abierta de un extremo que se va puede acabar de terminar (RFC 9113, 6.8).  \~
+    return still_needed(s, out, left);
 }
 
 void Http2Service::on_kick(BodySource &source) noexcept {
