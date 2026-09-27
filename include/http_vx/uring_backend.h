@@ -75,6 +75,7 @@
 #include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -249,7 +250,55 @@ class UringBackend final : public Backend {
     /// \~spanish Devuelve todo y deja de escuchar.  \~
     void release() noexcept;
 
+    /// \~english Signals the wake eventfd; any thread (HVX-5, 6.4).  \~spanish Senala el eventfd de despertar; cualquier hilo (HVX-5, 6.4).  \~
+    bool wake() noexcept override;
+
+    /// \~english What the system said when a wake failed.  \~spanish Lo que dijo el sistema cuando fallo un despertar.  \~
+    int32_t wake_error() const noexcept { return wake_error_.load(std::memory_order_relaxed); }
+
   private:
+    /**
+     * \~english
+     * The ring carries this back for the wake eventfd's read: no slot has it,
+     * because slots are numbered from zero up to the completion ring's size.
+     * \~spanish
+     * El anillo devuelve esto para la lectura del eventfd de despertar: ninguna
+     * casilla lo tiene, porque las casillas van de cero al tamano del anillo de
+     * finalizaciones.
+     * \~
+     */
+    static constexpr uint64_t kWakeData = ~uint64_t{0};
+
+    /// \~english Opens the wake eventfd.  \~spanish Abre el eventfd de despertar.  \~
+    bool wake_open() noexcept;
+
+    /// \~english Closes it, once the ring can no longer write into its buffer.  \~spanish Lo cierra, cuando el anillo ya no puede escribir en su buffer.  \~
+    void wake_close() noexcept;
+
+    /**
+     * @brief
+     * \~english Puts a read of the wake eventfd in the ring, if none is there.
+     * \~spanish Pone en el anillo una lectura del eventfd de despertar, si no hay ninguna.
+     * \~
+     *
+     * \~english
+     * The ring wakes only for what completes; this read completes when
+     * another thread writes.  It is armed again after every completion --
+     * without that, the next wake would be lost without a sound.
+     * \~spanish
+     * El anillo solo despierta por lo que acaba; esta lectura acaba cuando otro
+     * hilo escribe.  Se vuelve a armar tras cada finalizacion -- sin eso, el
+     * siguiente despertar se perderia sin un ruido.
+     * \~
+     */
+    void arm_wake() noexcept;
+
+    int wake_fd_ = -1;
+    /// \~english Where the wake read lands.  \~spanish Donde cae la lectura de despertar.  \~
+    uint64_t wake_buf_ = 0;
+    bool wake_armed_ = false;
+    std::atomic<int32_t> wake_error_{0};
+
     /**
      * \~english
      * One operation the kernel is holding, found again by the number the ring

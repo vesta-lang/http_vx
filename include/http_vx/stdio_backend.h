@@ -73,6 +73,7 @@
 #include "http_vx/buffer_pool.h"
 #include "http_vx/reactor_ops.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -133,12 +134,45 @@ class StdioBackend final : public Backend {
      * @param in   \~english what the peer says  \~spanish lo que dice el otro extremo  \~
      * @param out  \~english where the answers go  \~spanish donde van las respuestas  \~
      */
-    StdioBackend(BufferPool &pool, int in, int out) noexcept
-        : pool_(&pool), in_(in), out_(out) {}
+    StdioBackend(BufferPool &pool, int in, int out) noexcept;
+    ~StdioBackend() override;
+
+    /**
+     * @brief
+     * \~english Whether it can be used: its wake mechanism was made.
+     * \~spanish Si se puede usar: se hizo su mecanismo de despertar.
+     * \~
+     *
+     * @return \~english false, with @c wake_error set, if not  \~spanish false, con @c wake_error puesto, si no  \~
+     */
+    bool ready() const noexcept;
 
     bool submit(const Op &op) noexcept override;
     size_t wait(Completion *done, size_t cap, int timeout_ms) noexcept override;
     const char *name() const noexcept override { return "stdio"; }
+
+    /**
+     * @brief
+     * \~english Ends a read that is waiting for the peer, or the next one; any thread (HVX-5, 6.4).
+     * \~spanish Acaba una lectura que espera al otro extremo, o la siguiente; cualquier hilo (HVX-5, 6.4).
+     * \~
+     *
+     * \~english
+     * A pipe read blocks until the peer says something, so waking this
+     * backend is ending THAT read without losing it: the read stays pending
+     * and is made again on the next wait.  How is the platform's (linux/ and
+     * windows/ stdio_wake.cpp).
+     * \~spanish
+     * Una lectura de tuberia bloquea hasta que el otro extremo dice algo, asi
+     * que despertar este backend es acabar ESA lectura sin perderla: la lectura
+     * sigue pendiente y se vuelve a hacer en la espera siguiente.  El como es de
+     * cada plataforma (stdio_wake.cpp de linux/ y de windows/).
+     * \~
+     */
+    bool wake() noexcept override;
+
+    /// \~english What the system said when the wake mechanism failed.  \~spanish Lo que dijo el sistema cuando fallo el mecanismo de despertar.  \~
+    int32_t wake_error() const noexcept { return wake_error_.load(std::memory_order_relaxed); }
 
     /// \~english Whether the peer has closed its end.
     /// \~spanish Si el otro extremo ha cerrado su lado.  \~
@@ -164,7 +198,62 @@ class StdioBackend final : public Backend {
     size_t refused_datagrams() const noexcept { return refused_datagrams_; }
 
   private:
-    Completion finish(const Op &op) noexcept;
+    /**
+     * @brief
+     * \~english Finishes @p op into @p c; false if a wake ended its read first.
+     * \~spanish Acaba @p op en @p c; false si un despertar acabo antes su lectura.
+     * \~
+     */
+    bool finish(const Op &op, Completion &c, int timeout_ms) noexcept;
+
+    /**
+     * @brief
+     * \~english Reads what has arrived, unless a wake comes first; the platform's.
+     * \~spanish Lee lo que haya llegado, salvo que llegue antes un despertar; de cada plataforma.
+     * \~
+     *
+     * \~english
+     * @p timeout_ms is honoured as a wait's is: zero never blocks, a negative
+     * one blocks until something happens.  A shard that has kicks waiting
+     * asks for zero, and a read that blocked anyway would leave those kicks
+     * waiting behind a peer that says nothing -- a kick lost.
+     * \~spanish
+     * @p timeout_ms se respeta como el de una espera: cero no bloquea nunca, uno
+     * negativo bloquea hasta que pase algo.  Un fragmento con avisos esperando
+     * pide cero, y una lectura que bloqueara igualmente dejaria esos avisos
+     * esperando detras de un extremo que no dice nada -- un aviso perdido.
+     * \~
+     *
+     * @param woken \~english set, with nothing read, if a wake or the deadline ended the wait
+     *              \~spanish puesto, sin leer nada, si un despertar o el plazo acabo la espera  \~
+     * @return      \~english bytes read, zero at the end of the stream, -1 on error
+     *              \~spanish bytes leidos, cero al final del flujo, -1 en error  \~
+     */
+    long read_or_wake(uint8_t *room, uint32_t n, int timeout_ms, bool &woken) noexcept;
+
+    /* \~english
+     * The wake mechanism's state, in types that name no platform.  Linux: the
+     * eventfd.  Windows: the helper thread that is the ONLY reader of the
+     * input pipe, the read it has been handed (where, how much, what came
+     * of it), and three events -- a wake, "read this", "read done".
+     * \~spanish
+     * El estado del mecanismo de despertar, en tipos que no nombran ninguna
+     * plataforma.  Linux: el eventfd.  Windows: el hilo auxiliar que es el UNICO
+     * lector de la tuberia de entrada, la lectura que se le ha dado (donde,
+     * cuanto, en que quedo), y tres sucesos -- un despertar, "lee esto",
+     * "lectura hecha".
+     * \~ */
+    int wake_fd_ = -1;
+    void *wake_event_ = nullptr;
+    void *request_event_ = nullptr;
+    void *done_event_ = nullptr;
+    void *helper_ = nullptr;
+    uint8_t *read_room_ = nullptr;
+    uint32_t read_len_ = 0;
+    long read_result_ = 0;
+    bool read_in_flight_ = false;
+    std::atomic<bool> stopping_{false};
+    std::atomic<int32_t> wake_error_{0};
 
     BufferPool *pool_ = nullptr;
     int in_ = -1;

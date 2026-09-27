@@ -85,6 +85,7 @@
 #include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -233,7 +234,24 @@ class EpollBackend final : public Backend {
     /// \~spanish Devuelve todo y deja de escuchar.  \~
     void release() noexcept;
 
+    /// \~english Signals the wake eventfd; any thread (HVX-5, 6.4).  \~spanish Senala el eventfd de despertar; cualquier hilo (HVX-5, 6.4).  \~
+    bool wake() noexcept override;
+
+    /// \~english What the system said when a wake failed.  \~spanish Lo que dijo el sistema cuando fallo un despertar.  \~
+    int32_t wake_error() const noexcept { return wake_error_.load(std::memory_order_relaxed); }
+
   private:
+    /// \~english Opens the wake eventfd and puts it on the queue, edge-triggered.
+    /// \~spanish Abre el eventfd de despertar y lo pone en la cola, por flanco.  \~
+    bool wake_open() noexcept;
+
+    /// \~english Closes the wake eventfd.  \~spanish Cierra el eventfd de despertar.  \~
+    void wake_close() noexcept;
+
+    /// \~english The wake eventfd, or -1.  \~spanish El eventfd de despertar, o -1.  \~
+    int wake_fd_ = -1;
+    std::atomic<int32_t> wake_error_{0};
+
     /**
      * \~english
      * What one socket is waiting for.  Two operations at most and they are the

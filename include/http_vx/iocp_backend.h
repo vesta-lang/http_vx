@@ -76,6 +76,7 @@
 #include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -252,6 +253,29 @@ class IocpBackend final : public Backend {
 
     /**
      * @brief
+     * \~english Posts a packet with no operation behind it; any thread (HVX-5, 6.4).
+     * \~spanish Pone un paquete sin operacion detras; cualquier hilo (HVX-5, 6.4).
+     * \~
+     *
+     * \~english
+     * What the system offers for this: it ends a wait in
+     * `GetQueuedCompletionStatusEx`, needs no handle to the waiting thread and
+     * runs nothing in the middle of the wait, as an APC would.  The packet
+     * carries no record, so @c wait passes over it.
+     * \~spanish
+     * Lo que el sistema ofrece para esto: acaba una espera en
+     * `GetQueuedCompletionStatusEx`, no necesita el handle del hilo que espera y
+     * no ejecuta nada en mitad de la espera, como lo haria una APC.  El paquete
+     * no lleva registro, asi que @c wait lo salta.
+     * \~
+     */
+    bool wake() noexcept override;
+
+    /// \~english What the system said when a wake failed.  \~spanish Lo que dijo el sistema cuando fallo un despertar.  \~
+    int32_t wake_error() const noexcept { return wake_error_.load(std::memory_order_relaxed); }
+
+    /**
+     * @brief
      * \~english Gives everything back and stops listening.
      * \~spanish Devuelve todo y deja de escuchar.
      * \~
@@ -291,6 +315,8 @@ class IocpBackend final : public Backend {
     /// \~english Operations left with the kernel by @c release.
     /// \~spanish Operaciones que @c release le dejo al nucleo.  \~
     uint64_t stranded_ = 0;
+
+    std::atomic<int32_t> wake_error_{0};
 
     /**
      * \~english

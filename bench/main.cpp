@@ -119,6 +119,8 @@ class Counted final : public http_vx::Backend {
 
     const char *name() const noexcept override { return "counted"; }
 
+    bool wake() noexcept override { return inner_.wake(); }
+
     http_vx::MemoryBackend &inner() noexcept { return inner_; }
 
     size_t notices = 0;

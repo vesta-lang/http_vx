@@ -92,6 +92,7 @@ void EpollBackend::release() noexcept {
     }
 
     dgram_release();
+    wake_close();
 
     if (queue_ >= 0) {
         ::close(queue_);
@@ -121,6 +122,10 @@ bool EpollBackend::reset(BufferPool &pool, uint32_t max_fds) noexcept {
     queue_ = epoll_create1(EPOLL_CLOEXEC);
     if (queue_ < 0) {
         last_error_ = errno;
+        return false;
+    }
+    if (!wake_open()) {
+        release();
         return false;
     }
 
@@ -633,6 +638,9 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
      * \~ */
     for (int i = 0; i < got; ++i) {
         const int32_t fd = events[i].data.fd;
+        // \~english A wake: its whole job was to end this wait (HVX-5, 6.4).
+        // \~spanish Un despertar: todo su trabajo era acabar esta espera (HVX-5, 6.4).  \~
+        if (fd == wake_fd_) continue;
         if (fd < 0 || static_cast<uint32_t>(fd) >= max_fds_) continue;
 
         Waiting &w = waiting_[fd];

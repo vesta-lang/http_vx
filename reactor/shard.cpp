@@ -56,6 +56,7 @@ bool Shard::start(const ShardConfig &cfg, Backend &io, Service *service,
 
     cfg_ = cfg;
     io_ = &io;
+    kicks_.reset(&io);
     service_ = service;
 
     if (!conns_.reset(cfg.connections)) return false;
@@ -919,7 +920,16 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
         datagrams_.flush(now);
     }
 
-    const size_t made = io_->wait(done, cap, timeout_ms);
+    /* \~english
+     * A wait that may sleep publishes it first and looks at the kicks again
+     * (HVX-5, 6.3): a kick already there makes it not wait at all.
+     * \~spanish
+     * Una espera que puede dormir lo publica antes y vuelve a mirar los avisos
+     * (HVX-5, 6.3): un aviso que ya este hace que no espere nada.
+     * \~ */
+    const int wait_ms = timeout_ms != 0 && !kicks_.about_to_sleep() ? 0 : timeout_ms;
+    const size_t made = io_->wait(done, cap, wait_ms);
+    kicks_.awake();
 
     for (size_t i = 0; i < made; ++i) {
         /* \~english
@@ -983,6 +993,10 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
         }
     }
+
+    // \~english Every kicked source, to whoever opened its response.
+    // \~spanish Cada fuente avisada, a quien abrio su respuesta.  \~
+    kicks_.drain();
 
     /* \~english
      * And what the datagrams just delivered made the service want to say is

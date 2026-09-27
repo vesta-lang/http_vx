@@ -60,6 +60,7 @@
 #include "http_vx/datagram.h"
 #include "http_vx/reactor_ops.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -289,6 +290,20 @@ class MemoryBackend final : public Backend {
     size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
     const char *name() const noexcept override { return "memory"; }
 
+    /**
+     * @brief
+     * \~english Counts the wake; any thread.  This backend never sleeps, so there is nothing else to do.
+     * \~spanish Cuenta el despertar; cualquier hilo.  Este backend no duerme nunca, asi que no hay nada mas que hacer.
+     * \~
+     */
+    bool wake() noexcept override {
+        wakes_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    /// \~english How many wakes arrived.  \~spanish Cuantos despertares llegaron.  \~
+    uint64_t wakes() const noexcept { return wakes_.load(std::memory_order_relaxed); }
+
     /// \~english How many are waiting to finish.
     /// \~spanish Cuantas esperan para acabar.  \~
     size_t pending() const noexcept { return pending_count_; }
@@ -401,6 +416,7 @@ class MemoryBackend final : public Backend {
     int32_t failure_ = -1;
     uint32_t chunk_ = 0;
     bool ended_ = false;
+    std::atomic<uint64_t> wakes_{0};
 };
 
 } // namespace http_vx

@@ -528,7 +528,9 @@ void test_a_pipe_has_no_datagrams() {
 
     op.kind = http_vx::OpKind::Recv;
     check(io.submit(op), "the read was not taken");
-    check(io.wait(done, 2, 0) == 1 && done[0].result == 3,
+    // \~english A deadline, not zero: on Windows the read completes on another thread, as IOCP does.
+    // \~spanish Un plazo, no cero: en Windows la lectura acaba en otro hilo, como en IOCP.  \~
+    check(io.wait(done, 2, 2000) == 1 && done[0].result == 3,
           "the stream lost the bytes the datagram receive was refused");
 
     HTTP_VX_CLOSE(fds[0]);

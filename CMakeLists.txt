@@ -115,8 +115,8 @@ add_library(http_vx_core STATIC
         reactor/memory_datagram.cpp
         reactor/shard.cpp
         reactor/shard_datagram.cpp
+        reactor/kick_queue.cpp
         reactor/shard_streamless.cpp
-        reactor/stdio_backend.cpp
         reactor/timer_wheel.cpp
 )
 target_include_directories(http_vx_core
@@ -384,6 +384,12 @@ add_executable(http_vx_serve serve/main.cpp)
 target_include_directories(http_vx_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
+# El backend de stdio esta en la biblioteca de cada plataforma: su despertar es de ella.
+if (WIN32)
+    target_link_libraries(http_vx_serve PRIVATE http_vx_windows)
+else ()
+    target_link_libraries(http_vx_serve PRIVATE http_vx_linux)
+endif ()
 
 # El que escucha en un PUERTO va mas abajo, despues de las librerias de
 # plataforma: es lo unico de aqui que enlaza una.
@@ -404,7 +410,10 @@ if (WIN32)
             windows/iocp_address.cpp
             windows/iocp_backend.cpp
             windows/iocp_datagram.cpp
-            windows/iocp_release.cpp)
+            windows/iocp_release.cpp
+            windows/iocp_wake.cpp
+            windows/stdio_wake.cpp
+            reactor/stdio_backend.cpp)
     target_include_directories(http_vx_windows
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
@@ -427,9 +436,14 @@ if (UNIX)
             linux/epoll_backend.cpp
             linux/epoll_datagram.cpp
             linux/epoll_ready.cpp
+            linux/epoll_wake.cpp
             linux/socket_open.cpp
+            linux/stdio_wake.cpp
             linux/uring_backend.cpp
-            linux/uring_datagram.cpp)
+            linux/uring_datagram.cpp
+            linux/uring_wake.cpp
+            linux/wake_fd.cpp
+            reactor/stdio_backend.cpp)
     target_include_directories(http_vx_linux
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
@@ -670,8 +684,24 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_shard tests/test_shard.cpp)
     http_vx_add_test(test_shard_datagram tests/test_shard_datagram.cpp)
     http_vx_add_test(test_status tests/test_status.cpp)
-    http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
     http_vx_add_test(test_timer_wheel tests/test_timer_wheel.cpp)
+
+    http_vx_add_test(test_kick_queue tests/test_kick_queue.cpp)
+
+    # El backend de stdio despierta de una forma de cada plataforma, asi que
+    # esta en la biblioteca de la plataforma y la prueba la enlaza.  Y el
+    # despertar de cada backend se prueba desde otros hilos: HVX-5, 6.
+    find_package(Threads REQUIRED)
+    http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
+    http_vx_add_test(test_backend_wake tests/test_backend_wake.cpp)
+    foreach (_wake_test test_stdio_backend test_backend_wake)
+        target_link_libraries(${_wake_test} PRIVATE Threads::Threads)
+        if (WIN32)
+            target_link_libraries(${_wake_test} PRIVATE http_vx_windows)
+        else ()
+            target_link_libraries(${_wake_test} PRIVATE http_vx_linux)
+        endif ()
+    endforeach ()
 
     # La unica prueba que abre un puerto, y por eso enlaza lo que las demas no.
     # Lo que comprueba son las cosas en las que un backend sin sistema operativo

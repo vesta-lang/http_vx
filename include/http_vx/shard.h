@@ -67,6 +67,7 @@
 #include "http_vx/buffer_pool.h"
 #include "http_vx/conn_table.h"
 #include "http_vx/datagram_service.h"
+#include "http_vx/kick_queue.h"
 #include "http_vx/reactor_ops.h"
 #include "http_vx/timer_wheel.h"
 
@@ -435,6 +436,24 @@ class Shard {
 
     /**
      * @brief
+     * \~english Where the open responses of this shard's connections are kicked (HVX-5).
+     * \~spanish Donde se avisa a las respuestas abiertas de las conexiones de este fragmento (HVX-5).
+     * \~
+     *
+     * \~english
+     * A service opens a source here; any thread kicks it; every poll drains
+     * the kicks after the completions and before the datagram side flushes.
+     * \~spanish
+     * Un servicio abre aqui una fuente; cualquier hilo la avisa; cada poll vacia
+     * los avisos despues de las finalizaciones y antes de que el lado de
+     * datagramas vacie lo suyo.
+     * \~
+     */
+    KickQueue &kicks() noexcept { return kicks_; }
+    const KickQueue &kicks() const noexcept { return kicks_; }
+
+    /**
+     * @brief
      * \~english Takes a connection that has arrived.
      * \~spanish Coge una conexion que ha llegado.
      * \~
@@ -678,6 +697,7 @@ class Shard {
     Service *service_ = nullptr;
     ShardConfig cfg_;
     ShardCounts counts_;
+    KickQueue kicks_;
 };
 
 } // namespace http_vx

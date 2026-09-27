@@ -16,26 +16,25 @@
 #include "http_vx/stdio_backend.h"
 
 /* \~english
- * The only place in this project that names a platform, and it names two
- * spellings of the same call: reading a descriptor and writing one.  It is
- * here and not in `linux/` or `windows/` because there is nothing platform
- * SHAPED about it -- a pipe is a pipe -- and putting it in one of those would
- * mean writing it twice to say the same thing.
+ * Writing a descriptor is two spellings of the same call, and is spelled
+ * here.  Reading is not: a read has to be ended by a wake from another
+ * thread (HVX-5, 6.4), and how is platform SHAPED -- poll on an eventfd,
+ * cancelling a synchronous read -- so it lives in each platform's
+ * stdio_wake.cpp, and this file is built with it, in that platform's library.
  *
  * \~spanish
- * El unico sitio de este proyecto que nombra una plataforma, y nombra dos
- * grafias de la misma llamada: leer un descriptor y escribir uno.  Esta aqui y
- * no en `linux/` o `windows/` porque no tiene nada de FORMA de plataforma -- una
- * tuberia es una tuberia -- y ponerlo en uno de esos seria escribirlo dos veces
- * para decir lo mismo.
+ * Escribir un descriptor son dos grafias de la misma llamada, y se escriben
+ * aqui.  Leer no: una lectura la tiene que poder acabar un despertar desde otro
+ * hilo (HVX-5, 6.4), y el como tiene FORMA de plataforma -- esperar en un
+ * eventfd, cancelar una lectura sincrona --, asi que vive en el stdio_wake.cpp
+ * de cada plataforma, y este fichero se construye con el, en la biblioteca de
+ * esa plataforma.
  * \~ */
 #ifdef _WIN32
 #include <io.h>
-#define HTTP_VX_READ _read
 #define HTTP_VX_WRITE _write
 #else
 #include <unistd.h>
-#define HTTP_VX_READ ::read
 #define HTTP_VX_WRITE ::write
 #endif
 
@@ -49,8 +48,7 @@ bool StdioBackend::submit(const Op &op) noexcept {
     return true;
 }
 
-Completion StdioBackend::finish(const Op &op) noexcept {
-    Completion c;
+bool StdioBackend::finish(const Op &op, Completion &c, int timeout_ms) noexcept {
     c.conn = op.conn;
     c.kind = op.kind;
     c.buffer = op.buffer;
@@ -61,7 +59,7 @@ Completion StdioBackend::finish(const Op &op) noexcept {
     switch (op.kind) {
     case OpKind::Accept:
     case OpKind::Close:
-        return c;
+        return true;
 
     case OpKind::Ready:
         /* \~english
@@ -86,7 +84,7 @@ Completion StdioBackend::finish(const Op &op) noexcept {
          * una conexion parada, y un servidor que habla por una tuberia tiene
          * exactamente una conexion.  La R1 va de un millon de ellas.
          * \~ */
-        return c;
+        return true;
 
     case OpKind::RecvFrom:
     case OpKind::SendTo:
@@ -99,12 +97,12 @@ Completion StdioBackend::finish(const Op &op) noexcept {
          * \~ */
         ++refused_datagrams_;
         c.result = -1;
-        return c;
+        return true;
 
     case OpKind::Recv: {
         if (b == nullptr || in_ < 0) {
             c.result = -1;
-            return c;
+            return true;
         }
 
         /* \~english
@@ -121,7 +119,7 @@ Completion StdioBackend::finish(const Op &op) noexcept {
         uint8_t *room = b->reserve(op.length);
         if (room == nullptr) {
             c.result = -1;
-            return c;
+            return true;
         }
 
         /* \~english
@@ -133,10 +131,14 @@ Completion StdioBackend::finish(const Op &op) noexcept {
          * y no una con buffer.  Una que esperara a todo lo que pidio esperaria a
          * la peticion SIGUIENTE a esta.
          * \~ */
-        const auto got = HTTP_VX_READ(in_, room, op.length);
+        bool woken = false;
+        const long got = read_or_wake(room, op.length, timeout_ms, woken);
+        // \~english Woken first: nothing read, and the read stays pending for the next wait.
+        // \~spanish Despertado antes: nada leido, y la lectura sigue pendiente para la espera siguiente.  \~
+        if (woken) return false;
         if (got < 0) {
             c.result = -1;
-            return c;
+            return true;
         }
 
         b->commit(static_cast<size_t>(got));
@@ -153,13 +155,13 @@ Completion StdioBackend::finish(const Op &op) noexcept {
         if (got == 0) ended_ = true;
 
         c.result = static_cast<int32_t>(got);
-        return c;
+        return true;
     }
 
     case OpKind::Send: {
         if (b == nullptr || out_ < 0 || op.offset + op.length > b->size()) {
             c.result = -1;
-            return c;
+            return true;
         }
 
         /* \~english
@@ -178,22 +180,20 @@ Completion StdioBackend::finish(const Op &op) noexcept {
         const auto put = HTTP_VX_WRITE(out_, b->data() + op.offset, op.length);
         if (put < 0) {
             c.result = -1;
-            return c;
+            return true;
         }
 
         c.result = static_cast<int32_t>(put);
-        return c;
+        return true;
     }
     }
 
     c.result = -1;
-    return c;
+    return true;
 }
 
 size_t StdioBackend::wait(Completion *done, size_t cap,
                           int timeout_ms) noexcept {
-    (void)timeout_ms;
-
     size_t made = 0;
 
     /* \~english
@@ -213,6 +213,16 @@ size_t StdioBackend::wait(Completion *done, size_t cap,
      * dos extremos esperandose es un abrazo mortal, y aqui seria uno que se
      * invento este backend.
      * \~ */
+    /* \~english
+     * A wake ends the pass: the read it interrupted, and every one behind
+     * it, stay pending, and the wait returns so the shard can take its kicks.
+     * \~spanish
+     * Un despertar acaba la pasada: la lectura que interrumpio, y todas las de
+     * detras, siguen pendientes, y la espera vuelve para que el fragmento atienda
+     * sus avisos.
+     * \~ */
+    bool woken = false;
+
     for (int pass = 0; pass < 2 && made < cap; ++pass) {
         const bool writes = pass == 0;
 
@@ -227,10 +237,11 @@ size_t StdioBackend::wait(Completion *done, size_t cap,
                                  op.kind == OpKind::RecvFrom ||
                                  op.kind == OpKind::Ready;
 
-            if (made < cap && is_read != writes) {
-                done[made] = finish(op);
+            if (!woken && made < cap && is_read != writes &&
+                finish(op, done[made], made != 0 ? 0 : timeout_ms)) {
                 ++made;
             } else {
+                if (is_read != writes && made < cap) woken = true;
                 pending_[(head_ + kept) % kStdioPending] = op;
                 ++kept;
             }

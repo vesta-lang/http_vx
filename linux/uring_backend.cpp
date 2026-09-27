@@ -16,6 +16,7 @@
 #include "http_vx/uring_backend.h"
 
 #include "socket_open.h"
+#include "uring_ring.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -67,85 +68,7 @@ int ring_enter(int fd, uint32_t to_submit, uint32_t min_complete,
                                     min_complete, flags, arg, arg_size));
 }
 
-/**
- * @brief
- * \~english Reads a ring index the kernel may be writing.
- * \~spanish Lee un indice del anillo que puede estar escribiendo el nucleo.
- * \~
- *
- * \~english
- * ACQUIRE, and that is not decoration.  The tail of the completion ring is
- * written by the kernel and the entries it points at are written BEFORE it; a
- * plain read may be moved after the reads of those entries by either the
- * compiler or the processor, and then this end reads a completion that has not
- * been filled in yet.
- *
- * It does not fail loudly.  What it produces is a completion naming an
- * operation that was never asked for, once in a while, on a machine under
- * load.
- *
- * \~spanish
- * ACQUIRE, y no es un adorno.  La cola del anillo de finalizaciones la escribe
- * el nucleo y las entradas a las que apunta se escriben ANTES; una lectura
- * normal la pueden mover detras de las lecturas de esas entradas el compilador o
- * el procesador, y entonces este extremo lee una finalizacion que todavia no se
- * ha rellenado.
- *
- * Y no falla en voz alta.  Lo que produce es una finalizacion que nombra una
- * operacion que no pidio nadie, de vez en cuando, en una maquina con trabajo.
- * \~
- */
-uint32_t load_acquire(const uint32_t *p) noexcept {
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
-}
-
-/// \~english Publishes a ring index the kernel will read.
-/// \~spanish Publica un indice del anillo que leera el nucleo.  \~
-void store_release(uint32_t *p, uint32_t v) noexcept {
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
-}
-
 } // namespace
-
-/**
- * @brief
- * \~english Where the kernel and this end meet.
- * \~spanish Donde se encuentran el nucleo y este extremo.
- * \~
- */
-struct UringBackend::Ring {
-    /// \~english The mapping, and how much of it there is.
-    /// \~spanish El mapeo, y cuanto hay de el.  \~
-    void *rings = nullptr;
-    size_t rings_size = 0;
-
-    io_uring_sqe *sqes = nullptr;
-    size_t sqes_size = 0;
-
-    /* \~english
-     * Pointers INTO the mapping rather than copies of what is there.  Every
-     * one of these is a place the kernel and this end both write, so a copy
-     * would be a second answer that stops agreeing with the first.
-     * \~spanish
-     * Punteros DENTRO del mapeo y no copias de lo que hay.  Todos estos son un
-     * sitio en el que escriben el nucleo y este extremo, asi que una copia seria
-     * una segunda respuesta que deja de estar de acuerdo con la primera.
-     * \~ */
-    uint32_t *sq_head = nullptr;
-    uint32_t *sq_tail = nullptr;
-    uint32_t *sq_array = nullptr;
-    uint32_t sq_mask = 0;
-    uint32_t sq_entries = 0;
-
-    uint32_t *cq_head = nullptr;
-    uint32_t *cq_tail = nullptr;
-    io_uring_cqe *cqes = nullptr;
-    uint32_t cq_mask = 0;
-
-    /// \~english Whether the kernel accepts a deadline on the wait.
-    /// \~spanish Si el nucleo acepta un plazo en la espera.  \~
-    bool ext_arg = false;
-};
 
 /**
  * @brief
@@ -203,6 +126,10 @@ void UringBackend::release() noexcept {
         close(fd_);
         fd_ = -1;
     }
+
+    // \~english After the ring: nothing can read into the wake buffer any more.
+    // \~spanish Tras el anillo: ya nada puede leer en el buffer de despertar.  \~
+    wake_close();
 
     release_datagrams();
 
@@ -360,6 +287,10 @@ bool UringBackend::reset(BufferPool &pool, uint32_t entries) noexcept {
     }
     free_head_ = 0;
 
+    if (!wake_open()) {
+        release();
+        return false;
+    }
     return true;
 }
 
@@ -420,7 +351,7 @@ bool UringBackend::submit(const Op &op) noexcept {
      * bajo en otra.
      * \~ */
     const uint32_t tail = *ring_->sq_tail;
-    const uint32_t head = load_acquire(ring_->sq_head);
+    const uint32_t head = ring_load_acquire(ring_->sq_head);
 
     if (tail - head >= ring_->sq_entries) return false;
 
@@ -556,7 +487,7 @@ bool UringBackend::submit(const Op &op) noexcept {
      * nucleo no se le llama, se le DICE -- y se le dice con una escritura que no
      * se puede mover por delante de la entrada a la que apunta.
      * \~ */
-    store_release(ring_->sq_tail, tail + 1);
+    ring_store_release(ring_->sq_tail, tail + 1);
     ++waiting_;
     return true;
 }
@@ -613,6 +544,8 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
 
     if (ring_ == nullptr || made == cap) return made;
 
+    if (!wake_armed_) arm_wake();
+
     /* \~english
      * What is already in the completion ring is taken FIRST, and only then is
      * the kernel entered.  Entering when there is already work to report would
@@ -625,7 +558,7 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
      * que es justo lo que este backend existe para evitar.
      * \~ */
     uint32_t head = *ring_->cq_head;
-    uint32_t tail = load_acquire(ring_->cq_tail);
+    uint32_t tail = ring_load_acquire(ring_->cq_tail);
 
     if (head == tail) {
         /* \~english
@@ -641,7 +574,7 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
         if (r < 0 && errno != EINTR && errno != ETIME) last_error_ = errno;
 
         head = *ring_->cq_head;
-        tail = load_acquire(ring_->cq_tail);
+        tail = ring_load_acquire(ring_->cq_tail);
     } else if (waiting_ != 0) {
         /* \~english
          * There IS something to report, so nothing is waited for -- but what
@@ -665,6 +598,12 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
 
         ++head;
 
+        // \~english A wake: its whole job was to end this wait; armed again on the next one.
+        // \~spanish Un despertar: todo su trabajo era acabar esta espera; se vuelve a armar en la siguiente.  \~
+        if (which == kWakeData) {
+            wake_armed_ = false;
+            continue;
+        }
         if (which >= slot_count_) continue;
 
         Slot *slot = &slots_[which];
@@ -721,7 +660,7 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
      * No hacerlo llena el anillo de finalizaciones que no reclamo nadie, y el
      * nucleo deja de poder informar de nada.
      * \~ */
-    store_release(ring_->cq_head, head);
+    ring_store_release(ring_->cq_head, head);
 
     return made;
 }

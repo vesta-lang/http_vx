@@ -116,6 +116,11 @@ int main() {
     }
 
     http_vx::StdioBackend io(shard.buffers(), 0, 1);
+    if (!io.ready()) {
+        std::fprintf(stderr, "http_vx: cannot make the stdio backend's wake (error %d)\n",
+                     static_cast<int>(io.wake_error()));
+        return 1;
+    }
 
     http_vx::ShardConfig cfg;
     cfg.connections = 4;

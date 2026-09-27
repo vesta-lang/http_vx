@@ -137,14 +137,23 @@ contesta lleno, y despues se espera a que avise.
 
 ### 4.4 Vida de la fuente
 
-> **La fuente es de la aplicacion y DEBE vivir hasta su `gone()` o hasta el
-> `fill` que puso `done`.  A partir de ese momento NO DEBE avisarse.**
+> **Toda fuente recibe exactamente un `gone()`, tambien cuando acaba ella
+> misma (`done`, motivo `Finished`).  La fuente es de la aplicacion, DEBE vivir
+> hasta su `gone()` y NO DEBE avisarse despues.**
 
 Es el mismo contrato que tiene cerrar un `uv_async_t` en libuv o una tasklet en
 HAProxy: el nodo de la cola vive dentro de la fuente, y liberar una fuente con
-un aviso en vuelo seria el fragmento leyendo memoria liberada.  Quien avise
-desde otros hilos es responsable de que esos hilos hayan dejado de hacerlo
-antes de liberarla.
+un aviso en vuelo seria el fragmento leyendo memoria liberada.  Por eso el
+final no es el `fill` que pone `done`: mientras ese `fill` corre, otro hilo
+puede estar avisando y metiendo la fuente en la pila.
+
+El fragmento entrega `gone()` solo cuando la fuente no esta en la pila: pone su
+marca `queued` a 1 con un intercambio.  Si valia 0, nadie la tiene y `gone()`
+sale en el acto; si valia 1, esta en la pila -- o un hilo la esta metiendo en
+este instante --, y `gone()` sale cuando el fragmento la saque, en su vuelta
+siguiente.  La marca se queda a 1: un aviso tardio ya no la vuelve a meter.
+Quien avise desde otros hilos es responsable de que hayan dejado de hacerlo al
+recibir `gone()`.
 
 ## 5. Del lado del fragmento
 
@@ -251,10 +260,30 @@ io_uring pueden crecer por avisos.
 
 | backend | despertar | por que |
 | :-- | :-- | :-- |
-| IOCP | `PostQueuedCompletionStatus` con una clave reservada | lo que el sistema ofrece para esto; el mas rapido medido; no necesita el handle del hilo ni ejecuta nada en mitad de la espera, como una APC |
+| IOCP | `PostQueuedCompletionStatus` sin `OVERLAPPED` | ninguna operacion de verdad acaba sin el suyo, asi que eso identifica al despertar sin reservar una clave; lo que el sistema ofrece para esto; el mas rapido medido; no necesita el handle del hilo ni ejecuta nada en mitad de la espera, como una APC |
 | epoll | `eventfd` en modo de flanco (`EPOLLET`), sin leerlo en cada despertar | cada escritura vuelve a disparar, asi que no hace falta leer para rearmar; se lee solo si el contador se desborda (`EAGAIN`).  Es lo que hacen libuv, Netty y nginx; en modo de nivel habria que leerlo en cada vuelta, una llamada al sistema mas |
 | io_uring | el mismo `eventfd`, con una lectura suya siempre armada en el anillo | el anillo solo se despierta por lo que completa; una lectura del `eventfd` completa cuando alguien escribe.  Se vuelve a armar en cada finalizacion: sin eso, el siguiente despertar se pierde en silencio |
+| stdio (POSIX) | un `eventfd`, y la lectura espera con `poll` sobre la entrada y el `eventfd`, con el plazo de la espera | una lectura de tuberia bloquea hasta que el otro extremo habla; `poll` sobre los dos la acaba con lo primero que pase, sin perderla: la operacion sigue pendiente |
+| stdio (Windows) | un hilo auxiliar hace la lectura; el fragmento espera con `WaitForMultipleObjects` sobre "lectura hecha" y un suceso de despertar | ver abajo |
 | memoria | una bandera | las pruebas deciden cuando pasa cada cosa |
+
+En Windows una tuberia anonima no se lee de forma asincrona ni se puede
+reabrir para ello (`ReOpenFile` responde `ERROR_PIPE_BUSY`), y toda operacion
+sobre un handle sincrono toma el cerrojo de su objeto de fichero: mientras un
+hilo esta en `ReadFile`, cualquier otra llamada sobre la tuberia --
+`PeekNamedPipe` incluida -- espera a esa lectura.  Por eso UN solo hilo toca la
+tuberia de entrada: un auxiliar que hace para este backend lo que el nucleo
+hace para IOCP.  El fragmento le entrega el sitio ya reservado en el buffer de
+la operacion, que desde ese momento es del auxiliar como un buffer entregado a
+IOCP es del nucleo, y espera por los dos sucesos con su plazo.  Despertar es
+`SetEvent`.  Una lectura cortada por un despertar o por el plazo sigue en vuelo
+y se vuelve a esperar, sobre la misma reserva, en la espera siguiente.
+
+Cancelar con `CancelSynchronousIo` la lectura del propio fragmento desde el
+hilo que despierta NO sirve: entre ver al fragmento bloqueado y cancelar, este
+puede haber pasado a una escritura sincrona en la tuberia de salida, y la
+cancelacion la aborta.  El auxiliar solo lee, asi que la unica cancelacion que
+queda -- la suya, al soltar el backend -- no puede dar con otra operacion.
 
 `IORING_OP_MSG_RING` publica una finalizacion en otro anillo sin `eventfd`,
 pero un hilo sin anillo propio solo puede usarlo desde el nucleo 6.13

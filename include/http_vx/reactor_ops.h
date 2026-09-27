@@ -524,6 +524,28 @@ class Backend {
 
     /**
      * @brief
+     * \~english Makes a @c wait in progress, or the next one, return at once.  The ONE member any thread may call.
+     * \~spanish Hace que un @c wait en curso, o el siguiente, vuelva en el acto.  El UNICO miembro que puede llamar cualquier hilo.
+     * \~
+     *
+     * \~english
+     * What a kick from another thread needs (HVX-5, 6.4).  A wake that finds
+     * the backend awake makes its next wait return early, once: a wake too
+     * many is harmless, one too few is a response that never goes out.
+     * \~spanish
+     * Lo que necesita un aviso desde otro hilo (HVX-5, 6.4).  Un despertar que
+     * encuentra al backend despierto hace que su siguiente espera vuelva antes,
+     * una vez: un despertar de mas es inofensivo, uno de menos es una respuesta
+     * que no sale nunca.
+     * \~
+     *
+     * @return \~english false if the wake could not be delivered, with the system's reason kept
+     *         \~spanish false si no se pudo entregar el despertar, con el motivo del sistema guardado  \~
+     */
+    virtual bool wake() noexcept = 0;
+
+    /**
+     * @brief
      * \~english Waits for completions, up to @p cap of them.
      * \~spanish Espera finalizaciones, hasta @p cap de ellas.
      * \~
