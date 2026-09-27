@@ -62,6 +62,7 @@
 
 #include "http_vx/buffer.h"
 #include "http_vx/h3_frame.h"
+#include "http_vx/id_index.h"
 #include "http_vx/message.h"
 #include "http_vx/qpack_decoder.h"
 #include "http_vx/qpack_encoder.h"
@@ -265,6 +266,9 @@ public:
 private:
     enum class Phase : uint8_t { Headers, Body, Trailers, Done };
 
+    /// \~english The end of a list of messages.  \~spanish El final de una lista de mensajes.  \~
+    static constexpr uint32_t kNoLink = 0xFFFFFFFFu;
+
     /* \~english One request stream: its frames in, its message, and what waits to go out.
      * \~spanish Un flujo de peticion: sus tramas de entrada, su mensaje, y lo que espera salir.  \~ */
     struct Message {
@@ -288,6 +292,10 @@ private:
         bool end_reported = false;
         Buffer out;
         bool out_fin = false;
+        /// \~english Neighbours in the live list, or (next only) in the free list.
+        /// \~spanish Vecinos en la lista de vivos, o (solo next) en la lista libre.  \~
+        uint32_t prev = kNoLink;
+        uint32_t next = kNoLink;
     };
 
     /* \~english A stream this end opened, or a peer's unidirectional one, and what it is.
@@ -317,6 +325,10 @@ private:
     const Message *message(uint64_t id) const noexcept;
     Message *adopt(uint64_t id) noexcept;
     void drop(Message &m) noexcept;
+    /// \~english Puts message @p i last in the live list.  \~spanish Pone el mensaje @p i el ultimo de la lista de vivos.  \~
+    void link_last(uint32_t i) noexcept;
+    /// \~english Takes message @p i out of the live list.  \~spanish Saca el mensaje @p i de la lista de vivos.  \~
+    void unlink(uint32_t i) noexcept;
     Uni *uni(uint64_t id) noexcept;
     bool encode(Message &m, const qpack::Line *lines, size_t count, bool end) noexcept;
     void flush() noexcept;
@@ -345,8 +357,25 @@ private:
     bool peer_encoder_ = false;
     bool peer_decoder_ = false;
 
+    /* \~english
+     * The request streams, and the three ways into them, each constant time:
+     * by stream ID (the index), the live ones in turn (a list whose head is
+     * the next to be read: whoever produced an event goes last), and a free
+     * one to take (a list through the same links).  A table walk on every
+     * poll and every frame cost the whole table even with one request alive.
+     * \~spanish
+     * Los flujos de peticion, y las tres formas de llegar a ellos, cada una en
+     * tiempo constante: por identificador de flujo (el indice), los vivos por
+     * turno (una lista cuya cabeza es el siguiente a leer: quien produjo un
+     * evento pasa el ultimo), y uno libre que coger (una lista por los mismos
+     * enlaces).  Recorrer la tabla en cada poll y cada trama costaba la tabla
+     * entera aunque solo viviera una peticion.
+     * \~ */
     Message *messages_ = nullptr;
-    size_t cursor_ = 0;
+    IdIndex by_id_;
+    uint32_t free_head_ = kNoLink;
+    uint32_t live_head_ = kNoLink;
+    uint32_t live_tail_ = kNoLink;
 
     /* \~english Bytes handed out with a Body event, consumed at the next poll.
      * \~spanish Bytes entregados con un evento Body, consumidos en el siguiente poll.  \~ */
@@ -360,6 +389,9 @@ private:
     uint64_t max_push_id_ = ~uint64_t{0};
     /// \~english Server: the next client request stream not seen yet.  \~spanish Servidor: el siguiente flujo de peticion del cliente aun sin ver.  \~
     uint64_t next_request_ = 0;
+    /// \~english The index of the peer's next unidirectional stream not seen yet.
+    /// \~spanish El indice del siguiente flujo unidireccional del otro aun sin ver.  \~
+    uint64_t next_uni_ = 0;
     /// \~english The time of the last poll, for closing.  \~spanish La hora del ultimo poll, para cerrar.  \~
     uint64_t now_ = 0;
     /* \~english

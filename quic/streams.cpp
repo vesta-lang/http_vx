@@ -25,13 +25,6 @@ namespace quic {
 
 namespace {
 
-/// \~english Spreads sequential IDs across the table.  \~spanish Reparte por la tabla identificadores seguidos.  \~
-inline size_t mix(uint64_t id) noexcept {
-    uint64_t h = id * 0x9E3779B97F4A7C15ull;
-    h ^= h >> 29;
-    return static_cast<size_t>(h);
-}
-
 /// \~english The stream types, by who opens them.  \~spanish Los tipos de flujo, segun quien los abre.  \~
 inline uint64_t local_type(bool is_server, bool bidi) noexcept {
     return (is_server ? 1u : 0u) | (bidi ? 0u : 2u);
@@ -73,21 +66,16 @@ StreamTable::StreamTable(const StreamConfig &config) noexcept : cfg_(config), ba
     if (cap == 0 || cap > (uint64_t{1} << 24)) return;
     capacity_ = static_cast<size_t>(cap);
 
-    size_t hcap = 8;
-    while (hcap < 2 * capacity_) hcap *= 2;
-
     const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
                                  util::AllocFill::Sparse);
     slots_ = static_cast<Stream *>(util::host_alloc(capacity_ * sizeof(Stream)));
     free_ = static_cast<uint32_t *>(util::host_alloc(capacity_ * sizeof(uint32_t)));
-    hash_ = static_cast<Entry *>(util::host_alloc(hcap * sizeof(Entry)));
-    if (slots_ == nullptr || free_ == nullptr || hash_ == nullptr) {
+    if (slots_ == nullptr || free_ == nullptr || !index_.reset(capacity_)) {
         if (slots_ != nullptr) util::host_free(slots_);
         if (free_ != nullptr) util::host_free(free_);
-        if (hash_ != nullptr) util::host_free(hash_);
+        index_.release();
         slots_ = nullptr;
         free_ = nullptr;
-        hash_ = nullptr;
         return;
     }
 
@@ -99,8 +87,6 @@ StreamTable::StreamTable(const StreamConfig &config) noexcept : cfg_(config), ba
         free_[i] = static_cast<uint32_t>(capacity_ - 1 - i);
     }
     free_count_ = capacity_;
-    for (size_t i = 0; i < hcap; ++i) hash_[i].id = kNever;
-    hash_mask_ = hcap - 1;
 }
 
 StreamTable::~StreamTable() {
@@ -109,60 +95,10 @@ StreamTable::~StreamTable() {
         if (slots_[i].id != kNever) destroy(i);
     util::host_free(slots_);
     util::host_free(free_);
-    util::host_free(hash_);
 }
 
 bool StreamTable::is_local(uint64_t id) const noexcept {
     return stream_is_server_initiated(id) == cfg_.is_server;
-}
-
-bool StreamTable::hash_insert(uint64_t id, uint32_t slot) noexcept {
-    size_t i = mix(id) & hash_mask_;
-    while (hash_[i].id != kNever) i = (i + 1) & hash_mask_;
-    hash_[i] = {id, slot};
-    return true;
-}
-
-int64_t StreamTable::hash_find(uint64_t id) const noexcept {
-    size_t i = mix(id) & hash_mask_;
-    while (hash_[i].id != kNever) {
-        if (hash_[i].id == id) return static_cast<int64_t>(i);
-        i = (i + 1) & hash_mask_;
-    }
-    return -1;
-}
-
-void StreamTable::hash_erase(uint64_t id) noexcept {
-    const int64_t at = hash_find(id);
-    if (at < 0) return;
-
-    /* \~english
-     * Backward-shift deletion: the entries after the hole that probed past
-     * it move back into it.  No tombstones, so a table that sees millions of
-     * streams come and go never slows down with dead entries.
-     * \~spanish
-     * Borrado desplazando hacia atras: las entradas de detras del hueco que
-     * pasaron por el al buscar sitio vuelven a el.  Sin lapidas, asi que una
-     * tabla que ve ir y venir millones de flujos no se ralentiza con entradas
-     * muertas.
-     * \~ */
-    size_t i = static_cast<size_t>(at);
-    hash_[i].id = kNever;
-    size_t j = i;
-    for (;;) {
-        j = (j + 1) & hash_mask_;
-        if (hash_[j].id == kNever) return;
-        const size_t k = mix(hash_[j].id) & hash_mask_;
-
-        // \~english Does j's home lie cyclically outside (i, j]?  Then it may fill the hole.
-        // \~spanish Esta el origen de j ciclicamente fuera de (i, j]?  Entonces puede rellenar el hueco.  \~
-        const bool movable = (i <= j) ? (k <= i || k > j) : (k <= i && k > j);
-        if (movable) {
-            hash_[i] = hash_[j];
-            hash_[j].id = kNever;
-            i = j;
-        }
-    }
 }
 
 Stream *StreamTable::create(uint64_t id) noexcept {
@@ -216,8 +152,7 @@ Stream *StreamTable::create(uint64_t id) noexcept {
         s.send = new (mem) SendStream(cfg_.send_capacity, limit);
     }
 
-    hash_insert(id, slot);
-    ++live_;
+    index_.insert(id, slot);
     return &s;
 }
 
@@ -233,17 +168,14 @@ void StreamTable::destroy(size_t slot) noexcept {
         util::host_free(s.send);
         s.send = nullptr;
     }
-    if (hash_find(s.id) >= 0) {
-        hash_erase(s.id);
-        --live_;
-    }
+    index_.erase(s.id);
     s.id = kNever;
     free_[free_count_++] = static_cast<uint32_t>(slot);
 }
 
 Stream *StreamTable::find(uint64_t id) noexcept {
-    const int64_t at = hash_find(id);
-    return at < 0 ? nullptr : &slots_[hash_[at].slot];
+    const uint32_t at = index_.find(id);
+    return at == IdIndex::kAbsent ? nullptr : &slots_[at];
 }
 
 StreamLookup StreamTable::on_peer_frame(uint64_t id, FrameType type, Stream *&out,

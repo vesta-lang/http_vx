@@ -183,6 +183,19 @@ target_link_libraries(http_vx_proto PUBLIC vesta_alloc)
 # (R6): lo que lee QUIC es lo que manda un desconocido, y tiene que poder
 # darsele bytes torcidos desde una prueba corriente sin abrir ningun puerto.
 # ---------------------------------------------------------------------------
+# Las estructuras que comparten capas que no se conocen entre si -- QUIC no
+# depende de `http_vx_core`, que arrastra el reactor --, en una biblioteca que
+# no depende de nada mas que del asignador: una tabla de identificadores escrita
+# UNA vez y no una por cada capa que la necesita.
+add_library(http_vx_base STATIC
+        core/id_index.cpp
+)
+target_include_directories(http_vx_base
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
+target_compile_options(http_vx_base PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_base PUBLIC vesta_alloc)
+
 add_library(http_vx_quic STATIC
         quic/acceptor.cpp
         quic/ack.cpp
@@ -203,7 +216,7 @@ target_include_directories(http_vx_quic
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
 target_compile_options(http_vx_quic PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_quic PUBLIC vesta_alloc)
+target_link_libraries(http_vx_quic PUBLIC http_vx_base vesta_alloc)
 
 # ---------------------------------------------------------------------------
 # TLS 1.3, el propio.  La R22 deja fuera las bibliotecas de TLS y pone la linea
@@ -639,6 +652,7 @@ if (HTTP_VX_BUILD_TESTS)
     target_link_libraries(test_quic_fuzz PRIVATE http_vx_h3_service)
     http_vx_add_test(test_quic_routes tests/test_quic_routes.cpp)
     http_vx_add_test(test_deadline_heap tests/test_deadline_heap.cpp)
+    http_vx_add_test(test_id_index tests/test_id_index.cpp)
     http_vx_add_test(test_http3_service tests/test_http3_service.cpp)
     target_link_libraries(test_http3_service PRIVATE http_vx_h3_service)
     if (TARGET http_vx_crypto_openssl)

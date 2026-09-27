@@ -46,6 +46,7 @@
 #ifndef HTTP_VX_QUIC_STREAMS_H
 #define HTTP_VX_QUIC_STREAMS_H
 
+#include "http_vx/id_index.h"
 #include "http_vx/quic_ack.h"
 #include "http_vx/quic_frame.h"
 #include "http_vx/quic_stream_recv.h"
@@ -257,7 +258,7 @@ public:
     uint64_t max_streams(bool bidirectional) const noexcept;
 
     /// \~english The open streams, in no particular order.  \~spanish Los flujos abiertos, sin orden particular.  \~
-    size_t count() const noexcept { return live_; }
+    size_t count() const noexcept { return index_.size(); }
 
     /**
      * @brief
@@ -286,9 +287,6 @@ public:
 private:
     Stream *create(uint64_t id) noexcept;
     void destroy(size_t slot) noexcept;
-    bool hash_insert(uint64_t id, uint32_t slot) noexcept;
-    int64_t hash_find(uint64_t id) const noexcept;
-    void hash_erase(uint64_t id) noexcept;
     bool is_local(uint64_t id) const noexcept;
 
     StreamConfig cfg_;
@@ -299,14 +297,9 @@ private:
     uint32_t *free_ = nullptr;
     size_t capacity_ = 0;
     size_t free_count_ = 0;
-    size_t live_ = 0;
 
-    struct Entry {
-        uint64_t id;
-        uint32_t slot;
-    };
-    Entry *hash_ = nullptr;
-    size_t hash_mask_ = 0;
+    /// \~english Which slot holds each open stream.  \~spanish Que ranura tiene cada flujo abierto.  \~
+    IdIndex index_;
 
     /// \~english Per stream type (the two low bits of the ID).  \~spanish Por tipo de flujo (los dos bits bajos del ID).  \~
     uint64_t opened_[4] = {0, 0, 0, 0};

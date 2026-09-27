@@ -133,7 +133,10 @@ struct Link {
     std::vector<Rec> client_events;
     std::vector<Rec> server_events;
 
-    Link() : qc(cr, client_config()), qs(cr, server_config()), hc(qc), hs(qs) {
+    Link() : Link(client_config(), server_config()) {}
+
+    /// \~english With transport configurations of the test's own.  \~spanish Con configuraciones de transporte propias de la prueba.  \~
+    Link(const ConnectionConfig &cc, const ConnectionConfig &sc) : qc(cr, cc), qs(cr, sc), hc(qc), hs(qs) {
         check(install(qc, 4, 3) && install(qs, 3, 4), "keys");
         qc.handshake_confirmed(0);
         qs.handshake_confirmed(0);
@@ -1048,6 +1051,104 @@ void test_stream_order() {
     k.pump();
     check(k.find(k.server_events, h3::EventKind::Request, a) != nullptr, "the lower stream is read");
     check(k.find(k.server_events, h3::EventKind::Request, b) != nullptr, "and the higher one");
+
+    {
+        /* \~english
+         * Two request slots and five exchanges: each finished request gives its
+         * slot back and the next takes it -- and the finished one's ID no longer
+         * finds anything, not even the request that took its slot.
+         * \~spanish
+         * Dos casillas de peticion y cinco intercambios: cada peticion acabada
+         * devuelve su casilla y la siguiente la coge -- y el identificador de la
+         * acabada ya no encuentra nada, ni siquiera la peticion que cogio su
+         * casilla.
+         * \~ */
+        Link s;
+        h3::Config c = Link::config(true);
+        c.max_requests = 2;
+        s.start(true, c);
+        s.pump();
+        uint64_t first = ~uint64_t{0};
+        bool all_read = true;
+        for (int i = 0; i < 5; ++i) {
+            const uint64_t id = s.hc.send_request(req.data(), req.size(), true);
+            if (i == 0) first = id;
+            s.pump();
+            if (s.find(s.server_events, h3::EventKind::Request, id) == nullptr) all_read = false;
+            s.hs.respond(id, 204, nullptr, 0, true);
+            s.pump(10);
+        }
+        check(all_read, "a request after the first two found no free slot");
+        const Buffer *bytes = nullptr;
+        check(s.hs.request(first, bytes) == nullptr, "a finished request is still found by its ID");
+    }
+    {
+        /* \~english
+         * Turns: one request with a body waiting and one that just arrived.  The
+         * second's request is read before the first's body -- a request that
+         * always has something to say cannot keep another waiting.
+         * \~spanish
+         * Turnos: una peticion con un cuerpo esperando y otra que acaba de llegar.
+         * La peticion de la segunda se lee antes que el cuerpo de la primera --
+         * una peticion que siempre tiene algo que decir no puede hacer esperar a
+         * otra.
+         * \~ */
+        Link t;
+        t.start();
+        t.pump();
+        const std::vector<qpack::Line> post = {line(":method", "POST"), line(":scheme", "https"),
+                                               line(":authority", "example.com"), line(":path", "/")};
+        const uint64_t first = t.hc.send_request(post.data(), post.size(), false);
+        const std::string payload(3000, 'b');
+        t.hc.send_body(first, reinterpret_cast<const uint8_t *>(payload.data()), payload.size(), false);
+        const uint64_t second = t.hc.send_request(req.data(), req.size(), true);
+        t.pump();
+        size_t second_at = t.server_events.size();
+        size_t first_body_at = t.server_events.size();
+        for (size_t i = 0; i < t.server_events.size(); ++i) {
+            const Rec &r = t.server_events[i];
+            if (r.kind == h3::EventKind::Request && r.stream == second && second_at == t.server_events.size())
+                second_at = i;
+            if (r.kind == h3::EventKind::Body && r.stream == first && first_body_at == t.server_events.size())
+                first_body_at = i;
+        }
+        check(second_at < t.server_events.size() && first_body_at < t.server_events.size(),
+              "both requests and the body are read");
+        check(second_at < first_body_at, "a request with more to say kept another waiting for its turn");
+    }
+    {
+        /* \~english
+         * Unidirectional streams past the ones this end keeps are stopped with
+         * H3_STREAM_CREATION_ERROR, found by index like request streams.  The
+         * eight kept are stopped too, for their unknown type (6.2) -- but only
+         * after being read; the ninth is never read, so only finding it by
+         * index can stop it.
+         * \~spanish
+         * Los flujos unidireccionales que pasan de los que guarda este extremo se
+         * paran con H3_STREAM_CREATION_ERROR, encontrados por indice como los de
+         * peticion.  Los ocho guardados tambien se paran, por su tipo desconocido
+         * (6.2) -- pero despues de leerlos; el noveno no se lee nunca, asi que
+         * solo encontrarlo por indice puede pararlo.
+         * \~ */
+        ConnectionConfig cc = client_config();
+        ConnectionConfig sc = server_config();
+        cc.streams.peer_max_streams_uni = 12;
+        sc.streams.peer_uni_concurrency = 12;
+        Link u(cc, sc);
+        u.start(false);
+        u.pump(3, false);
+        std::vector<uint8_t> reserved;
+        add_varint(reserved, 0x21);
+        uint64_t ids[9] = {};
+        for (uint64_t &id : ids) id = raw(u, false, reserved, false);
+        u.pump(6, false);
+        bool stopped = true;
+        for (const uint64_t id : ids) {
+            const Stream *s = u.qc.streams().find(id);
+            if (s != nullptr && s->send->reset_code() != h3::kStreamCreationError) stopped = false;
+        }
+        check(stopped, "a unidirectional stream, kept or past what is kept, was not stopped (6.2)");
+    }
 }
 
 } // namespace

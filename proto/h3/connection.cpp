@@ -154,9 +154,16 @@ bool Connection::start(const Config &cfg) noexcept {
     ec.max_capacity = cfg.encoder_capacity;
     if (!encoder_.reset(ec)) return fail(kInternalError, encoder_.failure().why);
     const util::AllocScope scope(util::AllocUse::Long, util::AllocShape::Fixed, util::AllocFill::Sparse);
+    if (cfg.max_requests == 0 || cfg.max_requests >= kNoLink)
+        return fail(kInternalError, "a request table of no size, or one too large to link");
     messages_ = static_cast<Message *>(util::host_alloc(cfg.max_requests * sizeof(Message)));
-    if (messages_ == nullptr) return fail(kInternalError, "out of memory for request streams");
-    for (size_t i = 0; i < cfg.max_requests; ++i) new (&messages_[i]) Message();
+    if (messages_ == nullptr || !by_id_.reset(cfg.max_requests))
+        return fail(kInternalError, "out of memory for request streams");
+    for (size_t i = 0; i < cfg.max_requests; ++i) {
+        new (&messages_[i]) Message();
+        messages_[i].next = i + 1 == cfg.max_requests ? kNoLink : static_cast<uint32_t>(i + 1);
+    }
+    free_head_ = 0;
     // \~english Each stream starts with its type; the control stream then SETTINGS, its first frame (6.2, 6.2.1).
     // \~spanish Cada flujo empieza con su tipo; el de control despues con SETTINGS, su primera trama (6.2, 6.2.1).  \~
     const uint64_t types[kLocalUni] = {kControlStream, qpack::kEncoderStreamType, qpack::kDecoderStreamType};
@@ -198,44 +205,75 @@ Connection::Uni *Connection::uni(uint64_t id) noexcept {
 }
 
 Connection::Message *Connection::message(uint64_t id) noexcept {
-    for (size_t i = 0; i < cfg_.max_requests; ++i)
-        if (messages_[i].used && messages_[i].id == id) return &messages_[i];
-    return nullptr;
+    const uint32_t at = by_id_.find(id);
+    return at == IdIndex::kAbsent ? nullptr : &messages_[at];
 }
 
 const Connection::Message *Connection::message(uint64_t id) const noexcept {
-    for (size_t i = 0; i < cfg_.max_requests; ++i)
-        if (messages_[i].used && messages_[i].id == id) return &messages_[i];
-    return nullptr;
+    const uint32_t at = by_id_.find(id);
+    return at == IdIndex::kAbsent ? nullptr : &messages_[at];
+}
+
+void Connection::link_last(uint32_t i) noexcept {
+    Message &m = messages_[i];
+    m.prev = live_tail_;
+    m.next = kNoLink;
+    if (live_tail_ != kNoLink)
+        messages_[live_tail_].next = i;
+    else
+        live_head_ = i;
+    live_tail_ = i;
+}
+
+void Connection::unlink(uint32_t i) noexcept {
+    Message &m = messages_[i];
+    if (m.prev != kNoLink)
+        messages_[m.prev].next = m.next;
+    else
+        live_head_ = m.next;
+    if (m.next != kNoLink)
+        messages_[m.next].prev = m.prev;
+    else
+        live_tail_ = m.prev;
+    m.prev = kNoLink;
+    m.next = kNoLink;
 }
 
 Connection::Message *Connection::adopt(uint64_t id) noexcept {
-    for (size_t i = 0; i < cfg_.max_requests; ++i) {
-        Message &m = messages_[i];
-        if (m.used) continue;
-        m.used = true;
-        m.id = id;
-        m.phase = Phase::Headers;
-        m.reader.reset(cfg_.max_held);
-        m.blocked.clear();
-        m.is_blocked = false;
-        m.request.clear();
-        m.response = Response{};
-        m.fields.clear();
-        m.content_length = kNone;
-        m.body_seen = 0;
-        m.head_request = false;
-        m.final_response = false;
-        m.final_sent = false;
-        m.end_reported = false;
-        m.out.clear();
-        m.out_fin = false;
-        return &m;
-    }
-    return nullptr;
+    // \~english No free message: every one is a live request, which the peer's stream limit allows.
+    // \~spanish Ningun mensaje libre: cada uno es una peticion viva, que permite el limite de flujos del otro.  \~
+    if (free_head_ == kNoLink || messages_ == nullptr) return nullptr;
+    const uint32_t i = free_head_;
+    if (!by_id_.insert(id, i)) return nullptr;
+    Message &m = messages_[i];
+    free_head_ = m.next;
+    link_last(i);
+    m.used = true;
+    m.id = id;
+    m.phase = Phase::Headers;
+    m.reader.reset(cfg_.max_held);
+    m.blocked.clear();
+    m.is_blocked = false;
+    m.request.clear();
+    m.response = Response{};
+    m.fields.clear();
+    m.content_length = kNone;
+    m.body_seen = 0;
+    m.head_request = false;
+    m.final_response = false;
+    m.final_sent = false;
+    m.end_reported = false;
+    m.out.clear();
+    m.out_fin = false;
+    return &m;
 }
 
 void Connection::drop(Message &m) noexcept {
+    const uint32_t i = static_cast<uint32_t>(&m - messages_);
+    by_id_.erase(m.id);
+    unlink(i);
+    m.next = free_head_;
+    free_head_ = i;
     m.used = false;
     m.blocked.clear();
     m.fields.clear();
@@ -334,8 +372,8 @@ void Connection::flush() noexcept {
     }
     for (Uni &u : local_)
         if (u.id != kNone) flush_one(u.out, false, u.id);
-    for (size_t i = 0; i < cfg_.max_requests; ++i)
-        if (messages_[i].used) flush_one(messages_[i].out, messages_[i].out_fin, messages_[i].id);
+    for (uint32_t i = live_head_; i != kNoLink; i = messages_[i].next)
+        flush_one(messages_[i].out, messages_[i].out_fin, messages_[i].id);
 }
 
 size_t Connection::encoder_room() noexcept {
@@ -776,17 +814,30 @@ Event Connection::poll(uint64_t now_us) noexcept {
     }
     open_local();
     quic::StreamTable &t = q_.streams();
-    // \~english The peer's unidirectional streams first: SETTINGS and QPACK's inserts shape the rest.
-    // \~spanish Primero los flujos unidireccionales del otro: SETTINGS y las inserciones de QPACK dan forma al resto.  \~
-    for (size_t i = 0; i < t.capacity() && !failed(); ++i) {
-        quic::Stream *s = t.slot(i);
-        if (s == nullptr || !is_uni(s->id) || s->recv == nullptr) continue;
-        Uni *u = uni(s->id);
-        if (u == nullptr) {
-            s->recv->stop(kStreamCreationError);
-            continue;
-        }
-        read_uni(*s, *u);
+    /* \~english
+     * The peer's unidirectional streams first: SETTINGS and QPACK's inserts
+     * shape the rest.  New ones are found by index, as request streams are
+     * (the peer opens them in order), and one past what this end keeps is
+     * stopped once, when it is seen; then only the ones kept are read --
+     * not every stream of the connection, on every poll.
+     * \~spanish
+     * Primero los flujos unidireccionales del otro: SETTINGS y las inserciones
+     * de QPACK dan forma al resto.  Los nuevos se encuentran por indice, como
+     * los de peticion (el otro los abre en orden), y uno que pase de lo que
+     * guarda este extremo se para una vez, cuando se ve; despues solo se leen
+     * los guardados -- no todos los flujos de la conexion, en cada poll.
+     * \~ */
+    const uint64_t peer_uni_type = cfg_.server ? 2 : 3;
+    for (const uint64_t seen = t.peer_opened(false); next_uni_ < seen && !failed(); ++next_uni_) {
+        quic::Stream *s = t.find(next_uni_ * 4 + peer_uni_type);
+        if (s == nullptr || s->recv == nullptr) continue;
+        if (uni(s->id) == nullptr) s->recv->stop(kStreamCreationError);
+    }
+    for (Uni &u : peer_uni_) {
+        if (failed()) break;
+        if (u.id == kNone) continue;
+        quic::Stream *s = t.find(u.id);
+        if (s != nullptr && s->recv != nullptr) read_uni(*s, u);
     }
     if (goaway_event_ && !failed()) {
         goaway_event_ = false;
@@ -861,22 +912,34 @@ Event Connection::poll(uint64_t now_us) noexcept {
         }
     }
     if (failed()) return poll(now_us);
-    for (size_t step = 0; step < cfg_.max_requests; ++step) {
-        Message &m = messages_[(cursor_ + step) % cfg_.max_requests];
-        if (!m.used) continue;
+    /* \~english
+     * The live requests in turn.  One that produces an event goes to the end
+     * of the list, so the next poll starts with the one after it: every
+     * request gets its turn however often another has something to say.
+     * \~spanish
+     * Las peticiones vivas por turno.  La que produce un evento pasa al final
+     * de la lista, asi que el siguiente poll empieza por la de despues: cada
+     * peticion tiene su turno por mucho que otra tenga algo que decir.
+     * \~ */
+    for (uint32_t i = live_head_; i != kNoLink;) {
+        Message &m = messages_[i];
+        const uint32_t after = m.next;
         quic::Stream *s = t.find(m.id);
         if (s == nullptr) {
             drop(m);
+            i = after;
             continue;
         }
         Event e = read_message(*s, m);
         if (failed()) return poll(now_us);
         if (e.kind != EventKind::None) {
-            e.slot = static_cast<size_t>(&m - messages_);
-            cursor_ = (cursor_ + step + 1) % cfg_.max_requests;
+            e.slot = i;
+            unlink(i);
+            link_last(i);
             flush();
             return e;
         }
+        i = after;
     }
     flush();
     if (failed()) return poll(now_us);
