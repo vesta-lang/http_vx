@@ -128,7 +128,28 @@ class OpenPort {
      * \~
      */
     virtual void end(BodySource &s, GoneReason why) noexcept = 0;
+};
 
+/**
+ * @brief
+ * \~english The port a stream service is given: the connections are the shard's table.
+ * \~spanish La puerta que recibe un servicio de flujo: las conexiones son las de la tabla del fragmento.
+ * \~
+ *
+ * \~english
+ * What only makes sense when the loop owns the connection -- asking it for
+ * room, holding its reads, knowing why it ends.  A datagram service owns its
+ * connections itself and is given a plain @c OpenPort: it writes when the
+ * loop pulls, after the kicks are drained.
+ * \~spanish
+ * Lo que solo tiene sentido cuando la conexion es del bucle -- pedirle sitio,
+ * retener sus lecturas, saber por que acaba.  Un servicio de datagramas es dueno
+ * de sus conexiones y recibe una @c OpenPort a secas: escribe cuando el bucle
+ * tira, despues de vaciar los avisos.
+ * \~
+ */
+class StreamPort : public OpenPort {
+  public:
     /**
      * @brief
      * \~english Asks for @c Service::on_writable on @p c once what is going out has gone.

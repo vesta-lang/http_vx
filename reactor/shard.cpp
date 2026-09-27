@@ -167,7 +167,8 @@ void Shard::on_accept(const Completion &done, uint64_t now) noexcept {
 }
 
 void Shard::release() noexcept {
-    if (io_ != nullptr && service_ != nullptr) shut_down();
+    if (io_ != nullptr && (service_ != nullptr || datagram_service_ != nullptr)) shut_down();
+    datagram_service_ = nullptr;
 
     if (queue_next_ != nullptr) {
         util::host_free(queue_next_);

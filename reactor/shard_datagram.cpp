@@ -269,7 +269,11 @@ uint64_t ShardDatagrams::timer() const noexcept {
 bool Shard::attach_datagrams(DatagramService &service,
                              const DatagramConfig &cfg) noexcept {
     if (io_ == nullptr) return false;
-    return datagrams_.reset(cfg, *io_, pool_, service);
+    if (!datagrams_.reset(cfg, *io_, pool_, service)) return false;
+
+    datagram_service_ = &service;
+    service.attach(&datagram_port_);
+    return true;
 }
 
 bool Shard::add_datagram_socket(int32_t fd, const NetAddress &bound) noexcept {

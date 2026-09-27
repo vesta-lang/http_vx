@@ -207,7 +207,7 @@ class Http1Service final : public Service, public KickTarget {
     bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override;
     void on_open(ConnHandle c) noexcept override;
     void on_close(ConnHandle c) noexcept override;
-    void attach(OpenPort *port) noexcept override { port_ = port; }
+    void attach(StreamPort *port) noexcept override { port_ = port; }
     bool on_writable(ConnHandle c, Buffer &out) noexcept override;
     void on_kick(BodySource &source) noexcept override;
 
@@ -447,7 +447,7 @@ class Http1Service final : public Service, public KickTarget {
 
     /// \~english The shard's side of open responses, or null: then nothing opens.
     /// \~spanish El lado del fragmento de las respuestas abiertas, o nulo: entonces no se abre nada.  \~
-    OpenPort *port_ = nullptr;
+    StreamPort *port_ = nullptr;
 };
 
 } // namespace http_vx

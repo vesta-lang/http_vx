@@ -236,12 +236,43 @@ void Shard::shut_down() noexcept {
      * \~ */
     shutting_down_ = true;
 
-    for (uint32_t slot = 0; slot < cfg_.connections; ++slot) {
-        const ConnHandle c = conns_.at(slot);
-        if (c.valid()) service_->on_close(c);
+    if (service_ != nullptr) {
+        for (uint32_t slot = 0; slot < cfg_.connections; ++slot) {
+            const ConnHandle c = conns_.at(slot);
+            if (c.valid()) service_->on_close(c);
+        }
     }
+    if (datagram_service_ != nullptr) datagram_service_->on_shutdown();
 
     kicks_.drain();
+}
+
+OpenResponse Shard::DatagramPort::open(ConnHandle c, uint64_t stream, BodySource &s,
+                                       KickTarget &target) noexcept {
+    Shard &sh = *shard_;
+    if (sh.shutting_down_ || sh.open_counts_.open_now >= sh.cfg_.max_open) {
+        ++sh.open_counts_.refused;
+        return OpenResponse();
+    }
+
+    OpenResponse r;
+    r.conn = c;
+    r.stream = stream;
+    sh.kicks_.open(s, target, r);
+
+    ++sh.open_counts_.open_now;
+    ++sh.open_counts_.opened;
+    return r;
+}
+
+size_t Shard::DatagramPort::fill(BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept {
+    return shard_->fill(s, dst, room, done);
+}
+
+void Shard::DatagramPort::end(BodySource &s, GoneReason why) noexcept {
+    Shard &sh = *shard_;
+    if (!sh.kicks_.close(s, why)) return;
+    if (sh.open_counts_.open_now != 0) --sh.open_counts_.open_now;
 }
 
 } // namespace http_vx

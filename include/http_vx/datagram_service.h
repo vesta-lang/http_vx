@@ -59,6 +59,7 @@
 
 #include "http_vx/buffer_pool.h"
 #include "http_vx/datagram.h"
+#include "http_vx/open_port.h"
 #include "http_vx/reactor_ops.h"
 
 #include <cstddef>
@@ -155,6 +156,34 @@ class DatagramService {
     /// \~english Runs every timer due by @p now.
     /// \~spanish Ejecuta cada temporizador vencido a @p now.  \~
     virtual void on_timer(uint64_t now) noexcept = 0;
+
+    /**
+     * @brief
+     * \~english Gives the service its shard's side of open responses (HVX-5); once, at @c Shard::attach_datagrams.
+     * \~spanish Le da al servicio el lado de su fragmento de las respuestas abiertas (HVX-5); una vez, en @c Shard::attach_datagrams.
+     * \~
+     *
+     * \~english
+     * Its connections are its own, so the port checks the shard's limit and
+     * not a connection's: the limit per connection is the service's to keep.
+     * What it has to send is pulled with @c next_datagram after the kicks
+     * are drained, so a kicked source needs nothing more than being marked.
+     * \~spanish
+     * Sus conexiones son suyas, asi que la puerta comprueba el tope del fragmento
+     * y no el de una conexion: el tope por conexion lo lleva el servicio.  Lo que
+     * tenga que mandar se saca con @c next_datagram despues de vaciar los avisos,
+     * asi que una fuente avisada no necesita mas que marcarse.
+     * \~
+     */
+    virtual void attach(OpenPort *port) noexcept { (void)port; }
+
+    /**
+     * @brief
+     * \~english The shard is letting go: end every open response with @c GoneReason::Shutdown.
+     * \~spanish El fragmento lo suelta todo: acaba cada respuesta abierta con @c GoneReason::Shutdown.
+     * \~
+     */
+    virtual void on_shutdown() noexcept {}
 };
 
 /**

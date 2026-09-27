@@ -187,19 +187,25 @@ respuesta abierta que no dice nada durante el plazo acaba con
 
 ### 5.1 La puerta del fragmento
 
-Lo que no es de ninguna version lo da el fragmento a sus servicios de flujo
-como una interfaz, `OpenPort`, que recibe cada servicio al arrancar el
+Lo que no es de ninguna version lo da el fragmento a sus servicios como una
+interfaz.  Un servicio de flujo recibe una `StreamPort` al arrancar el
 fragmento (`Service::attach`; un servicio que envuelve a otro, como TLS, se la
-pasa):
+pasa); un servicio de datagramas recibe una `OpenPort` a secas al conectarse
+(`DatagramService::attach`), porque sus conexiones son suyas: su puerta
+comprueba el tope del fragmento, el tope por conexion lo lleva el servicio,
+no busca nada en la tabla de conexiones del fragmento, y lo que haya que
+mandar se saca despues de vaciar los avisos.  Al soltar el fragmento, el
+servicio de datagramas recibe `on_shutdown` y acaba lo abierto con
+`Shutdown`.
 
-| llamada | que hace |
-| :-- | :-- |
-| `open(conn, stream, fuente, destino)` | comprueba los topes del fragmento y de la conexion, registra la fuente en la pila de avisos con el servicio como destino, y cuenta; con un tope agotado devuelve una respuesta invalida y cuenta el rechazo |
-| `fill(fuente, dst, room, done)` | el unico sitio desde el que se llama a `BodySource::fill`: cuenta llamadas y bytes, y recorta a `room` lo que devuelva la fuente |
-| `end(fuente, motivo)` | acaba la respuesta; su `gone` sale ahora o en el vaciado siguiente (4.4) |
-| `want_writable(conn)` | pide `Service::on_writable` en cuanto no salga nada de esa conexion |
-| `hold_reads(conn, bool)` | deja de entregar y de leer los bytes de la conexion, o lo reanuda entregando antes lo que quedo |
-| `closing_reason(conn)` | el motivo del `gone` de lo que siga abierto: plazo vencido, cierre, o fragmento que se suelta |
+| llamada | puerta | que hace |
+| :-- | :-- | :-- |
+| `open(conn, stream, fuente, destino)` | las dos | comprueba los topes, registra la fuente en la pila de avisos con el servicio como destino, y cuenta; con un tope agotado devuelve una respuesta invalida y cuenta el rechazo |
+| `fill(fuente, dst, room, done)` | las dos | el unico sitio desde el que se llama a `BodySource::fill`: cuenta llamadas y bytes, y recorta a `room` lo que devuelva la fuente |
+| `end(fuente, motivo)` | las dos | acaba la respuesta; su `gone` sale ahora o en el vaciado siguiente (4.4) |
+| `want_writable(conn)` | `StreamPort` | pide `Service::on_writable` en cuanto no salga nada de esa conexion |
+| `hold_reads(conn, bool)` | `StreamPort` | deja de entregar y de leer los bytes de la conexion, o lo reanuda entregando antes lo que quedo |
+| `closing_reason(conn)` | `StreamPort` | el motivo del `gone` de lo que siga abierto: plazo vencido, cierre, o fragmento que se suelta |
 
 El servicio es el destino de los avisos de sus fuentes, porque es el que sabe
 a que flujo alimenta cada una; al recibir uno, marca el flujo y pide sitio.

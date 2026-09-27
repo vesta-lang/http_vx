@@ -274,12 +274,12 @@ class Service {
      * respuesta lo ignora.
      * \~
      */
-    virtual void attach(OpenPort *port) noexcept { (void)port; }
+    virtual void attach(StreamPort *port) noexcept { (void)port; }
 
     /**
      * @brief
-     * \~english Room on @p c, asked for with @c OpenPort::want_writable: fill what is open into @p out.
-     * \~spanish Hay sitio en @p c, pedido con @c OpenPort::want_writable: rellena en @p out lo que este abierto.
+     * \~english Room on @p c, asked for with @c StreamPort::want_writable: fill what is open into @p out.
+     * \~spanish Hay sitio en @p c, pedido con @c StreamPort::want_writable: rellena en @p out lo que este abierto.
      * \~
      *
      * @return \~english false to end the connection once @p out has gone
@@ -445,7 +445,7 @@ struct ShardCounts {
  * \~spanish Lo que le toca de servidor a un hilo.
  * \~
  */
-class Shard final : public OpenPort {
+class Shard final : public StreamPort {
   public:
     Shard() noexcept = default;
 
@@ -846,6 +846,40 @@ class Shard final : public OpenPort {
     KickQueue kicks_;
 
     OpenCounts open_counts_;
+
+    /**
+     * @brief
+     * \~english The port the datagram side's service is given: the shard's limit, kicks and counts, and no connection table.
+     * \~spanish La puerta que recibe el servicio del lado de datagramas: el tope, los avisos y las cuentas del fragmento, y ninguna tabla de conexiones.
+     * \~
+     *
+     * \~english
+     * Its connection handles are the service's own, so nothing here looks
+     * them up in @c conns_: a QUIC handle with the slot and life of a live
+     * TCP connection would count against the wrong one.
+     * \~spanish
+     * Sus referencias de conexion son del propio servicio, asi que aqui nada las
+     * busca en @c conns_: una referencia QUIC con la casilla y la vida de una
+     * conexion TCP viva contaria contra la que no es.
+     * \~
+     */
+    class DatagramPort final : public OpenPort {
+      public:
+        explicit DatagramPort(Shard &shard) noexcept : shard_(&shard) {}
+
+        OpenResponse open(ConnHandle c, uint64_t stream, BodySource &s,
+                          KickTarget &target) noexcept override;
+        size_t fill(BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept override;
+        void end(BodySource &s, GoneReason why) noexcept override;
+
+      private:
+        Shard *shard_;
+    };
+
+    DatagramPort datagram_port_{*this};
+
+    /// \~english The datagram side's service, or null.  \~spanish El servicio del lado de datagramas, o nulo.  \~
+    DatagramService *datagram_service_ = nullptr;
 
     /**
      * \~english
