@@ -945,14 +945,14 @@ int main() {
     http_vx::OpensslCrypto openssl;
     ++providers;
     void *ok = openssl.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len);
-    run_real(openssl, openssl, cert, cert_len, ok, "openssl");
+    run_real(openssl, openssl, cert, cert_len, ok, openssl.name());
 #endif
 #if HTTP_VX_HAVE_CNG
     http_vx::CngCrypto cng;
     ++providers;
     void *ck = cng.ready() ? cng.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len) : nullptr;
     if (ck != nullptr) {
-        run_real(cng, cng, cert, cert_len, ck, "cng");
+        run_real(cng, cng, cert, cert_len, ck, cng.name());
     } else {
         std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", cng.missing());
         ++failures;

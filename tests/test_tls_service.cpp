@@ -433,7 +433,7 @@ int main() {
     http_vx::OpensslCrypto openssl;
     ++providers;
     void *ok = openssl.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len);
-    run_all(openssl, cert, cert_len, ok, "openssl");
+    run_all(openssl, cert, cert_len, ok, openssl.name());
     openssl.forget_key(ok);
 #endif
 #if HTTP_VX_HAVE_CNG
@@ -441,7 +441,7 @@ int main() {
     ++providers;
     void *ck = cng.ready() ? cng.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len) : nullptr;
     if (ck != nullptr) {
-        run_all(cng, cert, cert_len, ck, "cng");
+        run_all(cng, cert, cert_len, ck, cng.name());
         cng.forget_key(ck);
     } else {
         std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", cng.missing());

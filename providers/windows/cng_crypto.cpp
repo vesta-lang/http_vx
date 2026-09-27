@@ -251,10 +251,6 @@ bool CngCrypto::ready() const noexcept {
     return missing_ == nullptr;
 }
 
-const char *CngCrypto::name() const noexcept {
-    return "cng";
-}
-
 bool CngCrypto::random(uint8_t *out, size_t n) noexcept {
     // \~english The system's preferred generator: no algorithm handle to keep.
     // \~spanish El generador preferido del sistema: sin manejador de algoritmo que guardar.  \~

@@ -894,14 +894,14 @@ int main() {
     http_vx::OpensslCrypto openssl;
     ++providers;
     void *ok = openssl.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len);
-    run_good(openssl, openssl, cert, cert_len, ok, Scheme::EcdsaSecp256r1Sha256, "openssl");
+    run_good(openssl, openssl, cert, cert_len, ok, Scheme::EcdsaSecp256r1Sha256, openssl.name());
 #endif
 #if HTTP_VX_HAVE_CNG
     http_vx::CngCrypto cng;
     ++providers;
     void *ck = cng.ready() ? cng.signing_key(Scheme::EcdsaSecp256r1Sha256, pkcs8, key_len) : nullptr;
     if (ck != nullptr) {
-        run_good(cng, cng, cert, cert_len, ck, Scheme::EcdsaSecp256r1Sha256, "cng");
+        run_good(cng, cng, cert, cert_len, ck, Scheme::EcdsaSecp256r1Sha256, cng.name());
     } else {
         std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", cng.missing());
         ++failures;

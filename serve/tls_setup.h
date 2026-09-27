@@ -37,6 +37,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace serve {
 
@@ -64,6 +65,14 @@ public:
      * @return \~english false, with why(), when TLS cannot be served  \~spanish falso, con why(), cuando no se puede servir TLS  \~
      */
     bool load(const char *name, const char *cert_path, const char *key_path) noexcept;
+
+    /// \~english Whether this build has a provider called @p name.
+    /// \~spanish Si esta construccion tiene un proveedor llamado @p name.  \~
+    static bool has(const char *name) noexcept;
+
+    /// \~english Writes the providers this build has, the default first, separated by ", "; "none" if none.
+    /// \~spanish Escribe los proveedores que tiene esta construccion, el de por defecto primero, separados por ", "; "none" si ninguno.  \~
+    static void print_names(std::FILE *out) noexcept;
 
     const char *why() const noexcept { return why_; }
     http_vx::quic::Crypto *crypto() const noexcept { return crypto_; }

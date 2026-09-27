@@ -71,7 +71,11 @@ public:
      */
     bool ready() const noexcept { return kdf_ != nullptr; }
 
-    const char *name() const noexcept override;
+    /// \~english The name it is chosen by; the only place it is written.
+    /// \~spanish El nombre por el que se elige; el unico sitio donde esta escrito.  \~
+    static constexpr const char *kName = "openssl";
+
+    const char *name() const noexcept override { return kName; }
     bool supports(quic::Aead a) const noexcept override;
     bool random(uint8_t *out, size_t n) noexcept override;
     bool digest(quic::Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept override;

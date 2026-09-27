@@ -432,7 +432,8 @@ endif ()
 # Va aqui y no al lado de `http_vx_serve` porque es lo unico del proyecto que
 # enlaza una libreria de plataforma, y esas se definen justo arriba.
 # ---------------------------------------------------------------------------
-add_executable(http_vx_listen serve/listen.cpp serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp)
+add_executable(http_vx_listen serve/listen.cpp serve/options.cpp serve/reactors.cpp
+        serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp)
 target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
 target_link_libraries(http_vx_listen PRIVATE http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core)

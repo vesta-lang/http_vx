@@ -117,7 +117,44 @@ bool next_block(uint8_t *file, size_t n, size_t &at, const char *label, uint8_t 
     return len != 0;
 }
 
+/**
+ * \~english
+ * The providers this build has, the default first, ending in null: their
+ * names are the providers' own (@c kName), so a name typed on the command
+ * line and a name printed in a message are the same string.
+ * \~spanish
+ * Los proveedores que tiene esta construccion, el de por defecto primero,
+ * acabados en nulo: sus nombres son los de los propios proveedores (@c kName),
+ * asi que un nombre tecleado en la linea de ordenes y uno impreso en un mensaje
+ * son la misma cadena.
+ * \~
+ */
+const char *const kProviders[] = {
+#if HTTP_VX_HAVE_CNG
+    http_vx::CngCrypto::kName,
+#endif
+#if HTTP_VX_HAVE_OPENSSL
+    http_vx::OpensslCrypto::kName,
+#endif
+    nullptr,
+};
+
 } // namespace
+
+bool TlsSetup::has(const char *name) noexcept {
+    for (const char *const *p = kProviders; *p != nullptr; ++p)
+        if (std::strcmp(name, *p) == 0) return true;
+    return false;
+}
+
+void TlsSetup::print_names(std::FILE *out) noexcept {
+    if (kProviders[0] == nullptr) {
+        std::fprintf(out, "none");
+        return;
+    }
+    for (const char *const *p = kProviders; *p != nullptr; ++p)
+        std::fprintf(out, "%s%s", p == kProviders ? "" : ", ", *p);
+}
 
 TlsSetup::~TlsSetup() {
     if (sealer_ != nullptr) {
@@ -144,7 +181,7 @@ bool TlsSetup::choose(const char *name) noexcept {
 #if HTTP_VX_HAVE_CNG
     // \~english On Windows the system's own comes first: nothing to install (section 9).
     // \~spanish En Windows va primero el del propio sistema: nada que instalar (seccion 9).  \~
-    if (any || std::strcmp(name, "cng") == 0) {
+    if (any || std::strcmp(name, http_vx::CngCrypto::kName) == 0) {
         provider_mem_ = util::host_alloc(sizeof(http_vx::CngCrypto));
         if (provider_mem_ == nullptr) return false;
         http_vx::CngCrypto *cng = new (provider_mem_) http_vx::CngCrypto();
@@ -158,7 +195,7 @@ bool TlsSetup::choose(const char *name) noexcept {
     }
 #endif
 #if HTTP_VX_HAVE_OPENSSL
-    if (any || std::strcmp(name, "openssl") == 0) {
+    if (any || std::strcmp(name, http_vx::OpensslCrypto::kName) == 0) {
         provider_mem_ = util::host_alloc(sizeof(http_vx::OpensslCrypto));
         if (provider_mem_ == nullptr) return false;
         http_vx::OpensslCrypto *ossl = new (provider_mem_) http_vx::OpensslCrypto();
@@ -174,7 +211,7 @@ bool TlsSetup::choose(const char *name) noexcept {
     (void)any;
     why_ = kind_ == kNone && name == nullptr
                ? "this build has no cryptographic provider, and TLS is not served in the clear instead (R24)"
-               : "this build has no provider by that name (try cng or openssl)";
+               : "this build has no provider by that name";
     return false;
 }
 

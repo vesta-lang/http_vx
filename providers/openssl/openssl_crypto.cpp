@@ -161,10 +161,6 @@ OpensslCrypto::~OpensslCrypto() {
     EVP_KDF_free(static_cast<EVP_KDF *>(kdf_));
 }
 
-const char *OpensslCrypto::name() const noexcept {
-    return "openssl";
-}
-
 bool OpensslCrypto::random(uint8_t *out, size_t n) noexcept {
     // \~english RAND_bytes takes an int; ask in pieces that fit.
     // \~spanish RAND_bytes toma un int; se pide en trozos que quepan.  \~

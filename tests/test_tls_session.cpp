@@ -2553,15 +2553,15 @@ int main() {
 #if HTTP_VX_HAVE_OPENSSL
     http_vx::OpensslCrypto openssl;
     ++providers;
-    test_sealer(openssl, true, "openssl");
-    run_real(openssl, openssl, "openssl");
+    test_sealer(openssl, true, openssl.name());
+    run_real(openssl, openssl, openssl.name());
 #endif
 #if HTTP_VX_HAVE_CNG
     http_vx::CngCrypto cng;
     ++providers;
     if (cng.ready()) {
-        test_sealer(cng, true, "cng");
-        run_real(cng, cng, "cng");
+        test_sealer(cng, true, cng.name());
+        run_real(cng, cng, cng.name());
     } else {
         std::fprintf(stderr, "FAIL [cng]: the system refused %s\n", cng.missing());
         ++failures;

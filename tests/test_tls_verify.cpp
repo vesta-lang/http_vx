@@ -325,20 +325,20 @@ int main() {
     int verifiers = 0;
 #if HTTP_VX_HAVE_CNG
     ++verifiers;
-    run<http_vx::CngVerifier>("cng");
+    run<http_vx::CngVerifier>(http_vx::CngCrypto::kName);
     http_vx::CngCrypto cng;
-    if (cng.ready()) run_handshakes<http_vx::CngVerifier>(cng, "cng");
+    if (cng.ready()) run_handshakes<http_vx::CngVerifier>(cng, http_vx::CngCrypto::kName);
 #endif
 #if HTTP_VX_HAVE_OPENSSL
     ++verifiers;
     {
         http_vx::OpensslVerifier probe;
-        std::snprintf(current, sizeof current, "openssl");
+        std::snprintf(current, sizeof current, "%s", http_vx::OpensslCrypto::kName);
         check(probe.ready(), "OpenSSL gave a store");
     }
-    run<http_vx::OpensslVerifier>("openssl");
+    run<http_vx::OpensslVerifier>(http_vx::OpensslCrypto::kName);
     http_vx::OpensslCrypto openssl;
-    run_handshakes<http_vx::OpensslVerifier>(openssl, "openssl");
+    run_handshakes<http_vx::OpensslVerifier>(openssl, http_vx::OpensslCrypto::kName);
 #endif
     if (verifiers == 0) {
         std::fprintf(stderr, "FAIL: no verifier was built: nothing was checked\n");

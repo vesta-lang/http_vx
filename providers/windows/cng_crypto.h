@@ -89,7 +89,11 @@ public:
     /// \~spanish Que algoritmo nego el sistema, cuando no esta listo.  \~
     const char *missing() const noexcept { return missing_; }
 
-    const char *name() const noexcept override;
+    /// \~english The name it is chosen by; the only place it is written.
+    /// \~spanish El nombre por el que se elige; el unico sitio donde esta escrito.  \~
+    static constexpr const char *kName = "cng";
+
+    const char *name() const noexcept override { return kName; }
     bool supports(quic::Aead a) const noexcept override;
     bool random(uint8_t *out, size_t n) noexcept override;
     bool digest(quic::Hash h, const uint8_t *in, size_t n, uint8_t *out) noexcept override;

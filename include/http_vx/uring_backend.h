@@ -210,7 +210,11 @@ class UringBackend final : public Backend {
 
     bool submit(const Op &op) noexcept override;
     size_t wait(Completion *out, size_t cap, int timeout_ms) noexcept override;
-    const char *name() const noexcept override { return "io_uring"; }
+    /// \~english The name it is chosen by; the only place it is written.
+    /// \~spanish El nombre por el que se elige; el unico sitio donde esta escrito.  \~
+    static constexpr const char *kName = "io_uring";
+
+    const char *name() const noexcept override { return kName; }
 
     /// \~english What the system said last time something failed.
     /// \~spanish Lo que dijo el sistema la ultima vez que algo fallo.  \~

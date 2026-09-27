@@ -107,7 +107,7 @@ using Sock = SOCKET;
 constexpr Sock kNoSock = INVALID_SOCKET;
 
 enum class Which { Iocp };
-const char *which_name(Which) { return "iocp"; }
+const char *which_name(Which) { return http_vx::IocpBackend::kName; }
 
 void unmake(Sock s) { closesocket(s); }
 
@@ -124,7 +124,9 @@ using Sock = int;
 constexpr Sock kNoSock = -1;
 
 enum class Which { Epoll, Uring };
-const char *which_name(Which w) { return w == Which::Epoll ? "epoll" : "io_uring"; }
+const char *which_name(Which w) {
+    return w == Which::Epoll ? http_vx::EpollBackend::kName : http_vx::UringBackend::kName;
+}
 
 void unmake(Sock s) { ::close(s); }
 void dont_block(Sock s) { (void)s; }
