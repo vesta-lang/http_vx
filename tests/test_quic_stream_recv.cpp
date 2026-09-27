@@ -316,17 +316,26 @@ void test_stop() {
               "a STOP_SENDING was owed after all data arrived (3.3)");
     }
     {
-        // \~english In "Size Known" every byte is accounted for: nothing to ask, the stream ends.
-        // \~spanish En "Size Known" cada byte esta en la cuenta: nada que pedir, el flujo acaba.  \~
+        /* \~english
+         * "Size Known" with a hole: STOP_SENDING, as in "Recv" (3.5); the
+         * stream waits for the hole or a reset, owing it again if lost (13.3).
+         * \~spanish
+         * "Size Known" con un hueco: STOP_SENDING, como en "Recv" (3.5); el
+         * flujo espera al hueco o a un reinicio, debiendolo otra vez si se
+         * pierde (13.3).
+         * \~ */
         RecvStream s(4096);
         feed(s, 0, b.data(), 10, false, fresh);
         feed(s, 50, b.data(), 0, true, fresh);
-        check(s.state() == RecvState::SizeKnown && !s.stop(1, released) && !s.stop_pending() &&
-                  released == 50 && s.state() == RecvState::DataRead,
-              "stopping in \"Size Known\" did not give back all 50 bytes counted and end the stream");
-        check(s.on_reset(50, 1, fresh, released) == StreamError::None && released == 0 &&
-                  s.state() == RecvState::DataRead,
-              "a reset after the stream ended changed something");
+        check(s.state() == RecvState::SizeKnown && s.stop(1, released) && s.stop_pending() && released == 50 &&
+                  s.state() == RecvState::SizeKnown,
+              "stopping in \"Size Known\" did not ask, give back all 50 bytes counted, and wait");
+        s.on_stop_sent();
+        s.on_stop_lost();
+        check(s.stop_pending(), "a lost STOP_SENDING in \"Size Known\" is not owed again (13.3)");
+        check(s.on_reset(50, 1, fresh, released) == StreamError::None && fresh == 0 && released == 0 &&
+                  s.state() == RecvState::ResetRead && !s.stop_pending(),
+              "the reset that answers it gave back twice, or did not end the stream");
     }
     {
         // \~english Stopped in "Recv", then reset: the reset has nobody to tell (3.5).
@@ -399,25 +408,69 @@ void test_abandon() {
         charged += fresh;
         check(r.peek(p) == 3000, "the first 3000 bytes are not readable");
         check(r.consume(1000) == 1000, "a read did not say how much it read");
-        check(r.stop(1, released) && released == charged - 1000 && r.chunks_held() == 0,
+        check(r.stop(1, released) && released == charged - 1000 && r.stop_pending(),
               "the 6000 bytes counted and not read, the hole included, were not given back at once");
-        check(r.consume(500) == 0 && r.read_offset() == 7000,
+        // \~english The marks stay; what arrived with no hole before it is passed.
+        // \~spanish Las marcas se quedan; lo que llego sin hueco delante se pasa.  \~
+        check(r.read_offset() == 3000 && r.chunks_held() == 2, "the stream did not stop at the hole");
+        check(r.consume(500) == 0 && r.read_offset() == 3000,
               "a read still pending after the stop counted its bytes a second time");
         // \~english The hole arrives: nothing new to charge, nothing more to give back.
         // \~spanish Llega el hueco: nada nuevo que cobrar, nada mas que devolver.  \~
         check(r.on_data(3000, b.data(), 3000, false, fresh, released) == StreamError::None && fresh == 0 &&
-                  released == 0 && r.chunks_held() == 0,
-              "a retransmission below what was given back was charged or kept");
+                  released == 0 && r.read_offset() == 7000 && r.chunks_held() == 1,
+              "a retransmission below what was given back was charged, or the marks did not move past it");
         // \~english More data, no FIN: charged and given back; the stream waits for its end.
         // \~spanish Mas datos, sin FIN: cobrados y devueltos; el flujo espera su final.  \~
         check(r.on_data(7000, b.data(), 2000, false, fresh, released) == StreamError::None && fresh == 2000 &&
-                  released == 2000 && r.state() == RecvState::Recv,
+                  released == 2000 && r.state() == RecvState::Recv && r.read_offset() == 9000,
               "data past what arrived was not charged and given back");
         check(!r.wants_update() && !r.takes_credit(), "an abandoned stream still wanted credit");
         // \~english Then the FIN alone.  \~spanish Luego el FIN solo.  \~
         check(r.on_data(9000, nullptr, 0, true, fresh, released) == StreamError::None && fresh == 0 &&
-                  released == 0 && r.state() == RecvState::DataRead,
+                  released == 0 && r.state() == RecvState::DataRead && r.chunks_held() == 0 && !r.stop_pending(),
               "a lone FIN at what was counted did not end the abandoned stream");
+    }
+    {
+        /* \~english
+         * "Size Known" with a hole: asked to stop (3.5), and ended only when
+         * the hole is filled -- a peer that sent everything before the
+         * STOP_SENDING retransmits rather than resets.
+         * \~spanish
+         * "Size Known" con un hueco: se pide parar (3.5), y acaba solo cuando se
+         * llena el hueco -- un otro que lo mando todo antes del STOP_SENDING
+         * retransmite en vez de reiniciar.
+         * \~ */
+        RecvStream r(16384);
+        r.on_data(0, b.data(), 1000, false, fresh, released);
+        r.on_data(2000, b.data(), 1000, true, fresh, released);
+        check(r.stop(1, released) && released == 3000 && r.state() == RecvState::SizeKnown && r.stop_pending(),
+              "stopping in \"Size Known\" with a hole did not ask, give back all 3000 bytes, and wait");
+        check(r.on_data(2000, b.data(), 1000, true, fresh, released) == StreamError::None && fresh == 0 &&
+                  released == 0 && r.state() == RecvState::SizeKnown,
+              "a retransmission of marked bytes cost something, or ended the stream with a hole left");
+        check(r.on_data(1000, b.data(), 500, false, fresh, released) == StreamError::None &&
+                  r.state() == RecvState::SizeKnown && r.stop_pending(),
+              "half the hole ended the stream");
+        check(r.on_data(1500, b.data(), 500, false, fresh, released) == StreamError::None && fresh == 0 &&
+                  released == 0 && r.state() == RecvState::DataRead && r.chunks_held() == 0 && !r.stop_pending(),
+              "the hole filled did not end the abandoned stream");
+    }
+    {
+        // \~english One-byte fragments after the stop: the marks alone bring it to its end.
+        // \~spanish Fragmentos de un byte tras la parada: solo las marcas lo llevan a su final.  \~
+        RecvStream r(16384);
+        r.on_data(9999, b.data(), 1, true, fresh, released);
+        r.stop(1, released);
+        uint64_t back = released;
+        bool fine = true;
+        for (uint64_t off = 0; off < 9999; off += 2) {
+            fine = fine && r.on_data(off, b.data(), 1, false, fresh, released) == StreamError::None;
+            back += released;
+        }
+        check(fine && r.state() == RecvState::SizeKnown && back == 10000, "the fragments were not all given back");
+        for (uint64_t off = 1; off < 9999; off += 2) r.on_data(off, b.data(), 1, false, fresh, released);
+        check(r.state() == RecvState::DataRead && r.chunks_held() == 0, "every byte marked did not end the stream");
     }
     {
         // \~english The final size still holds (4.5).  \~spanish El tamano final sigue valiendo (4.5).  \~

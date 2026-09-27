@@ -3184,6 +3184,31 @@ size_t stream_frame(uint8_t *f, size_t room, uint64_t off, size_t len, bool fin)
     return h + len;
 }
 
+/**
+ * @brief
+ * \~english The client acknowledges the server's 1-RTT packets @p smallest to @p largest, in its packet @p pn.
+ * \~spanish El cliente confirma los paquetes 1-RTT del servidor de @p smallest a @p largest, en su paquete @p pn.
+ * \~
+ */
+void ack_server(Crypto &cr, KeyPair &k, uint64_t pn, uint64_t smallest, uint64_t largest) {
+    uint8_t f[64];
+    const AckRange range{smallest, largest};
+    to_server(cr, k, pn, f, write_ack(f, sizeof f, &range, 1, 0, nullptr));
+}
+
+/**
+ * @brief
+ * \~english Builds one server datagram and throws it away: a packet lost on the way.
+ * \~spanish Construye un datagrama del servidor y lo tira: un paquete perdido por el camino.
+ * \~
+ *
+ * @return \~english whether there was one  \~spanish si lo habia  \~
+ */
+bool lose_one(KeyPair &k) {
+    uint8_t out[1500];
+    return k.server.build_datagram(g_sent, out, sizeof out, k.now) != 0;
+}
+
 /// \~english Whether every byte the server was charged came back, read or released.
 /// \~spanish Si cada byte que se le cobro al servidor volvio, leido o liberado.  \~
 bool window_whole(KeyPair &k) {
@@ -3316,6 +3341,96 @@ void test_abandoned(Crypto &cr) {
                   k.server.recv_flow().received() == 700 && window_whole(k),
               "the reset after a stop was not charged to its final size and given back");
         check_server_active(k, "the reset after a stop broke the connection");
+    }
+    for (int reset_first = 0; reset_first < 2; ++reset_first) {
+        // \~english "Data Recvd" or "Reset Recvd": no STOP_SENDING, the stream ends at once (3.3, 3.5).
+        // \~spanish "Data Recvd" o "Reset Recvd": sin STOP_SENDING, el flujo acaba en el acto (3.3, 3.5).  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        if (reset_first == 1) {
+            to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 100, false));
+            to_server(cr, k, 2, f, write_reset_stream(f, sizeof f, 0, 7, 400));
+        } else {
+            to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 400, true));
+        }
+        Stream *st = k.server.streams().find(0);
+        if (st == nullptr) {
+            check(false, "stream 0 is not open at the server");
+            return;
+        }
+        check(!k.server.stop_receiving(*st, 0x10c) && !st->recv->stop_pending() && window_whole(k) &&
+                  st->recv->state() == (reset_first == 1 ? RecvState::ResetRead : RecvState::DataRead),
+              "stopping with everything, or the reset, here asked for something or kept the stream");
+        while (lose_one(k)) {
+        }
+        check(k.server.sent().stop_sending == 0, "a STOP_SENDING went out for a stream with nothing left to send");
+    }
+    for (int by_reset = 0; by_reset < 2; ++by_reset) {
+        /* \~english
+         * "Size Known" with a hole: STOP_SENDING goes (3.5), and when the
+         * packet carrying it is lost it goes again (13.3).  The stream stays
+         * until the hole is filled -- a peer that had sent everything
+         * retransmits instead of resetting -- or a RESET_STREAM comes; then it
+         * is collected, and the window is whole.
+         * \~spanish
+         * "Size Known" con un hueco: sale STOP_SENDING (3.5), y cuando se pierde
+         * el paquete que lo llevaba sale otra vez (13.3).  El flujo se queda
+         * hasta que se llena el hueco -- un otro que lo habia mandado todo
+         * retransmite en vez de reiniciar -- o llega un RESET_STREAM; entonces
+         * se recoge, y la ventana esta entera.
+         * \~ */
+        ConnectionConfig answering = sc;
+        answering.streams.peer_window_bidi_local = 1 << 20;
+        answering.peer_max_data = 1 << 20;
+        KeyPair k(cr, Aead::Aes128Gcm, cc, answering);
+        to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 1000, false));
+        to_server(cr, k, 2, f, stream_frame(f, sizeof f, 2000, 1000, true));
+        Stream *st = k.server.streams().find(0);
+        if (st == nullptr) {
+            check(false, "stream 0 is not open at the server");
+            return;
+        }
+        check(st->recv->state() == RecvState::SizeKnown, "a FIN past a hole did not leave the stream in Size Known");
+        check(k.server.stop_receiving(*st, 0x10c) && window_whole(k) && st->recv->stop_pending(),
+              "stopping in Size Known did not owe a STOP_SENDING, or kept bytes charged");
+        // \~english Server packet 0 carries it, and is lost; packets 1-3 carry a byte each, and arrive.
+        // \~spanish El paquete 0 del servidor lo lleva, y se pierde; los paquetes 1-3 llevan un byte cada uno, y llegan.  \~
+        check(lose_one(k) && k.server.sent().stop_sending == 1, "no STOP_SENDING went out");
+        for (int i = 0; i < 3; ++i) {
+            size_t took = 0;
+            st->send->write(reinterpret_cast<const uint8_t *>("x"), 1, took);
+            lose_one(k);
+        }
+        ack_server(cr, k, 3, 1, 3);
+        check(k.server.recovery().packets_lost() >= 1, "the packet with the STOP_SENDING was not declared lost");
+        check(st->recv->stop_pending(), "a lost STOP_SENDING in Size Known is not owed again (13.3)");
+        lose_one(k);
+        check(k.server.sent().stop_sending == 2, "the lost STOP_SENDING was not sent again (13.3)");
+
+        if (by_reset == 1) {
+            to_server(cr, k, 4, f, write_reset_stream(f, sizeof f, 0, 0x10c, 3000));
+        } else {
+            // \~english A retransmission fills half the hole, then the rest.
+            // \~spanish Una retransmision llena medio hueco, y luego el resto.  \~
+            to_server(cr, k, 4, f, stream_frame(f, sizeof f, 1000, 500, false));
+            check(k.server.streams().find(0) != nullptr && st->recv->state() == RecvState::SizeKnown,
+                  "half the hole ended the stream");
+            to_server(cr, k, 5, f, stream_frame(f, sizeof f, 1500, 500, false));
+        }
+        st = k.server.streams().find(0);
+        check(st != nullptr &&
+                  st->recv->state() == (by_reset == 1 ? RecvState::ResetRead : RecvState::DataRead) &&
+                  !st->recv->stop_pending(),
+              "the hole filled, or the reset, did not end the abandoned stream");
+        check(k.server.recv_flow().received() == 3000 && window_whole(k), "the window came out short");
+        if (st == nullptr) continue;
+        // \~english The server's side ends and is acknowledged: nothing keeps the stream.
+        // \~spanish El lado del servidor acaba y se confirma: nada retiene el flujo.  \~
+        st->send->finish();
+        uint64_t last = 4;
+        while (lose_one(k)) ++last;
+        ack_server(cr, k, 6, 1, last);
+        check(k.server.streams().find(0) == nullptr, "the abandoned stream was not collected once both sides ended");
+        check_server_active(k, "the abandoned stream broke the connection");
     }
 }
 

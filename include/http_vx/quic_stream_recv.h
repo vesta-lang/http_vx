@@ -154,11 +154,15 @@ public:
      * \~english
      * On a stream the application abandoned (`stop`), the bytes are checked
      * against the final size and the limit as always, counted, and thrown
-     * away at once: what they cost comes back in @p released (3.5).
+     * away at once: what they cost comes back in @p released (3.5).  Which
+     * bytes arrived is still marked, without them: once every byte up to the
+     * final size has, the stream ends (3.2).
      * \~spanish
      * En un flujo que la aplicacion abandono (`stop`), los bytes se comprueban
      * contra el tamano final y el limite como siempre, se cuentan, y se tiran en
-     * el acto: lo que costaron vuelve en @p released (3.5).
+     * el acto: lo que costaron vuelve en @p released (3.5).  Que bytes llegaron
+     * se sigue marcando, sin ellos: cuando ha llegado cada byte hasta el tamano
+     * final, el flujo acaba (3.2).
      * \~
      *
      * @param new_bytes \~english how far this moved the highest offset received: what it costs the connection's window
@@ -317,27 +321,33 @@ public:
      *   @p released, for the connection's window;
      * - what still arrives is checked and counted as always (3.5, 4.5) and
      *   thrown away the same way (`on_data`);
-     * - the end needs no reader: a final size reached, or a reset, is a
-     *   terminal state by itself, so the stream can be collected (3.2).
+     * - the end needs no reader: every byte up to the final size arrived
+     *   ("Data Recvd"), or a reset, is a terminal state by itself, so the
+     *   stream can be collected (3.2).
      *
-     * A STOP_SENDING is owed only in "Recv": with the final size known every
-     * byte the peer will ever count is already accounted for, and the stream
-     * ends here; asking the peer to stop would only save retransmissions of
-     * bytes thrown away anyway.
+     * In "Recv" and "Size Known" a STOP_SENDING is owed (3.5), and owed again
+     * if the packet with it is lost, until everything or a reset arrives
+     * (13.3).  Which bytes arrived is still marked, without keeping them, so
+     * a peer that had sent everything before the STOP_SENDING and only
+     * retransmits still brings the stream to its end.  In "Data Recvd" or
+     * "Reset Recvd" nothing is asked: everything, or the reset, is here
+     * already (3.3, 3.5).
      * \~spanish
      * El transporte se encarga de lo que la aplicacion ya no hara:
      * - cada byte contado y no leido se tira y vuelve en @p released, para la
      *   ventana de la conexion;
      * - lo que siga llegando se comprueba y se cuenta como siempre (3.5, 4.5) y
      *   se tira igual (`on_data`);
-     * - el final no necesita lector: un tamano final alcanzado, o un reinicio,
-     *   es un estado terminal por si mismo, asi que el flujo se puede recoger
-     *   (3.2).
+     * - el final no necesita lector: que haya llegado cada byte hasta el tamano
+     *   final ("Data Recvd"), o un reinicio, es un estado terminal por si
+     *   mismo, asi que el flujo se puede recoger (3.2).
      *
-     * Se debe un STOP_SENDING solo en "Recv": con el tamano final conocido cada
-     * byte que el otro contara ya esta en la cuenta, y el flujo acaba aqui;
-     * pedirle al otro que pare solo ahorraria retransmisiones de bytes que se
-     * tiran igualmente.
+     * En "Recv" y "Size Known" se debe un STOP_SENDING (3.5), y otra vez si se
+     * pierde el paquete que lo llevaba, hasta que llegue todo o un reinicio
+     * (13.3).  Que bytes llegaron se sigue marcando, sin guardarlos, asi que un
+     * otro que lo mando todo antes del STOP_SENDING y solo retransmite lleva
+     * igual el flujo a su final.  En "Data Recvd" o "Reset Recvd" no se pide
+     * nada: ya esta aqui todo, o el reinicio (3.3, 3.5).
      * \~
      *
      * @param code     \~english the STOP_SENDING's code  \~spanish el codigo del STOP_SENDING  \~
@@ -362,21 +372,29 @@ public:
     }
 
 private:
+    struct Marks;
     struct Chunk;
 
-    Chunk *chunk_for(uint64_t index, bool create) noexcept;
+    Marks *chunk_for(uint64_t index, bool create) noexcept;
     void release_below(uint64_t offset) noexcept;
     void release_all() noexcept;
     bool all_received() const noexcept;
     /**
      * @brief
-     * \~english Throws away everything counted and unread on an abandoned stream, and ends it once its final size is known.
-     * \~spanish Tira todo lo contado y sin leer de un flujo abandonado, y lo acaba cuando se sabe su tamano final.
+     * \~english Moves the read offset @p n bytes on, freeing the chunks left behind.
+     * \~spanish Avanza el desplazamiento leido @p n bytes, liberando los trozos que quedan atras.
      * \~
      *
-     * @param released \~english the bytes given back  \~spanish los bytes devueltos  \~
+     * @param n \~english how many bytes  \~spanish cuantos bytes  \~
      */
-    void discard_arrived(uint64_t &released) noexcept;
+    void advance(uint64_t n) noexcept;
+    /**
+     * @brief
+     * \~english Abandoned: moves the read offset past every byte that arrived with no hole before it.
+     * \~spanish Abandonado: avanza el desplazamiento leido mas alla de cada byte que llego sin hueco delante.
+     * \~
+     */
+    void skip_marked() noexcept;
 
     uint64_t window_;
     uint64_t limit_;
@@ -392,7 +410,9 @@ private:
     bool size_known_ = false;
     RecvState state_ = RecvState::Recv;
 
-    Chunk **slots_ = nullptr;
+    /// \~english Chunks with their bytes, or only their marks once abandoned.
+    /// \~spanish Trozos con sus bytes, o solo sus marcas una vez abandonado.  \~
+    Marks **slots_ = nullptr;
     size_t nslots_ = 0;
     size_t held_ = 0;
 };

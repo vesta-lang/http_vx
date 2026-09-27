@@ -25,11 +25,16 @@
 namespace http_vx {
 namespace quic {
 
-/// \~english One chunk of the window: its bytes, and which of them arrived.
-/// \~spanish Un trozo de la ventana: sus bytes, y cuales de ellos llegaron.  \~
-struct RecvStream::Chunk {
-    uint8_t data[kRecvChunk];
+/// \~english Which bytes of one chunk of the window arrived: all an abandoned stream keeps (RFC 9000, 3.5).
+/// \~spanish Que bytes de un trozo de la ventana llegaron: todo lo que guarda un flujo abandonado (RFC 9000, 3.5).  \~
+struct RecvStream::Marks {
     uint64_t bits[kRecvChunk / 64];
+};
+
+/// \~english One chunk of the window: which bytes arrived, and the bytes.
+/// \~spanish Un trozo de la ventana: que bytes llegaron, y los bytes.  \~
+struct RecvStream::Chunk : RecvStream::Marks {
+    uint8_t data[kRecvChunk];
 };
 
 namespace {
@@ -95,7 +100,7 @@ RecvStream::~RecvStream() {
     if (slots_ != nullptr) util::host_free(slots_);
 }
 
-RecvStream::Chunk *RecvStream::chunk_for(uint64_t index, bool create) noexcept {
+RecvStream::Marks *RecvStream::chunk_for(uint64_t index, bool create) noexcept {
     if (slots_ == nullptr) {
         if (!create) return nullptr;
 
@@ -103,16 +108,24 @@ RecvStream::Chunk *RecvStream::chunk_for(uint64_t index, bool create) noexcept {
         // \~spanish La tabla de ranuras tambien se paga solo cuando llegan datos.  \~
         const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
                                      util::AllocFill::All);
-        slots_ = static_cast<Chunk **>(util::host_alloc(nslots_ * sizeof(Chunk *)));
+        slots_ = static_cast<Marks **>(util::host_alloc(nslots_ * sizeof(Marks *)));
         if (slots_ == nullptr) return nullptr;
-        util::vesta_memset(slots_, 0, nslots_ * sizeof(Chunk *));
+        util::vesta_memset(slots_, 0, nslots_ * sizeof(Marks *));
     }
 
-    Chunk *&slot = slots_[index % nslots_];
+    Marks *&slot = slots_[index % nslots_];
     if (slot == nullptr && create) {
         const util::AllocScope scope(util::AllocUse::Medium, util::AllocShape::Fixed,
                                      util::AllocFill::Dense);
-        slot = static_cast<Chunk *>(util::host_alloc(sizeof(Chunk)));
+        /* \~english
+         * An abandoned stream keeps no byte, only which ones arrived: a chunk
+         * made after the stop is its marks alone, an eighth of its size.
+         * \~spanish
+         * Un flujo abandonado no guarda ningun byte, solo cuales llegaron: un
+         * trozo hecho despues de la parada son solo sus marcas, un octavo de su
+         * tamano.
+         * \~ */
+        slot = static_cast<Marks *>(util::host_alloc(abandoned_ ? sizeof(Marks) : sizeof(Chunk)));
         if (slot == nullptr) return nullptr;
         util::vesta_memset(slot->bits, 0, sizeof slot->bits);
         ++held_;
@@ -128,7 +141,7 @@ void RecvStream::release_below(uint64_t offset) noexcept {
     const uint64_t first = read_ / kRecvChunk;
     const uint64_t last = offset / kRecvChunk;
     for (uint64_t i = first; i < last; ++i) {
-        Chunk *&slot = slots_[i % nslots_];
+        Marks *&slot = slots_[i % nslots_];
         if (slot != nullptr) {
             util::host_free(slot);
             slot = nullptr;
@@ -188,17 +201,26 @@ StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, b
         highest_ = end;
     }
     if (state_ == RecvState::DataRecvd || state_ == RecvState::DataRead) return StreamError::None;
-    if (abandoned_) {
-        discard_arrived(released);
-        return StreamError::None;
-    }
+
+    /* \~english
+     * An abandoned stream gives back at once what a frame costs (3.5): the
+     * bytes are counted, never kept.  Which ones arrived is still marked --
+     * the holes are what tell when every byte up to the final size came
+     * (3.2), and a retransmission of marked bytes costs nothing.
+     * \~spanish
+     * Un flujo abandonado devuelve en el acto lo que cuesta una trama (3.5):
+     * los bytes se cuentan, nunca se guardan.  Cuales llegaron se sigue
+     * marcando -- los huecos son lo que dice cuando llego cada byte hasta el
+     * tamano final (3.2), y una retransmision de bytes marcados no cuesta nada.
+     * \~ */
+    if (abandoned_) released = new_bytes;
 
     // \~english What was already read is dropped; the rest is copied chunk by chunk.
     // \~spanish Lo ya leido se tira; el resto se copia trozo a trozo.  \~
     uint64_t pos = offset > read_ ? offset : read_;
     while (pos < end) {
-        Chunk *c = chunk_for(pos / kRecvChunk, true);
-        if (c == nullptr) return StreamError::OutOfMemory;
+        Marks *m = chunk_for(pos / kRecvChunk, true);
+        if (m == nullptr) return StreamError::OutOfMemory;
 
         const size_t in = static_cast<size_t>(pos % kRecvChunk);
         const size_t n = static_cast<size_t>(min64(end - pos, kRecvChunk - in));
@@ -210,13 +232,21 @@ StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, b
          * Copiado encima de lo que hubiera: una retransmision lleva los mismos
          * bytes (2.2), asi que reescribirlos es mas barato que saltarselos.
          * \~ */
-        util::vesta_memcpy(c->data + in, p + (pos - offset), n);
-        buffered_ += bits::set(c->bits, in, n);
+        if (!abandoned_) util::vesta_memcpy(static_cast<Chunk *>(m)->data + in, p + (pos - offset), n);
+        buffered_ += bits::set(m->bits, in, n);
         pos += n;
     }
+    if (abandoned_) skip_marked();
 
     if (all_received()) {
-        state_ = RecvState::DataRecvd;
+        /* \~english
+         * Abandoned: nobody is left to read the end, so "Data Recvd" is
+         * "Data Read" at once, and the stream can go (3.2, 3.5).
+         * \~spanish
+         * Abandonado: no queda nadie que lea el final, asi que "Data Recvd" es
+         * "Data Read" en el acto, y el flujo se puede ir (3.2, 3.5).
+         * \~ */
+        state_ = abandoned_ ? RecvState::DataRead : RecvState::DataRecvd;
 
         /* \~english
          * A FIN that arrives after everything was read leaves no byte to
@@ -256,6 +286,14 @@ StreamError RecvStream::on_reset(uint64_t final_size, uint64_t error_code,
      * \~ */
     if (state_ != RecvState::Recv && state_ != RecvState::SizeKnown) return StreamError::None;
 
+    /* \~english
+     * What the connection already has back: what was read, or, on an
+     * abandoned stream, everything counted, which went back as it came.
+     * \~spanish
+     * Lo que la conexion ya tiene de vuelta: lo leido, o, en un flujo
+     * abandonado, todo lo contado, que volvio segun llegaba.
+     * \~ */
+    const uint64_t given_back = abandoned_ ? highest_ : read_;
     new_bytes = final_size - highest_;
     highest_ = final_size;
     final_ = final_size;
@@ -263,7 +301,7 @@ StreamError RecvStream::on_reset(uint64_t final_size, uint64_t error_code,
 
     // \~english Counted as received, never to be read: the connection gets it back.
     // \~spanish Contado como recibido, sin leerse nunca: la conexion lo recupera.  \~
-    released = final_size - read_;
+    released = final_size - given_back;
     reset_code_ = error_code;
     /* \~english
      * The application that asked for this reset with STOP_SENDING already gave
@@ -285,39 +323,40 @@ size_t RecvStream::peek(const uint8_t *&p) const noexcept {
         state_ == RecvState::DataRead || abandoned_ || slots_ == nullptr)
         return 0;
 
-    const Chunk *c = slots_[(read_ / kRecvChunk) % nslots_];
-    if (c == nullptr) return 0;
+    const Marks *m = slots_[(read_ / kRecvChunk) % nslots_];
+    if (m == nullptr) return 0;
 
     const size_t in = static_cast<size_t>(read_ % kRecvChunk);
-    const size_t n = bits::run(c->bits, in, kRecvChunk, true);
-    p = c->data + in;
+    const size_t n = bits::run(m->bits, in, kRecvChunk, true);
+    // \~english Never abandoned here: every chunk holds its bytes.  \~spanish Nunca abandonado aqui: cada trozo tiene sus bytes.  \~
+    p = static_cast<const Chunk *>(m)->data + in;
     return n;
 }
 
-void RecvStream::discard_arrived(uint64_t &released) noexcept {
+void RecvStream::advance(uint64_t n) noexcept {
+    const uint64_t to = read_ + n;
+    release_below(to);
+    read_ = to;
+    buffered_ -= n;
+}
+
+void RecvStream::skip_marked() noexcept {
     /* \~english
-     * Everything counted up to the highest offset is taken as read: what was
-     * waiting, what just came, and the holes, whose bytes nobody will read
-     * either.  The connection gets back exactly what it was charged and not
-     * given back yet, so its window sums hold (4.1, 4.5).
+     * Past every byte that arrived with no hole before it, one run per
+     * chunk: each byte is passed once, so the cost follows the data, and
+     * the marks of chunks left behind are freed.
      * \~spanish
-     * Todo lo contado hasta el mayor desplazamiento se da por leido: lo que
-     * esperaba, lo que acaba de llegar, y los huecos, cuyos bytes tampoco va a
-     * leer nadie.  La conexion recupera exactamente lo que se le cobro y aun no
-     * se le devolvio, asi que sus cuentas de ventana cuadran (4.1, 4.5).
+     * Mas alla de cada byte que llego sin hueco delante, una racha por trozo:
+     * cada byte se pasa una vez, asi que el coste sigue a los datos, y las
+     * marcas de los trozos que quedan atras se liberan.
      * \~ */
-    released = highest_ - read_;
-    read_ = highest_;
-    buffered_ = 0;
-    release_all();
-    /* \~english
-     * With the final size known every byte the peer will ever count is
-     * accounted for: nothing is left to wait for, and nobody to tell (3.2).
-     * \~spanish
-     * Con el tamano final conocido cada byte que el otro contara ya esta en la
-     * cuenta: no queda nada que esperar, ni nadie a quien decirselo (3.2).
-     * \~ */
-    if (size_known_) state_ = RecvState::DataRead;
+    while (slots_ != nullptr) {
+        const Marks *m = slots_[(read_ / kRecvChunk) % nslots_];
+        if (m == nullptr) return;
+        const size_t n = bits::run(m->bits, static_cast<size_t>(read_ % kRecvChunk), kRecvChunk, true);
+        if (n == 0) return;
+        advance(n);
+    }
 }
 
 bool RecvStream::stop(uint64_t code, uint64_t &released) noexcept {
@@ -334,16 +373,37 @@ bool RecvStream::stop(uint64_t code, uint64_t &released) noexcept {
     case RecvState::DataRead:
         return false;
     case RecvState::DataRecvd:
-    case RecvState::SizeKnown:
-        // \~english The final size known: nothing to ask the peer, only unread bytes to give back (3.3); the stream ends.
-        // \~spanish El tamano final conocido: nada que pedir al otro, solo bytes sin leer que devolver (3.3); el flujo acaba.  \~
-        discard_arrived(released);
+        /* \~english
+         * Everything is here: nothing to ask the peer (3.3, 3.5), only the
+         * unread bytes to give back, and the stream ends.
+         * \~spanish
+         * Todo esta aqui: nada que pedir al otro (3.3, 3.5), solo devolver los
+         * bytes sin leer, y el flujo acaba.
+         * \~ */
+        released = final_ - read_;
+        advance(released);
+        release_all();
+        state_ = RecvState::DataRead;
         return false;
     case RecvState::Recv:
+    case RecvState::SizeKnown:
         break;
     }
-    discard_arrived(released);
-    // \~english Still sending: asked to stop, once (3.5).  \~spanish Aun mandando: se le pide parar, una vez (3.5).  \~
+    /* \~english
+     * "Recv" or "Size Known": every byte counted and not read goes back to
+     * the connection now, holes included -- their bytes will cost nothing
+     * when they come.  The marks stay, to see the stream through to its end
+     * or its reset, and a STOP_SENDING is owed, again if it is lost, until
+     * then (3.5, 13.3).
+     * \~spanish
+     * "Recv" o "Size Known": cada byte contado y no leido vuelve ya a la
+     * conexion, huecos incluidos -- sus bytes no costaran nada cuando lleguen.
+     * Las marcas se quedan, para llevar el flujo hasta su final o su reinicio,
+     * y se debe un STOP_SENDING, otra vez si se pierde, hasta entonces (3.5,
+     * 13.3).
+     * \~ */
+    released = highest_ - read_;
+    skip_marked();
     stopped_ = true;
     stop_pending_ = true;
     stop_code_ = code;
@@ -352,10 +412,7 @@ bool RecvStream::stop(uint64_t code, uint64_t &released) noexcept {
 
 size_t RecvStream::consume(size_t n) noexcept {
     if (abandoned_) return 0;
-    const uint64_t to = read_ + n;
-    release_below(to);
-    read_ = to;
-    buffered_ -= n;
+    advance(n);
 
     // \~english The last byte read: the memory goes, the end waits for `read_end` (3.2).
     // \~spanish Leido el ultimo byte: la memoria se va, el final espera a `read_end` (3.2).  \~

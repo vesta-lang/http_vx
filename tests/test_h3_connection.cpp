@@ -689,6 +689,67 @@ void test_server_limits() {
         check(!k.hs.failed(), "nothing failed");
     }
     {
+        /* \~english
+         * Rejected requests whose bytes come out of order: the ends of their
+         * bodies, FIN included, first.  The server rejects streams with holes
+         * ("Size Known"): it asks them to stop (RFC 9000, 3.5), and each ends
+         * when its hole is filled or its reset comes -- none stays, and the
+         * window is whole.
+         * \~spanish
+         * Peticiones rechazadas cuyos bytes llegan desordenados: primero los
+         * finales de sus cuerpos, FIN incluido.  El servidor rechaza flujos con
+         * huecos ("Size Known"): les pide parar (RFC 9000, 3.5), y cada uno acaba
+         * cuando se llena su hueco o llega su reinicio -- ninguno se queda, y la
+         * ventana esta entera.
+         * \~ */
+        Link k;
+        k.start(false);
+        k.pump(3, false);
+        k.hs.goaway();
+        k.pump(2, false);
+        std::vector<uint8_t> v;
+        add_frame(v, h3::kHeaders, section_of(get()));
+        add_frame(v, h3::kData, std::vector<uint8_t>(3000, 'z'));
+        uint64_t ids[6] = {};
+        for (uint64_t &id : ids) {
+            Stream *s = k.qc.streams().open(true);
+            check(s != nullptr, "the raw client opens a stream");
+            if (s == nullptr) return;
+            size_t took = 0;
+            s->send->write(v.data(), v.size(), took);
+            s->send->finish();
+            k.qc.stop_receiving(*s, h3::kNoError);
+            id = s->id;
+        }
+        std::vector<std::vector<uint8_t>> air;
+        uint8_t buf[1500];
+        size_t n = 0;
+        while ((n = k.qc.build_datagram(g_sent, buf, sizeof buf, k.now)) != 0) air.emplace_back(buf, buf + n);
+        check(air.size() >= 6, "the requests did not take several datagrams");
+        // \~english The later half first, read by the server; then the rest.
+        // \~spanish Primero la mitad de detras, leida por el servidor; despues el resto.  \~
+        const size_t half = air.size() / 2;
+        for (size_t i = half; i < air.size(); ++i) k.qs.on_datagram(kPath, air[i].data(), air[i].size(), Ecn::NotEct, k.now);
+        k.drain(k.hs, k.server_events);
+        bool waiting = false;
+        for (const uint64_t id : ids) {
+            const Stream *s = k.qs.streams().find(id);
+            if (s != nullptr && s->recv->state() == RecvState::SizeKnown && s->recv->abandoned()) waiting = true;
+        }
+        check(waiting, "no rejected stream was left waiting for its hole");
+        for (size_t i = 0; i < half; ++i) k.qs.on_datagram(kPath, air[i].data(), air[i].size(), Ecn::NotEct, k.now);
+        k.pump(8, false);
+        bool gone = true;
+        for (const uint64_t id : ids)
+            if (k.qs.streams().find(id) != nullptr) gone = false;
+        check(gone, "a rejected stream with a hole stayed at the server");
+        check(k.qs.sent().stop_sending >= 1, "no STOP_SENDING asked the client to stop");
+        check(k.qs.recv_flow().consumed() == k.qs.recv_flow().received(),
+              "a byte of a rejected stream was not given back to the connection's window");
+        check(k.find(k.server_events, h3::EventKind::Request) == nullptr && !k.hs.failed(),
+              "a rejected request reached the application, or something failed");
+    }
+    {
         // \~english A section larger than announced is answered 431 (4.2.2).
         // \~spanish Una seccion mayor que la anunciada se contesta con 431 (4.2.2).  \~
         Link k;
