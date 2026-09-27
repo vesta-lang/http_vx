@@ -334,7 +334,7 @@ void test_peer_reset(Crypto &crypto, const Keys &k) {
     const uint64_t two = c.request("GET", "/open");
     w.settle();
     Stream *st = c.q->streams().find(one);
-    check(st != nullptr && st->recv != nullptr && st->recv->stop(h3::kRequestCancelled), "the client stops reading");
+    check(st != nullptr && c.q->stop_receiving(*st, h3::kRequestCancelled), "the client stops reading");
     // \~english Half a round trip on: the STOP_SENDING has arrived, the server's reset is not acknowledged yet.
     // \~spanish Media ida y vuelta despues: el STOP_SENDING llego, el reinicio del servidor aun no esta confirmado.  \~
     w.run(w.now + kDelay + kDelay / 2);

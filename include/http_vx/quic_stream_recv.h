@@ -151,11 +151,23 @@ public:
      * \~spanish Los datos de una trama STREAM.
      * \~
      *
+     * \~english
+     * On a stream the application abandoned (`stop`), the bytes are checked
+     * against the final size and the limit as always, counted, and thrown
+     * away at once: what they cost comes back in @p released (3.5).
+     * \~spanish
+     * En un flujo que la aplicacion abandono (`stop`), los bytes se comprueban
+     * contra el tamano final y el limite como siempre, se cuentan, y se tiran en
+     * el acto: lo que costaron vuelve en @p released (3.5).
+     * \~
+     *
      * @param new_bytes \~english how far this moved the highest offset received: what it costs the connection's window
      *                  \~spanish cuanto movio esto el mayor desplazamiento recibido: lo que le cuesta a la ventana de la conexion  \~
+     * @param released  \~english bytes counted as received that will never be read: give them back to the connection's window
+     *                  \~spanish bytes contados como recibidos que nunca se van a leer: devolverlos a la ventana de la conexion  \~
      */
     StreamError on_data(uint64_t offset, const uint8_t *p, size_t len, bool fin,
-                        uint64_t &new_bytes) noexcept;
+                        uint64_t &new_bytes, uint64_t &released) noexcept;
 
     /**
      * @brief
@@ -181,9 +193,25 @@ public:
      */
     size_t peek(const uint8_t *&p) const noexcept;
 
-    /// \~english The application read @p n bytes of what `peek` gave.
-    /// \~spanish La aplicacion leyo @p n bytes de lo que dio `peek`.  \~
-    void consume(size_t n) noexcept;
+    /**
+     * @brief
+     * \~english The application read @p n bytes of what `peek` gave.
+     * \~spanish La aplicacion leyo @p n bytes de lo que dio `peek`.
+     * \~
+     *
+     * \~english
+     * Nothing, once the stream was abandoned: `stop` already gave back every
+     * byte not read by then, and a read the application had pending would
+     * count them twice.
+     * \~spanish
+     * Nada, una vez abandonado el flujo: `stop` ya devolvio cada byte no leido
+     * hasta entonces, y una lectura que la aplicacion tuviera pendiente los
+     * contaria dos veces.
+     * \~
+     *
+     * @return \~english the bytes read, 0 if the stream was abandoned  \~spanish los bytes leidos, 0 si el flujo se abandono  \~
+     */
+    size_t consume(size_t n) noexcept;
 
     /**
      * @brief
@@ -234,6 +262,24 @@ public:
 
     /**
      * @brief
+     * \~english Whether the stream may still be given credit at all: "Recv" (3.3), and not abandoned.
+     * \~spanish Si al flujo aun se le puede dar credito: "Recv" (3.3), y no abandonado.
+     * \~
+     *
+     * \~english
+     * A stream the application gave up is waiting for its reset or its end;
+     * more room would only invite bytes that are thrown away.
+     * \~spanish
+     * Un flujo que la aplicacion abandono espera su reinicio o su final; mas
+     * sitio solo invitaria bytes que se tiran.
+     * \~
+     *
+     * @return \~english true if a MAX_STREAM_DATA may go  \~spanish true si puede salir un MAX_STREAM_DATA  \~
+     */
+    bool takes_credit() const noexcept { return state_ == RecvState::Recv && !abandoned_; }
+
+    /**
+     * @brief
      * \~english The limit an update would announce, WITHOUT raising it yet.
      * \~spanish El limite que anunciaria una actualizacion, SIN subirlo todavia.
      * \~
@@ -261,28 +307,46 @@ public:
 
     /**
      * @brief
-     * \~english The application stops reading: a STOP_SENDING with @p code is owed (RFC 9000, 3.5).
-     * \~spanish La aplicacion deja de leer: se debe un STOP_SENDING con @p code (RFC 9000, 3.5).
+     * \~english The application abandons the stream: it will read nothing more of it (RFC 9000, 3.5).
+     * \~spanish La aplicacion abandona el flujo: no leera nada mas de el (RFC 9000, 3.5).
      * \~
      *
      * \~english
-     * Only in "Recv" or "Size Known": past them everything or a reset has
-     * arrived, and asking is pointless.  What still arrives is still counted
-     * for flow control; reading it is up to the application.  The reset that
-     * answers it goes straight to "Reset Read": the application already gave
-     * the stream up, so there is nobody left to tell (3.5).
+     * The transport takes over what the application no longer will:
+     * - every byte counted and not read is thrown away and comes back in
+     *   @p released, for the connection's window;
+     * - what still arrives is checked and counted as always (3.5, 4.5) and
+     *   thrown away the same way (`on_data`);
+     * - the end needs no reader: a final size reached, or a reset, is a
+     *   terminal state by itself, so the stream can be collected (3.2).
+     *
+     * A STOP_SENDING is owed only in "Recv": with the final size known every
+     * byte the peer will ever count is already accounted for, and the stream
+     * ends here; asking the peer to stop would only save retransmissions of
+     * bytes thrown away anyway.
      * \~spanish
-     * Solo en "Recv" o "Size Known": despues ya llego todo o un reinicio, y pedir
-     * no tiene sentido.  Lo que siga llegando cuenta igual para el control de
-     * flujo; leerlo es cosa de la aplicacion.  El reinicio que lo contesta pasa
-     * directo a "Reset Read": la aplicacion ya abandono el flujo, asi que no
-     * queda nadie a quien decirselo (3.5).
+     * El transporte se encarga de lo que la aplicacion ya no hara:
+     * - cada byte contado y no leido se tira y vuelve en @p released, para la
+     *   ventana de la conexion;
+     * - lo que siga llegando se comprueba y se cuenta como siempre (3.5, 4.5) y
+     *   se tira igual (`on_data`);
+     * - el final no necesita lector: un tamano final alcanzado, o un reinicio,
+     *   es un estado terminal por si mismo, asi que el flujo se puede recoger
+     *   (3.2).
+     *
+     * Se debe un STOP_SENDING solo en "Recv": con el tamano final conocido cada
+     * byte que el otro contara ya esta en la cuenta, y el flujo acaba aqui;
+     * pedirle al otro que pare solo ahorraria retransmisiones de bytes que se
+     * tiran igualmente.
      * \~
      *
-     * @return \~english false if the stream is past those states, or it was already asked
-     *         \~spanish falso si el flujo ya paso esos estados, o ya se pidio  \~
+     * @param code     \~english the STOP_SENDING's code  \~spanish el codigo del STOP_SENDING  \~
+     * @param released \~english bytes given back to the connection's window  \~spanish bytes devueltos a la ventana de la conexion  \~
+     * @return \~english whether a STOP_SENDING is now owed  \~spanish si ahora se debe un STOP_SENDING  \~
      */
-    bool stop(uint64_t code) noexcept;
+    bool stop(uint64_t code, uint64_t &released) noexcept;
+    /// \~english The application abandoned the stream (`stop`).  \~spanish La aplicacion abandono el flujo (`stop`).  \~
+    bool abandoned() const noexcept { return abandoned_; }
     /// \~english A STOP_SENDING waits to go out: owed, and still worth sending (3.5).
     /// \~spanish Un STOP_SENDING espera salir: debido, y aun merece la pena mandarlo (3.5).  \~
     bool stop_pending() const noexcept {
@@ -304,6 +368,15 @@ private:
     void release_below(uint64_t offset) noexcept;
     void release_all() noexcept;
     bool all_received() const noexcept;
+    /**
+     * @brief
+     * \~english Throws away everything counted and unread on an abandoned stream, and ends it once its final size is known.
+     * \~spanish Tira todo lo contado y sin leer de un flujo abandonado, y lo acaba cuando se sabe su tamano final.
+     * \~
+     *
+     * @param released \~english the bytes given back  \~spanish los bytes devueltos  \~
+     */
+    void discard_arrived(uint64_t &released) noexcept;
 
     uint64_t window_;
     uint64_t limit_;
@@ -315,6 +388,7 @@ private:
     uint64_t stop_code_ = 0;
     bool stopped_ = false;
     bool stop_pending_ = false;
+    bool abandoned_ = false;
     bool size_known_ = false;
     RecvState state_ = RecvState::Recv;
 

@@ -305,7 +305,8 @@ void test_end_to_end() {
                     continue;
                 }
                 uint64_t fresh = 0;
-                if (rx.on_data(f.offset, f.data.data(), f.data.size(), f.fin, fresh) != StreamError::None) {
+                uint64_t released = 0;
+                if (rx.on_data(f.offset, f.data.data(), f.data.size(), f.fin, fresh, released) != StreamError::None) {
                     check(false, "the receiver refused what the sender sent");
                     return;
                 }

@@ -287,7 +287,7 @@ Event Connection::stream_error(Message &m, uint64_t code, const char *why) noexc
         // \~english Both directions: reset what is sent, stop what is received (4.1.1; RFC 9000, 3.5).
         // \~spanish Las dos direcciones: reiniciar lo que se manda, parar lo que se recibe (4.1.1; RFC 9000, 3.5).  \~
         if (s->send != nullptr && s->send->state() != quic::SendState::DataRecvd) s->send->reset(code);
-        if (s->recv != nullptr) s->recv->stop(code);
+        q_.stop_receiving(*s, code);
     }
     // \~english QPACK learns the stream's references are released (RFC 9204, 2.2.2.2).
     // \~spanish QPACK sabe que las referencias del flujo quedan liberadas (RFC 9204, 2.2.2.2).  \~
@@ -301,24 +301,6 @@ Event Connection::stream_error(Message &m, uint64_t code, const char *why) noexc
     e.stream = m.id;
     e.code = code;
     return e;
-}
-
-void Connection::abandon(quic::Stream &s, uint64_t code) noexcept {
-    if (s.recv == nullptr || s.recv->stop(code)) return;
-    /* \~english
-     * Too late to ask: every byte, or a reset, is already here (RFC 9000,
-     * 3.5).  Nobody will read it, so it is read now -- the connection's
-     * window gets the bytes back -- and its end taken, or the stream would
-     * wait forever for a reader and never be collected (3.2).
-     * \~spanish
-     * Demasiado tarde para pedirlo: ya estan aqui todos los bytes, o un
-     * reinicio (RFC 9000, 3.5).  Nadie lo va a leer, asi que se lee ahora -- la
-     * ventana de la conexion recupera los bytes -- y se recoge su final, o el
-     * flujo esperaria para siempre a un lector y nunca se recogeria (3.2).
-     * \~ */
-    const uint8_t *p = nullptr;
-    for (size_t n = s.recv->peek(p); n != 0; n = s.recv->peek(p)) q_.consume(s, n);
-    s.recv->read_end();
 }
 
 void Connection::cancel(uint64_t stream, uint64_t code) noexcept {
@@ -342,7 +324,7 @@ bool Connection::stop_reading(uint64_t stream) noexcept {
     // \~spanish Acabado e informado: read_message tira lo que siga llegando, y no dice nada mas.  \~
     m->phase = Phase::Done;
     m->end_reported = true;
-    s->recv->stop(kNoError);
+    q_.stop_receiving(*s, kNoError);
     flush();
     return !failed();
 }
@@ -508,7 +490,7 @@ bool Connection::read_uni(quic::Stream &s, Uni &u) noexcept {
                 // \~english Unknown or reserved: never an error; reading stops (6.2, 9).
                 // \~spanish Desconocido o reservado: nunca un error; se deja de leer (6.2, 9).  \~
                 u.discard = true;
-                s.recv->stop(kStreamCreationError);
+                q_.stop_receiving(s, kStreamCreationError);
             }
             continue;
         }
@@ -564,7 +546,7 @@ Event Connection::finish_headers(Message &m, qpack::Outcome o, const char *sink_
             m.end_reported = true;
             respond(m.id, 431, nullptr, 0, true);
             quic::Stream *s = q_.streams().find(m.id);
-            if (s != nullptr && s->recv != nullptr) s->recv->stop(kNoError);
+            if (s != nullptr) q_.stop_receiving(*s, kNoError);
             return none;
         }
         return stream_error(m, kMessageError, "a response header section larger than this end takes (4.2.2)");
@@ -709,24 +691,17 @@ Event Connection::read_message(quic::Stream &s, Message &m) noexcept {
     for (;;) {
         const uint8_t *p = nullptr;
         const size_t n = s.recv->peek(p);
-        if (m.phase == Phase::Done) {
-            // \~english A stream this end is done with: what still arrives is read and thrown away.
-            // \~spanish Un flujo con el que este extremo acabo: lo que siga llegando se lee y se tira.  \~
-            if (n != 0) {
-                q_.consume(s, n);
-                continue;
-            }
-            /* \~english
-             * And its end too, when it comes: already reported, or not wanted,
-             * it is still taken, or the stream would never be collected
-             * (RFC 9000, 3.2).
-             * \~spanish
-             * Y su final tambien, cuando llegue: ya informado, o no querido, se
-             * recoge igual, o el flujo no se recogeria nunca (RFC 9000, 3.2).
-             * \~ */
-            s.recv->read_end();
-            return none;
-        }
+        /* \~english
+         * A stream this end is done with has nothing left here: its end was
+         * taken when reported, or it was given up (`stop_receiving`), and the
+         * transport throws away what still arrives and ends it by itself
+         * (RFC 9000, 3.5).
+         * \~spanish
+         * Un flujo con el que este extremo acabo no tiene nada pendiente aqui: su
+         * final se recogio al informarlo, o se abandono (`stop_receiving`), y el
+         * transporte tira lo que siga llegando y lo acaba el solo (RFC 9000, 3.5).
+         * \~ */
+        if (m.phase == Phase::Done) return none;
         if (n == 0) {
             const quic::RecvState st = s.recv->state();
             if (st == quic::RecvState::ResetRecvd || st == quic::RecvState::ResetRead) {
@@ -878,7 +853,7 @@ Event Connection::poll(uint64_t now_us) noexcept {
     for (const uint64_t seen = t.peer_opened(false); next_uni_ < seen && !failed(); ++next_uni_) {
         quic::Stream *s = t.find(next_uni_ * 4 + peer_uni_type);
         if (s == nullptr || s->recv == nullptr) continue;
-        if (uni(s->id) == nullptr) abandon(*s, kStreamCreationError);
+        if (uni(s->id) == nullptr) q_.stop_receiving(*s, kStreamCreationError);
     }
     for (Uni &u : peer_uni_) {
         if (failed()) break;
@@ -954,7 +929,7 @@ Event Connection::poll(uint64_t now_us) noexcept {
             Message *m = (goaway_sent_ != kNone && s->id >= goaway_sent_) ? nullptr : adopt(s->id);
             if (m == nullptr) {
                 if (s->send != nullptr) s->send->reset(kRequestRejected);
-                abandon(*s, kRequestRejected);
+                q_.stop_receiving(*s, kRequestRejected);
             }
         }
     }

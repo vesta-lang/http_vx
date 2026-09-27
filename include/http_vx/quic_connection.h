@@ -973,6 +973,31 @@ public:
      */
     void consume(Stream &s, size_t n) noexcept;
 
+    /**
+     * @brief
+     * \~english The application abandons the receiving part of @p s: what it held, and what still comes, goes back to the connection's window (RFC 9000, 3.5).
+     * \~spanish La aplicacion abandona la parte receptora de @p s: lo que tenia, y lo que siga llegando, vuelve a la ventana de la conexion (RFC 9000, 3.5).
+     * \~
+     *
+     * \~english
+     * The only way to stop reading a stream of a live connection: stopping the
+     * `RecvStream` alone would leave its unread bytes charged to the
+     * connection for good.
+     * \~spanish
+     * La unica forma de dejar de leer un flujo de una conexion viva: parar solo
+     * el `RecvStream` dejaria sus bytes sin leer cobrados a la conexion para
+     * siempre.
+     * \~
+     *
+     * @param s    \~english the stream  \~spanish el flujo  \~
+     * @param code \~english the STOP_SENDING's code, if one is owed  \~spanish el codigo del STOP_SENDING, si se debe  \~
+     * @return \~english whether a STOP_SENDING is now owed  \~spanish si ahora se debe un STOP_SENDING  \~
+     */
+    bool stop_receiving(Stream &s, uint64_t code) noexcept;
+
+    /// \~english The connection's receive flow control, as counted so far.  \~spanish El control de flujo de recepcion de la conexion, tal como va.  \~
+    const RecvFlow &recv_flow() const noexcept { return recv_flow_; }
+
     /// \~english The handshake's buffers, per space.  \~spanish Los buffers del saludo, por espacio.  \~
     SendStream &crypto_send(Space s) noexcept { return *crypto_send_[static_cast<size_t>(s)]; }
     RecvStream &crypto_recv(Space s) noexcept { return *crypto_recv_[static_cast<size_t>(s)]; }

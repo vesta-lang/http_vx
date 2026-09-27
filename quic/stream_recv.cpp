@@ -153,8 +153,9 @@ bool RecvStream::all_received() const noexcept {
 }
 
 StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, bool fin,
-                                uint64_t &new_bytes) noexcept {
+                                uint64_t &new_bytes, uint64_t &released) noexcept {
     new_bytes = 0;
+    released = 0;
     const uint64_t end = offset + len;
 
     /* \~english
@@ -187,6 +188,10 @@ StreamError RecvStream::on_data(uint64_t offset, const uint8_t *p, size_t len, b
         highest_ = end;
     }
     if (state_ == RecvState::DataRecvd || state_ == RecvState::DataRead) return StreamError::None;
+    if (abandoned_) {
+        discard_arrived(released);
+        return StreamError::None;
+    }
 
     // \~english What was already read is dropped; the rest is copied chunk by chunk.
     // \~spanish Lo ya leido se tira; el resto se copia trozo a trozo.  \~
@@ -269,7 +274,7 @@ StreamError RecvStream::on_reset(uint64_t final_size, uint64_t error_code,
      * flujo (3.5): no queda nadie a quien decirselo, asi que se lee al llegar.
      * Cualquier otro reinicio espera en "Reset Recvd" a `read_end`.
      * \~ */
-    state_ = stopped_ ? RecvState::ResetRead : RecvState::ResetRecvd;
+    state_ = abandoned_ ? RecvState::ResetRead : RecvState::ResetRecvd;
     buffered_ = 0;
     release_all();
     return StreamError::None;
@@ -277,7 +282,7 @@ StreamError RecvStream::on_reset(uint64_t final_size, uint64_t error_code,
 
 size_t RecvStream::peek(const uint8_t *&p) const noexcept {
     if (state_ == RecvState::ResetRecvd || state_ == RecvState::ResetRead ||
-        state_ == RecvState::DataRead || slots_ == nullptr)
+        state_ == RecvState::DataRead || abandoned_ || slots_ == nullptr)
         return 0;
 
     const Chunk *c = slots_[(read_ / kRecvChunk) % nslots_];
@@ -289,17 +294,64 @@ size_t RecvStream::peek(const uint8_t *&p) const noexcept {
     return n;
 }
 
-bool RecvStream::stop(uint64_t code) noexcept {
-    // \~english Only while there is still something to stop (3.5); asked once.
-    // \~spanish Solo mientras aun haya algo que parar (3.5); se pide una vez.  \~
-    if (stopped_ || (state_ != RecvState::Recv && state_ != RecvState::SizeKnown)) return false;
+void RecvStream::discard_arrived(uint64_t &released) noexcept {
+    /* \~english
+     * Everything counted up to the highest offset is taken as read: what was
+     * waiting, what just came, and the holes, whose bytes nobody will read
+     * either.  The connection gets back exactly what it was charged and not
+     * given back yet, so its window sums hold (4.1, 4.5).
+     * \~spanish
+     * Todo lo contado hasta el mayor desplazamiento se da por leido: lo que
+     * esperaba, lo que acaba de llegar, y los huecos, cuyos bytes tampoco va a
+     * leer nadie.  La conexion recupera exactamente lo que se le cobro y aun no
+     * se le devolvio, asi que sus cuentas de ventana cuadran (4.1, 4.5).
+     * \~ */
+    released = highest_ - read_;
+    read_ = highest_;
+    buffered_ = 0;
+    release_all();
+    /* \~english
+     * With the final size known every byte the peer will ever count is
+     * accounted for: nothing is left to wait for, and nobody to tell (3.2).
+     * \~spanish
+     * Con el tamano final conocido cada byte que el otro contara ya esta en la
+     * cuenta: no queda nada que esperar, ni nadie a quien decirselo (3.2).
+     * \~ */
+    if (size_known_) state_ = RecvState::DataRead;
+}
+
+bool RecvStream::stop(uint64_t code, uint64_t &released) noexcept {
+    released = 0;
+    if (abandoned_) return false;
+    abandoned_ = true;
+    switch (state_) {
+    case RecvState::ResetRecvd:
+        // \~english The reset's bytes were given back when it came; only its reader is gone.
+        // \~spanish Los bytes del reinicio se devolvieron al llegar; solo falta su lector.  \~
+        state_ = RecvState::ResetRead;
+        return false;
+    case RecvState::ResetRead:
+    case RecvState::DataRead:
+        return false;
+    case RecvState::DataRecvd:
+    case RecvState::SizeKnown:
+        // \~english The final size known: nothing to ask the peer, only unread bytes to give back (3.3); the stream ends.
+        // \~spanish El tamano final conocido: nada que pedir al otro, solo bytes sin leer que devolver (3.3); el flujo acaba.  \~
+        discard_arrived(released);
+        return false;
+    case RecvState::Recv:
+        break;
+    }
+    discard_arrived(released);
+    // \~english Still sending: asked to stop, once (3.5).  \~spanish Aun mandando: se le pide parar, una vez (3.5).  \~
     stopped_ = true;
     stop_pending_ = true;
     stop_code_ = code;
     return true;
 }
 
-void RecvStream::consume(size_t n) noexcept {
+size_t RecvStream::consume(size_t n) noexcept {
+    if (abandoned_) return 0;
     const uint64_t to = read_ + n;
     release_below(to);
     read_ = to;
@@ -308,6 +360,7 @@ void RecvStream::consume(size_t n) noexcept {
     // \~english The last byte read: the memory goes, the end waits for `read_end` (3.2).
     // \~spanish Leido el ultimo byte: la memoria se va, el final espera a `read_end` (3.2).  \~
     if (state_ == RecvState::DataRecvd && read_ == final_) release_all();
+    return n;
 }
 
 bool RecvStream::read_end() noexcept {
@@ -325,7 +378,7 @@ bool RecvStream::read_end() noexcept {
 bool RecvStream::wants_update() const noexcept {
     // \~english With the size known there is nothing more to allow (3.2).
     // \~spanish Con el tamano conocido no hay nada mas que permitir (3.2).  \~
-    if (state_ != RecvState::Recv) return false;
+    if (!takes_credit()) return false;
     return limit_ - read_ < window_ / 2;
 }
 

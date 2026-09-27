@@ -318,14 +318,16 @@ public:
      * stream's sections will not be read (RFC 9204, 4.4.2), and nothing more
      * of the request is reported; what still arrives, a reset included, is
      * thrown away.  The response is sent whole: a client MUST NOT discard it
-     * for having had its request cut short.
+     * for having had its request cut short.  The bytes of a Body event on
+     * the stream are gone from here on: copy them first.
      * \~spanish
      * Para una respuesta que no necesita el resto de la peticion -- un 413, por
      * ejemplo.  Se le pide al cliente que deje de mandar con H3_NO_ERROR, se le
      * dice a QPACK que las secciones del flujo no se leeran (RFC 9204, 4.4.2), y
      * no se informa de nada mas de la peticion; lo que siga llegando, un
      * reinicio incluido, se tira.  La respuesta se manda entera: un cliente NO
-     * DEBE tirarla por haberse cortado su peticion.
+     * DEBE tirarla por haberse cortado su peticion.  Los bytes de un evento Body
+     * del flujo desaparecen desde aqui: copiarlos antes.
      * \~
      */
     bool stop_reading(uint64_t stream) noexcept;
@@ -393,16 +395,6 @@ private:
 
     bool fail(uint64_t code, const char *why) noexcept;
     Event stream_error(Message &m, uint64_t code, const char *why) noexcept;
-    /**
-     * @brief
-     * \~english Stops reading a stream nothing here will ever read: STOP_SENDING, or, if everything or a reset already came, the rest thrown away and its end taken.
-     * \~spanish Deja de leer un flujo que aqui nada leera nunca: STOP_SENDING, o, si ya llego todo o un reinicio, el resto tirado y su final recogido.
-     * \~
-     *
-     * @param s    \~english the stream  \~spanish el flujo  \~
-     * @param code \~english the STOP_SENDING's code  \~spanish el codigo del STOP_SENDING  \~
-     */
-    void abandon(quic::Stream &s, uint64_t code) noexcept;
     bool open_local() noexcept;
     bool read_uni(quic::Stream &s, Uni &u) noexcept;
     bool on_control(Uni &u, quic::Stream &s) noexcept;

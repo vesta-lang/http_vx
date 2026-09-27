@@ -1144,8 +1144,17 @@ void Connection::handshake_confirmed(uint64_t now_us) noexcept {
 
 void Connection::consume(Stream &s, size_t n) noexcept {
     if (s.recv == nullptr) return;
-    s.recv->consume(n);
-    recv_flow_.on_consumed(n);
+    // \~english Only what was really read: an abandoned stream gave its bytes back already.
+    // \~spanish Solo lo que de verdad se leyo: un flujo abandonado ya devolvio sus bytes.  \~
+    recv_flow_.on_consumed(s.recv->consume(n));
+}
+
+bool Connection::stop_receiving(Stream &s, uint64_t code) noexcept {
+    if (s.recv == nullptr) return false;
+    uint64_t released = 0;
+    const bool owed = s.recv->stop(code, released);
+    recv_flow_.on_consumed(released);
+    return owed;
 }
 
 void Connection::consume_crypto(Space s, size_t n) noexcept {
@@ -2292,8 +2301,11 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
 
         case FrameType::Crypto: {
             uint64_t fresh = 0;
+            // \~english The handshake never abandons its stream: nothing is ever released here.
+            // \~spanish El saludo nunca abandona su flujo: aqui nunca se libera nada.  \~
+            uint64_t unused = 0;
             const StreamError e = crypto_recv_[idx(s)]->on_data(
-                f.offset, payload + f.data.off, f.data.len, false, fresh);
+                f.offset, payload + f.data.off, f.data.len, false, fresh, unused);
             if (e == StreamError::FlowControl) {
                 fail(TransportError::CryptoBufferExceeded, f.wire_type, now_us);
                 return false;
@@ -2323,7 +2335,7 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
             uint64_t released = 0;
             StreamError e = StreamError::None;
             if (f.type == FrameType::Stream) {
-                e = st->recv->on_data(f.offset, payload + f.data.off, f.data.len, f.fin, fresh);
+                e = st->recv->on_data(f.offset, payload + f.data.off, f.data.len, f.fin, fresh, released);
             } else if (f.type == FrameType::ResetStream) {
                 e = st->recv->on_reset(f.final_size, f.error_code, fresh, released);
             } else if (f.type == FrameType::MaxStreamData) {
@@ -2336,8 +2348,16 @@ bool Connection::process_frames(Space s, const uint8_t *payload, size_t n, Packe
                 return false;
             }
 
-            // \~english The connection's window pays for new offsets and gets back what a reset released.
-            // \~spanish La ventana de la conexion paga los desplazamientos nuevos y recupera lo que libero un reinicio.  \~
+            /* \~english
+             * The connection's window pays for new offsets, then gets back what
+             * a reset, or data on an abandoned stream, released: charged first,
+             * so bytes past the limit are an error even when thrown away (3.5).
+             * \~spanish
+             * La ventana de la conexion paga los desplazamientos nuevos, y luego
+             * recupera lo que libero un reinicio, o datos de un flujo
+             * abandonado: cobrado primero, asi que bytes pasado el limite son un
+             * error aunque se tiren (3.5).
+             * \~ */
             if (!recv_flow_.on_received(fresh)) {
                 fail(TransportError::FlowControlError, f.wire_type, now_us);
                 return false;
@@ -2531,11 +2551,10 @@ size_t Connection::write_frames(Space s, uint8_t *p, size_t room, PacketRecord &
         for (size_t i = 0; i < streams_.capacity() && !full(rec); ++i) {
             Stream *st = streams_.slot(i);
             if (st == nullptr) continue;
-            // \~english A lost one is owed again -- but only in "Recv": past it there is nothing to allow (3.2).
-            // \~spanish Uno perdido se vuelve a deber -- pero solo en "Recv": despues no hay nada que permitir (3.2).  \~
+            // \~english A lost one is owed again -- but only while the stream takes credit: in "Recv", not abandoned (3.2, 3.5).
+            // \~spanish Uno perdido se vuelve a deber -- pero solo mientras el flujo acepte credito: en "Recv", sin abandonar (3.2, 3.5).  \~
             if (st->recv != nullptr &&
-                (st->recv->wants_update() ||
-                 (st->max_stream_data_owed && st->recv->state() == RecvState::Recv))) {
+                (st->recv->wants_update() || (st->max_stream_data_owed && st->recv->takes_credit()))) {
                 n = write_max_stream_data(p + used, room - used, st->id, st->recv->next_limit());
                 if (n != 0) {
                     st->recv->advertise();

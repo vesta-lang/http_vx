@@ -3082,7 +3082,7 @@ void test_stop_sending(Crypto &cr) {
         pump(k, 1);
         // \~english The client no longer wants the answer: H3_REQUEST_CANCELLED, as HTTP/3 would say it.
         // \~spanish El cliente ya no quiere la respuesta: H3_REQUEST_CANCELLED, como lo diria HTTP/3.  \~
-        check(cli->recv->stop(0x10c), "the client could not stop reading");
+        check(k.client.stop_receiving(*cli, 0x10c), "the client could not stop reading");
         if (lose_first == 1) {
             uint8_t buf[1500];
             check(k.client.build_datagram(g_sent, buf, sizeof buf, k.now) != 0, "nothing carried the STOP_SENDING");
@@ -3170,6 +3170,155 @@ void test_lone_fin(Crypto &cr) {
     }
 }
 
+/**
+ * @brief
+ * \~english A STREAM frame on the client's stream 0 at @p off, @p len bytes of 'x', with or without FIN.
+ * \~spanish Una trama STREAM en el flujo 0 del cliente en @p off, @p len bytes de 'x', con o sin FIN.
+ * \~
+ *
+ * @return \~english the frame's size in @p f  \~spanish el tamano de la trama en @p f  \~
+ */
+size_t stream_frame(uint8_t *f, size_t room, uint64_t off, size_t len, bool fin) {
+    const size_t h = write_stream_header(f, room, 0, off, len, fin, true);
+    std::memset(f + h, 'x', len);
+    return h + len;
+}
+
+/// \~english Whether every byte the server was charged came back, read or released.
+/// \~spanish Si cada byte que se le cobro al servidor volvio, leido o liberado.  \~
+bool window_whole(KeyPair &k) {
+    return k.server.recv_flow().consumed() == k.server.recv_flow().received();
+}
+
+/**
+ * @brief
+ * \~english A stream the server stopped reading: whatever the peer sends after, the connection's window gets every byte back (RFC 9000, 3.5, 4.5).
+ * \~spanish Un flujo que el servidor dejo de leer: mande lo que mande despues el otro, la ventana de la conexion recupera cada byte (RFC 9000, 3.5, 4.5).
+ * \~
+ *
+ * \~english
+ * The peer's frames are sealed by hand, so it can do what a peer may: go on
+ * sending data and a FIN instead of the RESET_STREAM asked for.
+ * \~spanish
+ * Las tramas del otro se sellan a mano, asi que puede hacer lo que puede un
+ * otro extremo: seguir mandando datos y un FIN en vez del RESET_STREAM pedido.
+ * \~
+ */
+void test_abandoned(Crypto &cr) {
+    std::snprintf(current, sizeof current, "%s/abandoned", cr.name());
+    const ConnectionConfig cc = key_client();
+    ConnectionConfig sc = small_server();
+    std::memcpy(sc.peer_cid, cc.local_cid, 8);
+    // \~english A small stream window: an update would be due after half of it, were it still read.
+    // \~spanish Una ventana de flujo pequena: tocaria una actualizacion tras la mitad, si aun se leyera.  \~
+    sc.streams.window_bidi_remote = 4096;
+    uint8_t f[1300];
+    uint8_t out[1500];
+    {
+        // \~english Held bytes back at once; then data, then the FIN alone.
+        // \~spanish Los bytes guardados vuelven en el acto; luego datos, luego el FIN solo.  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 1000, false));
+        Stream *st = k.server.streams().find(0);
+        check(st != nullptr && !window_whole(k) && k.server.recv_flow().received() == 1000,
+              "1000 unread bytes are not charged to the connection");
+        if (st == nullptr) return;
+        check(k.server.stop_receiving(*st, 0x10c) && window_whole(k),
+              "stopping did not give the 1000 unread bytes back at once");
+        to_server(cr, k, 2, f, stream_frame(f, sizeof f, 1000, 1200, false));
+        to_server(cr, k, 3, f, stream_frame(f, sizeof f, 2200, 1200, false));
+        check(k.server.recv_flow().received() == 3400 && window_whole(k),
+              "data after the stop was not charged and given back");
+        const uint64_t updates = k.server.sent().max_stream_data;
+        // \~english As if a MAX_STREAM_DATA sent before the stop had been lost: not owed any more.
+        // \~spanish Como si se hubiera perdido un MAX_STREAM_DATA mandado antes de la parada: ya no se debe.  \~
+        st->max_stream_data_owed = true;
+        while (k.server.build_datagram(g_sent, out, sizeof out, k.now) != 0) {
+        }
+        check(k.server.sent().max_stream_data == updates, "an abandoned stream was given more credit");
+        check(k.server.sent().stop_sending >= 1, "no STOP_SENDING went out");
+        to_server(cr, k, 4, f, stream_frame(f, sizeof f, 3400, 0, true));
+        st = k.server.streams().find(0);
+        check(st != nullptr && st->recv->state() == RecvState::DataRead && window_whole(k),
+              "a lone FIN did not end the abandoned stream");
+        check_server_active(k, "the abandoned stream's data broke the connection");
+    }
+    {
+        // \~english Data with its FIN in one frame, and the stream goes once the server's side is done.
+        // \~spanish Datos con su FIN en una trama, y el flujo se va cuando acaba el lado del servidor.  \~
+        ConnectionConfig answering = sc;
+        answering.streams.peer_window_bidi_local = 1 << 20;
+        answering.peer_max_data = 1 << 20;
+        KeyPair k(cr, Aead::Aes128Gcm, cc, answering);
+        say(k, "hello");
+        pump(k, 3);
+        Stream *st = k.server.streams().find(0);
+        Stream *cli = k.client.streams().find(0);
+        if (st == nullptr || cli == nullptr) {
+            check(false, "stream 0 is not open at both ends");
+            return;
+        }
+        // \~english The client's data and FIN leave before the STOP_SENDING can reach it.
+        // \~spanish Los datos y el FIN del cliente salen antes de que pueda llegarle el STOP_SENDING.  \~
+        const std::vector<uint8_t> more(900, 'y');
+        size_t took = 0;
+        cli->send->write(more.data(), more.size(), took);
+        cli->send->finish();
+        std::vector<std::vector<uint8_t>> in_flight;
+        size_t n = 0;
+        while ((n = k.client.build_datagram(g_sent, out, sizeof out, k.now)) != 0)
+            in_flight.emplace_back(out, out + n);
+        check(k.server.stop_receiving(*st, 0x10c) && window_whole(k), "the 5 unread bytes did not come back");
+        for (std::vector<uint8_t> &d : in_flight) k.server.on_datagram(kPath, d.data(), d.size(), Ecn::NotEct, k.now);
+        check(window_whole(k) && k.server.recv_flow().received() == 905 && st->recv->state() == RecvState::DataRead,
+              "data and FIN after the stop were not given back, or did not end the stream");
+        // \~english The server's own side ends: then nothing keeps the stream.
+        // \~spanish Acaba el lado propio del servidor: entonces nada retiene el flujo.  \~
+        st->send->finish();
+        pump(k, 12);
+        check(k.server.streams().find(0) == nullptr, "a stream abandoned and ended was not collected");
+        check(window_whole(k), "the window came out short");
+        check_server_active(k, "the abandoned stream broke the connection");
+    }
+    {
+        // \~english The final size still holds: a FIN below what arrived (4.5).
+        // \~spanish El tamano final sigue valiendo: un FIN por debajo de lo que llego (4.5).  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 500, false));
+        Stream *st = k.server.streams().find(0);
+        if (st != nullptr) k.server.stop_receiving(*st, 0x10c);
+        to_server(cr, k, 2, f, stream_frame(f, sizeof f, 400, 0, true));
+        check(server_closed_with(k, TransportError::FinalSizeError),
+              "a FIN below what arrived on an abandoned stream was not a FINAL_SIZE_ERROR");
+    }
+    {
+        // \~english Past the stream's limit: still a FLOW_CONTROL_ERROR, thrown away or not (3.5, 4.1).
+        // \~spanish Pasado el limite del flujo: sigue siendo FLOW_CONTROL_ERROR, se tire o no (3.5, 4.1).  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 100, false));
+        Stream *st = k.server.streams().find(0);
+        if (st != nullptr) k.server.stop_receiving(*st, 0x10c);
+        to_server(cr, k, 2, f, stream_frame(f, sizeof f, 4000, 100, false));
+        check(server_closed_with(k, TransportError::FlowControlError),
+              "data past the stream's limit on an abandoned stream was not a FLOW_CONTROL_ERROR");
+    }
+    {
+        // \~english The RESET_STREAM asked for: charged up to its final size, and all of it back.
+        // \~spanish El RESET_STREAM pedido: cobrado hasta su tamano final, y todo de vuelta.  \~
+        KeyPair k(cr, Aead::Aes128Gcm, cc, sc);
+        to_server(cr, k, 1, f, stream_frame(f, sizeof f, 0, 200, false));
+        Stream *st = k.server.streams().find(0);
+        if (st != nullptr) k.server.stop_receiving(*st, 0x10c);
+        const size_t n = write_reset_stream(f, sizeof f, 0, 0x10c, 700);
+        to_server(cr, k, 2, f, n);
+        st = k.server.streams().find(0);
+        check(st != nullptr && st->recv->state() == RecvState::ResetRead &&
+                  k.server.recv_flow().received() == 700 && window_whole(k),
+              "the reset after a stop was not charged to its final size and given back");
+        check_server_active(k, "the reset after a stop broke the connection");
+    }
+}
+
 void run_all(Crypto &cr) {
     std::printf("-- %s --\n", cr.name());
     /* \~english
@@ -3212,6 +3361,7 @@ void run_all(Crypto &cr) {
     test_key_update_rules(cr, Aead::Aes128Gcm);
     test_stop_sending(cr);
     test_lone_fin(cr);
+    test_abandoned(cr);
     test_key_update_rules(cr, Aead::Aes256Gcm);
     test_key_update_rules(cr, Aead::ChaCha20Poly1305);
     test_cid_rules(cr);

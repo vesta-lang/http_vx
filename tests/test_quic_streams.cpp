@@ -75,8 +75,9 @@ void finish(Stream *s) {
         return;
     }
     uint64_t fresh = 0;
+    uint64_t released = 0;
     if (s->recv != nullptr) {
-        s->recv->on_data(0, nullptr, 0, true, fresh);
+        s->recv->on_data(0, nullptr, 0, true, fresh, released);
         // \~english The application takes the end: only then is the part done (RFC 9000, 3.2).
         // \~spanish La aplicacion recoge el final: solo entonces acaba la parte (RFC 9000, 3.2).  \~
         s->recv->read_end();
@@ -198,7 +199,8 @@ void test_closing_and_max_streams() {
     // \~spanish Un flujo terminado a medias no se recoge.  \~
     Stream *half = t.find(8);
     uint64_t fresh = 0;
-    half->recv->on_data(0, nullptr, 0, true, fresh);
+    uint64_t released = 0;
+    half->recv->on_data(0, nullptr, 0, true, fresh, released);
     half->recv->read_end();
     check(t.collect() == 0 && t.find(8) != nullptr, "a stream still sending was collected");
 }
@@ -221,9 +223,9 @@ void test_end_untaken_is_not_collected() {
     // \~english Stream 0: every byte read, then the FIN alone; its sending part done.
     // \~spanish Flujo 0: todos los bytes leidos, luego el FIN solo; su parte emisora acabada.  \~
     Stream *a = t.find(0);
-    a->recv->on_data(0, data, sizeof data, false, fresh);
+    a->recv->on_data(0, data, sizeof data, false, fresh, released);
     a->recv->consume(sizeof data);
-    a->recv->on_data(sizeof data, nullptr, 0, true, fresh);
+    a->recv->on_data(sizeof data, nullptr, 0, true, fresh, released);
     a->send->reset(1);
     a->send->on_reset_acked();
     check(a->recv->state() == RecvState::DataRecvd && t.collect() == 0 && t.find(0) != nullptr,
@@ -248,12 +250,26 @@ void test_end_untaken_is_not_collected() {
     // \~english Stream 8: the application stopped it; the reset answering it has nobody to tell (3.5).
     // \~spanish Flujo 8: la aplicacion lo paro; el reinicio que lo contesta no tiene a quien decirselo (3.5).  \~
     Stream *c = t.find(8);
-    check(c->recv->stop(1), "the stream could not be stopped");
+    check(c->recv->stop(1, released), "the stream could not be stopped");
     c->recv->on_reset(0, 1, fresh, released);
     c->send->reset(1);
     c->send->on_reset_acked();
     check(c->recv->state() == RecvState::ResetRead && t.collect() == 1,
           "a stream the application stopped was not collected once reset");
+
+    // \~english Stream 12: stopped, then data and FIN instead of a reset -- ended, and collected, with no reader (3.5).
+    // \~spanish Flujo 12: parado, y luego datos y FIN en vez de un reinicio -- acabado, y recogido, sin lector (3.5).  \~
+    t.advertise_max_streams(true);
+    frame(t, 12, FrameType::Stream, s, e);
+    Stream *d = t.find(12);
+    check(d != nullptr && d->recv->stop(1, released), "stream 12 could not be stopped");
+    if (d == nullptr) return;
+    d->recv->on_data(0, data, sizeof data, true, fresh, released);
+    d->send->reset(1);
+    d->send->on_reset_acked();
+    check(released == sizeof data && d->recv->state() == RecvState::DataRead && t.collect() == 1 &&
+              t.find(12) == nullptr,
+          "a stopped stream answered with data and FIN was not ended and collected");
 }
 
 /**

@@ -626,6 +626,69 @@ void test_server_limits() {
         check(k.qs.streams().find(id) == nullptr, "the rejected stream stayed at the server");
     }
     {
+        /* \~english
+         * Many rejected requests, each with a body, far more than the
+         * connection's window: every rejected byte comes back to the window
+         * (RFC 9000, 3.5), and every rejected stream goes, so both MAX_DATA
+         * and MAX_STREAMS keep moving.  The raw client gives up reading each
+         * answer, as the server gives up reading each request.
+         * \~spanish
+         * Muchas peticiones rechazadas, cada una con cuerpo, mucho mas que la
+         * ventana de la conexion: cada byte rechazado vuelve a la ventana (RFC
+         * 9000, 3.5), y cada flujo rechazado se va, asi que tanto MAX_DATA como
+         * MAX_STREAMS siguen avanzando.  El cliente en crudo renuncia a leer cada
+         * respuesta, como el servidor renuncia a leer cada peticion.
+         * \~ */
+        ConnectionConfig cc = client_config();
+        ConnectionConfig sc = server_config();
+        sc.data_window = 20000;
+        cc.peer_max_data = 20000;
+        cc.streams.peer_max_streams_bidi = 10;
+        sc.streams.peer_bidi_concurrency = 10;
+        Link k(cc, sc);
+        k.start(false);
+        k.pump(3, false);
+        k.hs.goaway();
+        std::vector<uint8_t> v;
+        add_frame(v, h3::kHeaders, section_of(get()));
+        add_frame(v, h3::kData, std::vector<uint8_t>(3000, 'z'));
+        const int want = 60;
+        int sent = 0;
+        for (int round = 0; round < 400 && sent < want; ++round) {
+            Stream *s = k.qc.streams().open(true);
+            if (s == nullptr) {
+                k.pump(1, false);
+                continue;
+            }
+            size_t took = 0;
+            s->send->write(v.data(), v.size(), took);
+            s->send->finish();
+            k.qc.stop_receiving(*s, h3::kNoError);
+            ++sent;
+        }
+        k.pump(6, false);
+        const RecvFlow &flow = k.qs.recv_flow();
+        check(sent == want, "the client could not open every request: streams or window stuck");
+        /* \~english
+         * Not every body arrives whole: the server's STOP_SENDING makes the
+         * client reset what it had not sent yet (3.5).  What did arrive is
+         * several windows, which only a window that moved lets through.
+         * \~spanish
+         * No todos los cuerpos llegan enteros: el STOP_SENDING del servidor hace
+         * que el cliente reinicie lo que aun no mando (3.5).  Lo que llego son
+         * varias ventanas, que solo deja pasar una ventana que se movio.
+         * \~ */
+        check(flow.received() > 4 * sc.data_window, "the connection's window stopped moving");
+        if (flow.consumed() != flow.received())
+            std::fprintf(stderr, "FAIL [%s]: %llu of %llu bytes came back to the connection's window\n", current,
+                         static_cast<unsigned long long>(flow.consumed()),
+                         static_cast<unsigned long long>(flow.received()));
+        failures += flow.consumed() != flow.received() ? 1 : 0;
+        check(k.find(k.server_events, h3::EventKind::Request) == nullptr, "no request reaches the application");
+        check(k.qs.streams().count() <= 3 + 1, "rejected streams stayed at the server");
+        check(!k.hs.failed(), "nothing failed");
+    }
+    {
         // \~english A section larger than announced is answered 431 (4.2.2).
         // \~spanish Una seccion mayor que la anunciada se contesta con 431 (4.2.2).  \~
         Link k;
@@ -649,6 +712,12 @@ void test_server_limits() {
         k.pump();
         check(k.find(k.server_events, h3::EventKind::Request, s->id) == nullptr, "no request reaches the application");
         check(k.hs.stream_why() != nullptr && std::strstr(k.hs.stream_why(), "431") != nullptr, "the server says why");
+        // \~english The section never read is given back, and the stream goes once answered (RFC 9000, 3.5).
+        // \~spanish La seccion que nunca se leyo se devuelve, y el flujo se va una vez contestado (RFC 9000, 3.5).  \~
+        k.pump();
+        check(k.qs.streams().find(s->id) == nullptr, "the stream answered 431 stayed at the server");
+        check(k.qs.recv_flow().consumed() == k.qs.recv_flow().received(),
+              "the header section never read was not given back to the connection's window");
     }
     {
         // \~english The client gives up: the server sees the stream reset with its code (4.1.1).
@@ -1061,6 +1130,36 @@ void test_stop_reading() {
           "the reset the client answers with is not reported: the stream was already left");
     check(!b.hs.failed(), "nothing failed");
 
+    /* \~english
+     * Stopped right after a Body event, before the next poll takes its bytes:
+     * those bytes were given back by the stop, and must not be counted a
+     * second time; the client's data and FIN that were already on their way
+     * are thrown away and given back too, and the stream goes.
+     * \~spanish
+     * Parada justo tras un evento Body, antes de que el siguiente poll recoja
+     * sus bytes: esos bytes ya los devolvio la parada, y no deben contarse otra
+     * vez; los datos y el FIN del cliente que ya iban de camino se tiran y se
+     * devuelven tambien, y el flujo se va.
+     * \~ */
+    section("stop reading at a Body event");
+    Link d;
+    d.start();
+    d.pump();
+    const uint64_t did = d.hc.send_request(req.data(), req.size(), false);
+    const std::string half(2000, 'q');
+    d.hc.send_body(did, reinterpret_cast<const uint8_t *>(half.data()), half.size(), false);
+    d.pump(3, true, false);
+    check(d.poll_until(d.hs, d.server_events, h3::EventKind::Body, did), "the server has a Body event");
+    check(d.hs.stop_reading(did), "and stops reading there");
+    d.hc.send_body(did, reinterpret_cast<const uint8_t *>(half.data()), half.size(), true);
+    d.pump();
+    check(d.hs.respond(did, 413, nullptr, 0, true), "the response goes");
+    d.pump();
+    const RecvFlow &flow = d.qs.recv_flow();
+    check(flow.consumed() == flow.received(), "a byte of the connection's window was lost or counted twice");
+    check(d.qs.streams().find(did) == nullptr, "the stream stayed once both sides were done");
+    check(!d.hs.failed() && !d.hc.failed(), "nothing failed");
+
     section("stop reading, a client");
     Link c;
     c.start();
@@ -1217,6 +1316,8 @@ void test_stream_order() {
         for (const uint64_t id : ids)
             if (u.qs.streams().find(id) != nullptr) gone = false;
         check(gone, "a unidirectional stream this end is done with stayed");
+        check(u.qs.recv_flow().consumed() == u.qs.recv_flow().received(),
+              "a byte of a stream thrown away was not given back to the connection's window");
         check(!u.hs.failed(), "and nothing failed");
     }
 }
@@ -1364,7 +1465,9 @@ void test_lone_fin() {
          * \~ */
         Stream *s = k.qs.streams().find(id);
         uint64_t fresh = 0;
-        check(s != nullptr && s->recv->on_data(s->recv->highest() + 5, nullptr, 0, true, fresh) == StreamError::None,
+        uint64_t released = 0;
+        check(s != nullptr &&
+                  s->recv->on_data(s->recv->highest() + 5, nullptr, 0, true, fresh, released) == StreamError::None,
               "the early FIN is taken");
         k.drain(k.hs, k.server_events);
         check(count_of(k.server_events, h3::EventKind::End, id) == 0,
@@ -1383,8 +1486,8 @@ void test_lone_fin() {
         Link k;
         k.start(false);
         k.pump(3, false);
-        // \~english A reserved type, a few bytes and the FIN in one go: nothing left to stop (RFC 9114, 6.2, 9).
-        // \~spanish Un tipo reservado, unos bytes y el FIN de una vez: nada que parar (RFC 9114, 6.2, 9).  \~
+        // \~english A reserved type, a few bytes and the FIN in one go: thrown away, and given back (RFC 9114, 6.2, 9).
+        // \~spanish Un tipo reservado, unos bytes y el FIN de una vez: se tira, y se devuelve (RFC 9114, 6.2, 9).  \~
         std::vector<uint8_t> v;
         add_varint(v, 0x21);
         const std::vector<uint8_t> junk = bytes("ignored");
@@ -1393,6 +1496,8 @@ void test_lone_fin() {
         k.pump(4, false);
         check(!k.hs.failed(), "an unknown stream type is not an error (6.2)");
         check(k.qs.streams().find(id) == nullptr, "the stream was read, its end taken, and it went");
+        check(k.qs.recv_flow().consumed() == k.qs.recv_flow().received(),
+              "the bytes after the type were not given back to the connection's window");
     }
 }
 
