@@ -134,11 +134,12 @@ void KickQueue::deliver_gone(BodySource &s) noexcept {
     s.gone(r, why);
 }
 
-void KickQueue::close(BodySource &s, GoneReason why) noexcept {
-    if (s.closing_) return;
+bool KickQueue::close(BodySource &s, GoneReason why) noexcept {
+    if (s.closing_) return false;
     s.closing_ = true;
     s.why_ = why;
     if (s.queued_.exchange(1, std::memory_order_acq_rel) == 0) deliver_gone(s);
+    return true;
 }
 
 size_t KickQueue::drain() noexcept {

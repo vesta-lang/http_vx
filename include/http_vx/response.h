@@ -54,6 +54,7 @@
 
 #include "http_vx/buffer.h"
 #include "http_vx/fields.h"
+#include "http_vx/open_port.h"
 #include "http_vx/span.h"
 #include "http_vx/status.h"
 
@@ -229,6 +230,63 @@ class ResponseBuilder {
      */
     bool body(const void *p, size_t n) noexcept;
 
+    /**
+     * @brief
+     * \~english Opens the response: the head goes now, and @p s gives the body when there is room (HVX-5).
+     * \~spanish Abre la respuesta: la cabecera sale ya, y @p s da el cuerpo cuando haya sitio (HVX-5).
+     * \~
+     *
+     * \~english
+     * What was written with @c body before opening is the first piece.  An
+     * invalid result means the response was not opened and @p s is never
+     * used: the request cannot have one (`HEAD`, or a service that says so),
+     * it was opened already, or a limit is reached -- and that last one is
+     * answered 503 whatever else the handler wrote (HVX-1, 12).
+     * \~spanish
+     * Lo escrito con @c body antes de abrir es el primer trozo.  Un resultado
+     * invalido quiere decir que la respuesta no se abrio y @p s no se usa nunca:
+     * la peticion no puede tener una (`HEAD`, o un servicio que lo dice), ya se
+     * abrio, o hay un tope agotado -- y eso ultimo se contesta 503 escribiera lo
+     * que escribiera el manejador (HVX-1, 12).
+     * \~
+     *
+     * @param s \~english where the body comes from; it lives until its @c gone
+     *          \~spanish de donde sale el cuerpo; vive hasta su @c gone  \~
+     * @return  \~english the response, or an invalid one  \~spanish la respuesta, o una invalida  \~
+     */
+    OpenResponse open(BodySource &s) noexcept;
+
+    /**
+     * @brief
+     * \~english Lets @c open open, on stream @p stream of @p c; the service's, before the handler runs.
+     * \~spanish Deja que @c open abra, en el flujo @p stream de @p c; del servicio, antes de que corra el manejador.
+     * \~
+     *
+     * \~english
+     * Not called, @c open refuses: a response that cannot be open -- the
+     * answer to a `HEAD` -- is one the service simply does not allow.
+     * \~spanish
+     * Sin llamarla, @c open rechaza: una respuesta que no puede estar abierta --
+     * la de un `HEAD` -- es una que el servicio sencillamente no permite.
+     * \~
+     */
+    void allow_open(OpenPort &port, ConnHandle c, uint64_t stream,
+                    KickTarget &target) noexcept {
+        port_ = &port;
+        conn_ = c;
+        stream_ = stream;
+        target_ = &target;
+    }
+
+    /// \~english The source of the opened response, or null.  \~spanish La fuente de la respuesta abierta, o nulo.  \~
+    BodySource *opened_source() const noexcept { return source_; }
+
+    /// \~english The opened response; invalid if none.  \~spanish La respuesta abierta; invalida si no hay.  \~
+    OpenResponse opened() const noexcept { return opened_; }
+
+    /// \~english Whether opening was refused by a limit: the answer is 503.  \~spanish Si un tope rechazo abrir: la respuesta es 503.  \~
+    bool open_refused() const noexcept { return open_refused_; }
+
     /// \~english What happened.  \~spanish Que paso.  \~
     StatusCode status() const noexcept { return status_; }
 
@@ -256,6 +314,14 @@ class ResponseBuilder {
     StatusCode status_ = 200;
     bool started_body_ = false;
     bool failed_ = false;
+
+    OpenPort *port_ = nullptr;
+    KickTarget *target_ = nullptr;
+    BodySource *source_ = nullptr;
+    ConnHandle conn_;
+    uint64_t stream_ = 0;
+    OpenResponse opened_;
+    bool open_refused_ = false;
 };
 
 } // namespace http_vx

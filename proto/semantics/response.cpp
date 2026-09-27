@@ -146,4 +146,25 @@ bool ResponseBuilder::body(const void *p, size_t n) noexcept {
     return true;
 }
 
+OpenResponse ResponseBuilder::open(BodySource &s) noexcept {
+    /* \~english
+     * Once.  A second source would be a second body for one response, and the
+     * first is already the port's -- so the second is refused and never used.
+     * \~spanish
+     * Una vez.  Una segunda fuente seria un segundo cuerpo para una respuesta, y
+     * la primera ya es de la puerta -- asi que la segunda se rechaza y no se usa.
+     * \~ */
+    if (port_ == nullptr || source_ != nullptr || open_refused_) return OpenResponse();
+
+    const OpenResponse r = port_->open(conn_, stream_, s, *target_);
+    if (!r.valid()) {
+        open_refused_ = true;
+        return r;
+    }
+
+    source_ = &s;
+    opened_ = r;
+    return r;
+}
+
 } // namespace http_vx

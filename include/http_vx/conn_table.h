@@ -314,7 +314,11 @@ struct ConnCold {
     /// \~spanish El otro extremo, con sitio para las dos clases de direccion.  \~
     uint8_t peer[16];
     uint16_t port;
-    uint16_t _pad[3];
+
+    /// \~english How many of its responses are open (HVX-5, 8).  \~spanish Cuantas de sus respuestas estan abiertas (HVX-5, 8).  \~
+    uint16_t open;
+
+    uint16_t _pad[2];
 };
 
 /**
@@ -432,6 +436,9 @@ class ConnTable {
      * @return  \~english the record, or null  \~spanish el registro, o nulo  \~
      */
     ConnHot *hot(ConnHandle h) noexcept;
+
+    /// \~english The same, to read.  \~spanish Lo mismo, para leer.  \~
+    const ConnHot *hot(ConnHandle h) const noexcept;
 
     /// \~english The same for the half nobody reads in a sweep.
     /// \~spanish Lo mismo para la mitad que no lee nadie en un barrido.  \~

@@ -75,6 +75,24 @@ size_t write_chunk_header(uint8_t *out, uint64_t size) noexcept {
     return n + 2;
 }
 
+size_t chunk_size_digits(uint64_t size) noexcept {
+    size_t n = 1;
+    while ((size >>= 4) != 0) ++n;
+    return n;
+}
+
+size_t write_chunk_header_fixed(uint8_t *out, uint64_t size, size_t digits) noexcept {
+    static const char kHex[] = "0123456789abcdef";
+
+    for (size_t i = digits; i-- != 0;) {
+        out[i] = static_cast<uint8_t>(kHex[size & 0xF]);
+        size >>= 4;
+    }
+    out[digits] = '\r';
+    out[digits + 1] = '\n';
+    return digits + 2;
+}
+
 WriteError ResponseWriter::fail(WriteError e) noexcept {
     state_ = State::Failed;
     return e;

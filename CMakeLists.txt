@@ -114,6 +114,7 @@ add_library(http_vx_core STATIC
         reactor/memory_backend.cpp
         reactor/memory_datagram.cpp
         reactor/shard.cpp
+        reactor/shard_open.cpp
         reactor/shard_datagram.cpp
         reactor/kick_queue.cpp
         reactor/shard_streamless.cpp
@@ -142,6 +143,7 @@ add_library(http_vx_proto STATIC
         proto/h1/framing.cpp
         proto/h1/parser.cpp
         proto/h1/service.cpp
+        proto/h1/service_open.cpp
         proto/h1/writer.cpp
 
         proto/h2/connection.cpp
@@ -523,6 +525,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_conn_table tests/test_conn_table.cpp)
     http_vx_add_test(test_h1_parser tests/test_h1_parser.cpp)
     http_vx_add_test(test_http1_service tests/test_http1_service.cpp)
+    http_vx_add_test(test_h1_open tests/test_h1_open.cpp)
     http_vx_add_test(test_h1_writer tests/test_h1_writer.cpp)
     http_vx_add_test(test_h2_connection tests/test_h2_connection.cpp)
     http_vx_add_test(test_h2_decoder tests/test_h2_decoder.cpp)

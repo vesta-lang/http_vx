@@ -157,7 +157,7 @@ class Handler {
  * \~spanish Lee HTTP/1.1 de una conexion y escribe las respuestas.
  * \~
  */
-class Http1Service final : public Service {
+class Http1Service final : public Service, public KickTarget {
   public:
     Http1Service() noexcept = default;
     ~Http1Service() override;
@@ -207,6 +207,22 @@ class Http1Service final : public Service {
     bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override;
     void on_open(ConnHandle c) noexcept override;
     void on_close(ConnHandle c) noexcept override;
+    void attach(OpenPort *port) noexcept override { port_ = port; }
+    bool on_writable(ConnHandle c, Buffer &out) noexcept override;
+    void on_kick(BodySource &source) noexcept override;
+
+    /**
+     * \~english
+     * The most body one fill is offered.  What bounds it is the buffer an
+     * open response writes into, not the source: a source that has more waits
+     * for the next room (HVX-5, 4.3).
+     * \~spanish
+     * Lo mas de cuerpo que se ofrece en un relleno.  Lo que lo acota es el
+     * buffer en el que escribe una respuesta abierta, no la fuente: una fuente
+     * que tenga mas espera al sitio siguiente (HVX-5, 4.3).
+     * \~
+     */
+    static constexpr size_t kFillRoom = 16384;
 
     /// \~english How many whole requests have been answered.
     /// \~spanish Cuantas peticiones enteras se han contestado.  \~
@@ -275,9 +291,58 @@ class Http1Service final : public Service {
          */
         size_t decoded;
 
+        /**
+         * \~english
+         * The source of the response open on this connection, or null.  While
+         * there is one, the requests behind it wait (HVX-5, 7.1).
+         * \~spanish
+         * La fuente de la respuesta abierta en esta conexion, o nulo.  Mientras
+         * haya una, las peticiones de detras esperan (HVX-5, 7.1).
+         * \~
+         */
+        BodySource *open;
+
         Phase phase;
         bool keep_alive;
+
+        /// \~english The open response goes in chunks; false is HTTP/1.0, ended by closing.
+        /// \~spanish La respuesta abierta va por trozos; false es HTTP/1.0, que acaba cerrando.  \~
+        bool chunked;
+
+        /// \~english Kicked since its last fill.  \~spanish Avisada desde su ultimo relleno.  \~
+        bool kicked;
+
+        /// \~english Its last fill took all the room: asked again when there is more (HVX-5, 4.3).
+        /// \~spanish Su ultimo relleno uso todo el sitio: se le vuelve a pedir cuando haya mas (HVX-5, 4.3).  \~
+        bool hungry;
     };
+
+    /**
+     * @brief
+     * \~english Writes the head of an opened response and its first fill into @p out.
+     * \~spanish Escribe la cabecera de una respuesta abierta y su primer relleno en @p out.
+     * \~
+     *
+     * @return \~english false to end the connection  \~spanish false para acabar la conexion  \~
+     */
+    bool start_open(ConnHandle c, State &s, const ResponseBuilder &res, Buffer &out) noexcept;
+
+    /**
+     * @brief
+     * \~english Asks the open source for one piece and frames it into @p out.
+     * \~spanish Le pide un trozo a la fuente abierta y lo enmarca en @p out.
+     * \~
+     *
+     * @return \~english false to end the connection  \~spanish false para acabar la conexion  \~
+     */
+    bool fill_open(ConnHandle c, State &s, Buffer &out) noexcept;
+
+    /// \~english Ends the open response of @p s with @p why.  \~spanish Acaba la respuesta abierta de @p s con @p why.  \~
+    void end_open(State &s, GoneReason why) noexcept;
+
+    /// \~english Answers 503 and carries on: a limit on open responses was reached.
+    /// \~spanish Contesta 503 y sigue: se agoto un tope de respuestas abiertas.  \~
+    bool unavailable(const Request &req, bool keep_alive, Buffer &out) noexcept;
 
     /// \~english Answers @p status and ends the connection.
     /// \~spanish Contesta @p status y acaba la conexion.  \~
@@ -318,6 +383,10 @@ class Http1Service final : public Service {
      */
     bool render(const ResponseBuilder &res, const Request &req,
                 bool keep_alive, Buffer &out) noexcept;
+
+    /// \~english Writes the handler's fields; the one loop for a whole response and an open one.
+    /// \~spanish Escribe las cabeceras del manejador; el unico bucle para una respuesta entera y una abierta.  \~
+    void put_fields(h1::ResponseWriter &w, const ResponseBuilder &res) noexcept;
 
     /// \~english Puts what the writer made into @p out.
     /// \~spanish Pone lo que hizo el escritor en @p out.  \~
@@ -375,6 +444,10 @@ class Http1Service final : public Service {
     Handler *handler_ = nullptr;
     h1::Limits limits_;
     size_t served_ = 0;
+
+    /// \~english The shard's side of open responses, or null: then nothing opens.
+    /// \~spanish El lado del fragmento de las respuestas abiertas, o nulo: entonces no se abre nada.  \~
+    OpenPort *port_ = nullptr;
 };
 
 } // namespace http_vx

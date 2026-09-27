@@ -70,8 +70,12 @@ void Http1Service::on_open(ConnHandle c) noexcept {
     s.left = 0;
     s.head_size = 0;
     s.decoded = 0;
+    s.open = nullptr;
     s.phase = Phase::Head;
     s.keep_alive = true;
+    s.chunked = false;
+    s.kicked = false;
+    s.hungry = false;
 }
 
 void Http1Service::on_close(ConnHandle c) noexcept {
@@ -97,6 +101,10 @@ void Http1Service::on_close(ConnHandle c) noexcept {
     s.phase = Phase::Head;
     s.left = 0;
     s.decoded = 0;
+
+    // \~english An open response goes with its connection, and its source is told why.
+    // \~spanish Una respuesta abierta se va con su conexion, y a su fuente se le dice por que.  \~
+    if (s.open != nullptr && port_ != nullptr) end_open(s, port_->closing_reason(c));
 }
 
 bool Http1Service::flush(h1::ResponseWriter &w, Buffer &out) noexcept {
@@ -117,7 +125,39 @@ bool Http1Service::render(const ResponseBuilder &res, const Request &req,
 
     h1::ResponseWriter &w = writer_;
     w.begin(req.version, res.status(), req.method, keep_alive);
+    put_fields(w, res);
 
+    const Span b = res.body();
+
+    /* \~english
+     * The framing is decided from what there is, not asked of the handler.  A
+     * handler that had to say how long its own body was would be a handler
+     * that could say a number that did not match it -- and a response whose
+     * length disagrees with its bytes is where one message ends inside
+     * another.
+     * \~spanish
+     * El troceado se decide con lo que hay, no se le pregunta al manejador.  Un
+     * manejador que tuviera que decir cuanto mide su propio cuerpo seria uno que
+     * puede decir un numero que no cuadra -- y una respuesta cuya longitud
+     * discrepa de sus bytes es donde un mensaje acaba dentro de otro.
+     * \~ */
+    w.finish(h1::ResponseBody::Length, b.len);
+
+    if (b.len != 0) w.body(res.bytes() + b.off, b.len);
+
+    /* \~english
+     * And the writer is NOT released.  Its memory is what answering the next
+     * request would ask for again, and @c begin empties it -- so keeping it is
+     * the whole of the saving and costs one buffer per service.
+     * \~spanish
+     * Y el escritor NO se libera.  Su memoria es la que volveria a pedir
+     * contestar la peticion siguiente, y @c begin lo vacia -- asi que guardarlo es
+     * todo el ahorro y cuesta un buffer por servicio.
+     * \~ */
+    return flush(w, out);
+}
+
+void Http1Service::put_fields(h1::ResponseWriter &w, const ResponseBuilder &res) noexcept {
     const uint8_t *bytes = res.bytes();
 
     for (const Field *f = res.fields().begin(); f != res.fields().end(); ++f) {
@@ -141,35 +181,6 @@ bool Http1Service::render(const ResponseBuilder &res, const Request &req,
                     f->name_len, value, f->value_len);
         }
     }
-
-    const Span b = res.body();
-
-    /* \~english
-     * The framing is decided from what there is, not asked of the handler.  A
-     * handler that had to say how long its own body was would be a handler
-     * that could say a number that did not match it -- and a response whose
-     * length disagrees with its bytes is where one message ends inside
-     * another.
-     * \~spanish
-     * El troceado se decide con lo que hay, no se le pregunta al manejador.  Un
-     * manejador que tuviera que decir cuanto mide su propio cuerpo seria uno que
-     * puede decir un numero que no cuadra -- y una respuesta cuya longitud
-     * discrepa de sus bytes es donde un mensaje acaba dentro de otro.
-     * \~ */
-    w.finish(h1::ResponseBody::Length, b.len);
-
-    if (b.len != 0) w.body(bytes + b.off, b.len);
-
-    /* \~english
-     * And the writer is NOT released.  Its memory is what answering the next
-     * request would ask for again, and @c begin empties it -- so keeping it is
-     * the whole of the saving and costs one buffer per service.
-     * \~spanish
-     * Y el escritor NO se libera.  Su memoria es la que volveria a pedir
-     * contestar la peticion siguiente, y @c begin lo vacia -- asi que guardarlo es
-     * todo el ahorro y cuesta un buffer por servicio.
-     * \~ */
-    return flush(w, out);
 }
 
 bool Http1Service::refuse(StatusCode status, Buffer &out) noexcept {
@@ -213,6 +224,15 @@ bool Http1Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
      * \~ */
     for (;;) {
         if (in.empty()) return true;
+
+        /* \~english
+         * A response is open: the requests behind it wait where they are
+         * (RFC 9112, 9.3.2), and are taken when it ends.
+         * \~spanish
+         * Hay una respuesta abierta: las peticiones de detras esperan donde
+         * estan (RFC 9112, 9.3.2), y se cogen cuando acabe.
+         * \~ */
+        if (s.open != nullptr) return true;
 
         if (s.phase == Phase::Head) {
             const h1::ParseResult r = s.parser.parse(in.data(), in.size(), s.req);
@@ -347,9 +367,26 @@ bool Http1Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
          * le tocan las cabeceras de un `GET` y ninguno de sus bytes.
          * \~ */
         ResponseBuilder res(said_);
+
+        /* \~english
+         * Opening is allowed where the response can have a body at all: the
+         * answer to a `HEAD` goes whole with its head (HVX-5, 4.1).
+         * \~spanish
+         * Abrir se permite donde la respuesta puede tener cuerpo: la de un `HEAD`
+         * sale entera con su cabecera (HVX-5, 4.1).
+         * \~ */
+        if (port_ != nullptr && s.req.method != MethodId::Head)
+            res.allow_open(*port_, c, 0, *this);
+
         handler_->handle(s.req, in.data(), body, body_len, res);
 
-        if (!render(res, s.req, s.keep_alive, out)) return false;
+        if (res.opened_source() != nullptr) {
+            if (!start_open(c, s, res, out)) return false;
+        } else if (res.open_refused()) {
+            if (!unavailable(s.req, s.keep_alive, out)) return false;
+        } else if (!render(res, s.req, s.keep_alive, out)) {
+            return false;
+        }
 
         ++served_;
 
@@ -378,6 +415,10 @@ bool Http1Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
         s.left = 0;
         s.head_size = 0;
         s.decoded = 0;
+
+        // \~english Still open: the connection ends, or carries on, when it does.
+        // \~spanish Sigue abierta: la conexion acaba, o sigue, cuando acabe ella.  \~
+        if (s.open != nullptr) return true;
 
         if (!s.keep_alive) return false;
     }

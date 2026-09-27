@@ -524,6 +524,36 @@ class ResponseWriter {
  */
 size_t write_chunk_header(uint8_t *out, uint64_t size) noexcept;
 
+/**
+ * @brief
+ * \~english Writes a chunk header of exactly @p digits hex digits, zeros in front.
+ * \~spanish Escribe una cabecera de trozo de exactamente @p digits cifras hexadecimales, con ceros delante.
+ * \~
+ *
+ * \~english
+ * What lets an open response be filled with no copy: the room for the header
+ * is kept in front, the source writes its bytes where they will leave from,
+ * and the size -- known only afterwards -- goes in the room kept, which has to
+ * have a width decided before.  Zeros in front are part of the grammar
+ * (`chunk-size = 1*HEXDIG`, RFC 9112, 7.1).
+ * \~spanish
+ * Lo que permite rellenar una respuesta abierta sin copiar: el sitio de la
+ * cabecera se guarda delante, la fuente escribe sus bytes donde van a salir, y
+ * el tamano -- que solo se sabe despues -- va en el sitio guardado, que tiene
+ * que tener un ancho decidido antes.  Los ceros delante son parte de la
+ * gramatica (`chunk-size = 1*HEXDIG`, RFC 9112, 7.1).
+ * \~
+ *
+ * @param out    \~english where to write; @p digits + 2 bytes  \~spanish donde escribir; @p digits + 2 bytes  \~
+ * @param size   \~english the chunk's size; it must fit in @p digits  \~spanish el tamano del trozo; tiene que caber en @p digits  \~
+ * @param digits \~english how many digits, 1 to 16  \~spanish cuantas cifras, de 1 a 16  \~
+ * @return       \~english @p digits + 2  \~spanish @p digits + 2  \~
+ */
+size_t write_chunk_header_fixed(uint8_t *out, uint64_t size, size_t digits) noexcept;
+
+/// \~english How many hex digits @p size takes.  \~spanish Cuantas cifras hexadecimales ocupa @p size.  \~
+size_t chunk_size_digits(uint64_t size) noexcept;
+
 /// \~english The most a chunk header takes: sixteen digits and a CRLF.
 /// \~spanish Lo mas que ocupa una cabecera de trozo: dieciseis digitos y un CRLF.  \~
 constexpr size_t kChunkHeaderMax = 18;

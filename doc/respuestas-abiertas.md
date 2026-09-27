@@ -185,6 +185,39 @@ respuesta abierta que no dice nada durante el plazo acaba con
 `gone(IdleTimeout)`: el plazo protege contra un extremo muerto, y el latido
 -- un comentario SSE vacio, por ejemplo -- es politica de la aplicacion.
 
+### 5.1 La puerta del fragmento
+
+Lo que no es de ninguna version lo da el fragmento a sus servicios de flujo
+como una interfaz, `OpenPort`, que recibe cada servicio al arrancar el
+fragmento (`Service::attach`; un servicio que envuelve a otro, como TLS, se la
+pasa):
+
+| llamada | que hace |
+| :-- | :-- |
+| `open(conn, stream, fuente, destino)` | comprueba los topes del fragmento y de la conexion, registra la fuente en la pila de avisos con el servicio como destino, y cuenta; con un tope agotado devuelve una respuesta invalida y cuenta el rechazo |
+| `fill(fuente, dst, room, done)` | el unico sitio desde el que se llama a `BodySource::fill`: cuenta llamadas y bytes, y recorta a `room` lo que devuelva la fuente |
+| `end(fuente, motivo)` | acaba la respuesta; su `gone` sale ahora o en el vaciado siguiente (4.4) |
+| `want_writable(conn)` | pide `Service::on_writable` en cuanto no salga nada de esa conexion |
+| `hold_reads(conn, bool)` | deja de entregar y de leer los bytes de la conexion, o lo reanuda entregando antes lo que quedo |
+| `closing_reason(conn)` | el motivo del `gone` de lo que siga abierto: plazo vencido, cierre, o fragmento que se suelta |
+
+El servicio es el destino de los avisos de sus fuentes, porque es el que sabe
+a que flujo alimenta cada una; al recibir uno, marca el flujo y pide sitio.
+El manejador abre con `ResponseBuilder::open(fuente)`, que el servicio solo
+habilita donde la respuesta puede tener cuerpo (no en un `HEAD`).
+
+Ninguna de estas llamadas vuelve a entrar en el servicio: `want_writable` y
+`hold_reads` apuntan la conexion en una lista enhebrada por casilla -- una
+entrada por conexion, nada reservado al pedir -- que el fragmento atiende al
+final de cada vuelta, despues de vaciar los avisos.  `on_writable` recibe un
+buffer nuevo del pozo y lo que escriba sale por la cola de la conexion, detras
+de lo que ya hubiera: una respuesta abierta tiene como mucho un buffer
+saliendo (R34), y el siguiente se le da cuando acaba ese envio.  Sin buffer
+libre, la peticion se repite en la vuelta siguiente y se cuenta.
+
+Una conexion que tiene pendiente reanudar no lee: lo que llego mientras estuvo
+retenida se entrega antes que cualquier lectura nueva.
+
 ## 6. Avisar desde otro hilo
 
 ### 6.1 Lo que hacen los disenos serios

@@ -110,8 +110,11 @@ public:
      * este instante, y @c gone se entrega cuando el fragmento la saque (HVX-5,
      * 4.4).
      * \~
+     *
+     * @return \~english false if @p s was ended already: nothing was done
+     *         \~spanish false si @p s ya estaba acabada: no se hizo nada  \~
      */
-    void close(BodySource &s, GoneReason why) noexcept;
+    bool close(BodySource &s, GoneReason why) noexcept;
 
     /// \~english Pushes @p s, and wakes the shard if it sleeps; any thread.  \~spanish Mete @p s, y despierta al fragmento si duerme; cualquier hilo.  \~
     bool kick(BodySource &s) noexcept;

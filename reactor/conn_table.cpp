@@ -240,6 +240,11 @@ ConnHot *ConnTable::hot(ConnHandle h) noexcept {
     return &hot_[h.slot];
 }
 
+const ConnHot *ConnTable::hot(ConnHandle h) const noexcept {
+    if (!alive(h)) return nullptr;
+    return &hot_[h.slot];
+}
+
 ConnCold *ConnTable::cold(ConnHandle h) noexcept {
     if (!alive(h)) return nullptr;
     return &cold_[h.slot];

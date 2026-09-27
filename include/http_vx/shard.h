@@ -68,6 +68,7 @@
 #include "http_vx/conn_table.h"
 #include "http_vx/datagram_service.h"
 #include "http_vx/kick_queue.h"
+#include "http_vx/open_port.h"
 #include "http_vx/reactor_ops.h"
 #include "http_vx/timer_wheel.h"
 
@@ -141,6 +142,42 @@ enum ConnFlag : uint16_t {
      * \~
      */
     kClosing = 4,
+
+    /**
+     * \~english
+     * Its bytes are not handed to the service and nothing more is read: an
+     * HTTP/1.1 response is open and the requests behind it wait (HVX-5, 7.1).
+     * \~spanish
+     * Sus bytes no se le dan al servicio y no se lee mas: hay una respuesta de
+     * HTTP/1.1 abierta y las peticiones de detras esperan (HVX-5, 7.1).
+     * \~
+     */
+    kHeld = 8,
+
+    /**
+     * \~english
+     * The service asked for @c Service::on_writable, which comes once nothing
+     * of this connection is going out.
+     * \~spanish
+     * El servicio pidio @c Service::on_writable, que llega en cuanto no sale
+     * nada de esta conexion.
+     * \~
+     */
+    kWantWritable = 16,
+
+    /**
+     * \~english
+     * It stopped being held while the service was being called, so what it
+     * left is handed over once that call returns.
+     * \~spanish
+     * Dejo de estar retenida mientras se llamaba al servicio, asi que lo que
+     * dejo se entrega en cuanto vuelva esa llamada.
+     * \~
+     */
+    kResume = 32,
+
+    /// \~english Closed because its deadline passed.  \~spanish Cerrada porque vencio su plazo.  \~
+    kExpired = 64,
 };
 
 /**
@@ -222,6 +259,37 @@ class Service {
 
     /// \~english And went.  \~spanish Y se fue.  \~
     virtual void on_close(ConnHandle c) noexcept { (void)c; }
+
+    /**
+     * @brief
+     * \~english Gives the service its shard's side of open responses (HVX-5); once, at @c Shard::reset.
+     * \~spanish Le da al servicio el lado de su fragmento de las respuestas abiertas (HVX-5); una vez, en @c Shard::reset.
+     * \~
+     *
+     * \~english
+     * A service that wraps another passes it on.  One that never opens a
+     * response ignores it.
+     * \~spanish
+     * Un servicio que envuelve a otro se lo pasa.  Uno que nunca abre una
+     * respuesta lo ignora.
+     * \~
+     */
+    virtual void attach(OpenPort *port) noexcept { (void)port; }
+
+    /**
+     * @brief
+     * \~english Room on @p c, asked for with @c OpenPort::want_writable: fill what is open into @p out.
+     * \~spanish Hay sitio en @p c, pedido con @c OpenPort::want_writable: rellena en @p out lo que este abierto.
+     * \~
+     *
+     * @return \~english false to end the connection once @p out has gone
+     *         \~spanish false para acabar la conexion cuando haya salido @p out  \~
+     */
+    virtual bool on_writable(ConnHandle c, Buffer &out) noexcept {
+        (void)c;
+        (void)out;
+        return true;
+    }
 };
 
 /**
@@ -329,6 +397,18 @@ struct ShardConfig {
      * \~
      */
     uint32_t accepts = 0;
+
+    /**
+     * \~english
+     * How many responses may be open at once on this shard, and on one
+     * connection (HVX-5, 8).  A request that would go over is answered 503.
+     * \~spanish
+     * Cuantas respuestas pueden estar abiertas a la vez en este fragmento, y en
+     * una conexion (HVX-5, 8).  Una peticion que se pasaria se contesta 503.
+     * \~
+     */
+    uint32_t max_open = 1024;
+    uint16_t max_open_per_conn = 16;
 };
 
 /**
@@ -365,7 +445,7 @@ struct ShardCounts {
  * \~spanish Lo que le toca de servidor a un hilo.
  * \~
  */
-class Shard {
+class Shard final : public OpenPort {
   public:
     Shard() noexcept = default;
 
@@ -574,10 +654,76 @@ class Shard {
     /// \~english The datagram side.  \~spanish El lado de datagramas.  \~
     ShardDatagrams &datagrams() noexcept { return datagrams_; }
 
-    /// \~english Gives the memory back.  \~spanish Devuelve la memoria.  \~
+    /**
+     * @brief
+     * \~english Gives the memory back.
+     * \~spanish Devuelve la memoria.
+     * \~
+     *
+     * \~english
+     * Every connection still here is told it went, with the reason
+     * @c GoneReason::Shutdown for what it had open, and every source is told
+     * its @c gone before this returns.  The service must still be alive.
+     * \~spanish
+     * A cada conexion que siga aqui se le dice que se fue, con el motivo
+     * @c GoneReason::Shutdown para lo que tuviera abierto, y cada fuente recibe su
+     * @c gone antes de que esto vuelva.  El servicio tiene que seguir vivo.
+     * \~
+     */
     void release() noexcept;
 
+    /// \~english What was done with open responses.  \~spanish Lo que se hizo con las respuestas abiertas.  \~
+    OpenCounts open_counts() const noexcept;
+
+    OpenResponse open(ConnHandle c, uint64_t stream, BodySource &s,
+                      KickTarget &target) noexcept override;
+    size_t fill(BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept override;
+    void end(BodySource &s, GoneReason why) noexcept override;
+    void want_writable(ConnHandle c) noexcept override;
+    void hold_reads(ConnHandle c, bool hold) noexcept override;
+    GoneReason closing_reason(ConnHandle c) const noexcept override;
+
   private:
+    /**
+     * @brief
+     * \~english Hands what is in buffer @p buf to the service, sends its answer, and reads on.
+     * \~spanish Le da al servicio lo que hay en el buffer @p buf, manda su respuesta, y sigue leyendo.
+     * \~
+     */
+    void serve(ConnHandle c, ConnHot &h, uint32_t buf) noexcept;
+
+    /**
+     * @brief
+     * \~english Calls @c Service::on_writable into a fresh buffer and sends what it wrote.
+     * \~spanish Llama a @c Service::on_writable sobre un buffer nuevo y manda lo que escribio.
+     * \~
+     */
+    void run_writable(ConnHandle c, ConnHot &h) noexcept;
+
+    /**
+     * @brief
+     * \~english Does what the service asked for during the turn: room to write, reads to resume.
+     * \~spanish Hace lo que pidio el servicio durante la vuelta: sitio para escribir, lecturas que reanudar.
+     * \~
+     *
+     * \~english
+     * Asking never calls the service back from inside itself: the connection
+     * is put on a list, and the list is served here, at the end of every
+     * poll, where the shard is calling nobody.
+     * \~spanish
+     * Pedir nunca vuelve a llamar al servicio desde dentro de si mismo: la
+     * conexion se pone en una lista, y la lista se atiende aqui, al final de
+     * cada poll, donde el fragmento no esta llamando a nadie.
+     * \~
+     */
+    void run_asked() noexcept;
+
+    /// \~english Puts @p c on the list @c run_asked serves, once.  \~spanish Pone @p c en la lista que atiende @c run_asked, una vez.  \~
+    void ask(ConnHandle c) noexcept;
+
+    /// \~english Tells the service every connection went, and delivers every @c gone.
+    /// \~spanish Le dice al servicio que se fueron todas las conexiones, y entrega todos los @c gone.  \~
+    void shut_down() noexcept;
     /**
      * @brief
      * \~english Asks for the next thing this connection has to say.
@@ -698,6 +844,29 @@ class Shard {
     ShardConfig cfg_;
     ShardCounts counts_;
     KickQueue kicks_;
+
+    OpenCounts open_counts_;
+
+    /**
+     * \~english
+     * The connections that asked for something this turn, threaded through an
+     * array indexed by slot like the answer queue: one entry per connection,
+     * nothing allocated to ask.  @c kNotAsked marks a slot not on the list.
+     * \~spanish
+     * Las conexiones que pidieron algo en esta vuelta, enhebradas en un array
+     * indexado por casilla como la cola de respuestas: una entrada por conexion,
+     * nada reservado al pedir.  @c kNotAsked marca una casilla que no esta en la
+     * lista.
+     * \~
+     */
+    static constexpr uint32_t kNotAsked = 0xFFFFFFFE;
+    uint32_t *asked_next_ = nullptr;
+    uint32_t asked_head_ = kNoSlot;
+    uint32_t asked_tail_ = kNoSlot;
+
+    /// \~english Letting go of everything: what is still open goes with @c GoneReason::Shutdown.
+    /// \~spanish Soltandolo todo: lo que siga abierto se va con @c GoneReason::Shutdown.  \~
+    bool shutting_down_ = false;
 };
 
 } // namespace http_vx

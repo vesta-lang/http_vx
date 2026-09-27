@@ -72,6 +72,14 @@ bool Shard::start(const ShardConfig &cfg, Backend &io, Service *service,
 
     for (uint32_t i = 0; i < cfg.buffers; ++i) queue_next_[i] = kNoBuffer;
 
+    asked_next_ = static_cast<uint32_t *>(
+        util::host_alloc(static_cast<size_t>(cfg.connections) * sizeof(uint32_t)));
+    if (asked_next_ == nullptr) return false;
+
+    for (uint32_t i = 0; i < cfg.connections; ++i) asked_next_[i] = kNotAsked;
+    asked_head_ = kNoSlot;
+    asked_tail_ = kNoSlot;
+
     /* \~english
      * A deadline that does not fit the wheel is refused when it is armed, so
      * it is checked here instead -- where it is a configuration that cannot
@@ -82,6 +90,8 @@ bool Shard::start(const ShardConfig &cfg, Backend &io, Service *service,
      * una conexion que por lo bajo no vence nunca.
      * \~ */
     if (cfg.idle_ticks == 0 || cfg.idle_ticks > wheel_.horizon()) return false;
+
+    if (service_ != nullptr) service_->attach(this);
 
     /* \~english
      * And the accepts are posted, which is what makes a shard start listening.
@@ -157,10 +167,20 @@ void Shard::on_accept(const Completion &done, uint64_t now) noexcept {
 }
 
 void Shard::release() noexcept {
+    if (io_ != nullptr && service_ != nullptr) shut_down();
+
     if (queue_next_ != nullptr) {
         util::host_free(queue_next_);
         queue_next_ = nullptr;
     }
+    if (asked_next_ != nullptr) {
+        util::host_free(asked_next_);
+        asked_next_ = nullptr;
+    }
+    asked_head_ = kNoSlot;
+    asked_tail_ = kNoSlot;
+    open_counts_ = OpenCounts();
+    shutting_down_ = false;
 
     datagrams_.release();
     conns_.release();
@@ -274,6 +294,19 @@ void Shard::want_read(ConnHandle c, ConnHot &h) noexcept {
      * donde les toca.
      * \~ */
     if (h.queued >= cfg_.max_queued) return;
+
+    // \~english Held: an open HTTP/1.1 response, and the requests behind it wait (HVX-5, 7.1).
+    // \~spanish Retenida: una respuesta de HTTP/1.1 abierta, y las peticiones de detras esperan (HVX-5, 7.1).  \~
+    if ((h.flags & kHeld) != 0) return;
+
+    /* \~english
+     * Nor while a resume is due: what arrived while it was held is served
+     * first, and a read now would take its buffer from under it.
+     * \~spanish
+     * Ni mientras toca reanudar: lo que llego mientras estaba retenida se
+     * atiende antes, y una lectura ahora le quitaria su buffer.
+     * \~ */
+    if ((h.flags & kResume) != 0) return;
 
     /* \~english
      * **A connection between messages asks to be TOLD, and takes no buffer.**
@@ -620,8 +653,7 @@ void Shard::on_read(const Completion &done) noexcept {
         return;
     }
 
-    Buffer *in = pool_.at(done.buffer);
-    if (in == nullptr) {
+    if (pool_.at(done.buffer) == nullptr) {
         close(done.conn);
         return;
     }
@@ -640,6 +672,17 @@ void Shard::on_read(const Completion &done) noexcept {
     ConnCold *cold = conns_.cold(done.conn);
     if (cold != nullptr) cold->bytes_in += static_cast<uint64_t>(done.result);
 
+    serve(done.conn, *h, done.buffer);
+}
+
+void Shard::serve(ConnHandle c, ConnHot &hot, uint32_t buf) noexcept {
+    ConnHot *h = &hot;
+    Buffer *in = pool_.at(buf);
+    if (in == nullptr) {
+        close(c);
+        return;
+    }
+
     /* \~english
      * A second buffer for the answer, so a connection mid-exchange holds two.
      * Not getting one closes the connection rather than holding the request:
@@ -655,13 +698,13 @@ void Shard::on_read(const Completion &done) noexcept {
      * \~ */
     const uint32_t wb = pool_.acquire();
     if (wb == kNoBuffer) {
-        pool_.release(done.buffer);
-        close(done.conn);
+        pool_.release(buf);
+        close(c);
         return;
     }
 
     Buffer *out = pool_.at(wb);
-    const bool keep = service_->on_bytes(done.conn, *in, *out);
+    const bool keep = service_->on_bytes(c, *in, *out);
 
     /* \~english
      * **The read buffer goes back only if the service emptied it.**  What is
@@ -686,9 +729,9 @@ void Shard::on_read(const Completion &done) noexcept {
      * en dos paquetes, que son casi todas las grandes.
      * \~ */
     const bool empty = out->empty();
-    h->reading = in->empty() ? kNoBuffer : done.buffer;
+    h->reading = in->empty() ? kNoBuffer : buf;
 
-    if (h->reading == kNoBuffer) pool_.release(done.buffer);
+    if (h->reading == kNoBuffer) pool_.release(buf);
 
     /* \~english
      * The answer goes out BEFORE the connection is ended, whether or not the
@@ -703,14 +746,14 @@ void Shard::on_read(const Completion &done) noexcept {
      * \~ */
     if (empty) {
         pool_.release(wb);
-    } else if (!want_write(done.conn, *h, wb)) {
+    } else if (!want_write(c, *h, wb)) {
         pool_.release(wb);
-        close(done.conn);
+        close(c);
         return;
     }
 
     if (!keep) {
-        close(done.conn);
+        close(c);
         return;
     }
 
@@ -725,7 +768,7 @@ void Shard::on_read(const Completion &done) noexcept {
      * siguiente mientras se contesta esta no se le hace esperar por una respuesta
      * que todavia no ha pedido.
      * \~ */
-    want_read(done.conn, *h);
+    want_read(c, *h);
 }
 
 void Shard::on_write(const Completion &done) noexcept {
@@ -845,6 +888,20 @@ void Shard::on_write(const Completion &done) noexcept {
     }
 
     wheel_.arm(done.conn.slot, cfg_.idle_ticks);
+
+    /* \~english
+     * Nothing of it going out any more: an open response that asked for room
+     * gets it now, one buffer at a time (HVX-5, 4.3).
+     * \~spanish
+     * Ya no sale nada suyo: una respuesta abierta que pidio sitio lo tiene
+     * ahora, un buffer cada vez (HVX-5, 4.3).
+     * \~ */
+    if ((h->flags & (kWantWritable | kWritePending)) == kWantWritable && h->queue == kNoBuffer) {
+        run_writable(done.conn, *h);
+        h = conns_.hot(done.conn);
+        if (h == nullptr) return;
+    }
+
     want_read(done.conn, *h);
 }
 
@@ -998,6 +1055,10 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
     // \~spanish Cada fuente avisada, a quien abrio su respuesta.  \~
     kicks_.drain();
 
+    // \~english And what the services asked for during the turn.
+    // \~spanish Y lo que pidieron los servicios durante la vuelta.  \~
+    run_asked();
+
     /* \~english
      * And what the datagrams just delivered made the service want to say is
      * handed over now, so that the next wait sends it.
@@ -1030,6 +1091,11 @@ size_t Shard::expire(uint64_t now) noexcept {
          * \~ */
         const ConnHandle c = conns_.at(slot);
         if (!c.valid()) continue;
+
+        // \~english So what is open on it ends as an idle timeout, not a plain close.
+        // \~spanish Para que lo abierto en ella acabe por plazo vencido, no por un cierre sin mas.  \~
+        ConnHot *h = conns_.hot(c);
+        if (h != nullptr) h->flags |= kExpired;
 
         close(c);
         ++closed;
