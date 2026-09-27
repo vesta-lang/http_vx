@@ -379,6 +379,10 @@ class IocpBackend final : public Backend {
     /// \~english The listening socket.  \~spanish El socket de escucha.  \~
     uintptr_t listener_ = static_cast<uintptr_t>(-1);
 
+    /// \~english The listener's address family, which every accepted socket must share.
+    /// \~spanish La familia de direcciones del socket de escucha, que tienen que compartir los aceptados.  \~
+    int32_t listener_family_ = 0;
+
     /// \~english `AcceptEx`, looked up at run time as Windows requires.
     /// \~spanish `AcceptEx`, buscado en ejecucion como exige Windows.  \~
     void *accept_fn_ = nullptr;

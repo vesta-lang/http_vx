@@ -200,9 +200,22 @@ int failures = 0;
  */
 const char *against = "?";
 
+/**
+ * \~english
+ * Which loopback the run in progress uses: every case runs over IPv4 AND
+ * IPv6, so that a backend cannot listen on one family only -- which all of
+ * them did, while their datagram side took both.
+ * \~spanish
+ * Que bucle local usa la corrida en curso: cada caso corre sobre IPv4 Y sobre
+ * IPv6, para que un backend no pueda escuchar en una sola familia -- que es lo
+ * que hacian todos, mientras su lado de datagramas cogia las dos.
+ * \~
+ */
+const char *loopback = "127.0.0.1";
+
 void check(bool ok, const char *what) {
     if (ok) return;
-    std::fprintf(stderr, "FAIL [%s]: %s\n", against, what);
+    std::fprintf(stderr, "FAIL [%s over %s]: %s\n", against, loopback, what);
     ++failures;
 }
 
@@ -275,20 +288,31 @@ struct Client {
     }
 
     bool open(uint16_t port) {
+        sockaddr_in6 to;
+        std::memset(&to, 0, sizeof to);
+        sockaddr_in *v4 = reinterpret_cast<sockaddr_in *>(&to);
+        int family = AF_INET;
+        int len = sizeof(sockaddr_in);
+        if (inet_pton(AF_INET, loopback, &v4->sin_addr) == 1) {
+            v4->sin_family = AF_INET;
+            v4->sin_port = htons(port);
+        } else if (inet_pton(AF_INET6, loopback, &to.sin6_addr) == 1) {
+            family = AF_INET6;
+            len = sizeof to;
+            to.sin6_family = AF_INET6;
+            to.sin6_port = htons(port);
+        } else {
+            return false;
+        }
+
 #ifdef _WIN32
-        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
 #else
-        sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+        sock = socket(family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
 #endif
         if (sock == kNoSock) return false;
 
         dont_block(sock);
-
-        sockaddr_in to;
-        std::memset(&to, 0, sizeof to);
-        to.sin_family = AF_INET;
-        to.sin_port = htons(port);
-        inet_pton(AF_INET, "127.0.0.1", &to.sin_addr);
 
         /* \~english
          * A connect that does not block reports that it has not finished, and
@@ -300,7 +324,7 @@ struct Client {
          * bucle, que es para lo que se hace asi.
          * \~ */
         const int r =
-            connect(sock, reinterpret_cast<sockaddr *>(&to), sizeof to);
+            connect(sock, reinterpret_cast<sockaddr *>(&to), len);
         return connecting(r);
     }
 
@@ -382,7 +406,7 @@ struct Server {
 #ifdef _WIN32
         (void)which;
         if (!iocp.reset(shard.buffers(), 64)) return false;
-        if (!iocp.listen("127.0.0.1", 0)) return false;
+        if (!iocp.listen(loopback, 0)) return false;
         bound = iocp.port();
         io = &iocp;
 #else
@@ -399,12 +423,12 @@ struct Server {
              * operacion que este haciendo el nucleo.
              * \~ */
             if (!epoll.reset(shard.buffers(), 1024)) return false;
-            if (!epoll.listen("127.0.0.1", 0)) return false;
+            if (!epoll.listen(loopback, 0)) return false;
             bound = epoll.port();
             io = &epoll;
         } else {
             if (!uring.reset(shard.buffers(), 256)) return false;
-            if (!uring.listen("127.0.0.1", 0)) return false;
+            if (!uring.listen(loopback, 0)) return false;
             bound = uring.port();
             io = &uring;
         }
@@ -466,6 +490,36 @@ bool insist(Server &s, Client &c, const char *what) {
     return false;
 }
 
+/**
+ * @brief
+ * \~english Starts @p s on a port, or says it could not and tells the case to stop.
+ * \~spanish Arranca @p s en un puerto, o dice que no pudo y le dice al caso que pare.
+ * \~
+ *
+ * \~english
+ * Without a server nothing else in a case can say anything, and every helper
+ * below would spend its whole budget waiting for an answer that cannot come
+ * -- on Windows, where a sleep of one millisecond lasts a clock tick, that
+ * turned a server that would not start into minutes of silence before the red.
+ * \~spanish
+ * Sin servidor nada mas de un caso puede decir nada, y cada ayudante de abajo
+ * gastaria todo su presupuesto esperando una respuesta que no puede llegar --
+ * en Windows, donde dormir un milisegundo dura un tic del reloj, eso convertia
+ * un servidor que no arrancaba en minutos de silencio antes del rojo.
+ * \~
+ */
+bool started(Server &s, Which which) {
+    if (!s.start(which)) {
+        check(false, "the server would not start");
+        return false;
+    }
+    if (s.port() == 0) {
+        check(false, "no port was bound");
+        return false;
+    }
+    return true;
+}
+
 bool answered(const Client &c) { return c.has("hello"); }
 bool hung_up(const Client &c) { return c.ended; }
 bool answered_twice(const Client &c) {
@@ -494,8 +548,7 @@ bool answered_twice(const Client &c) {
  */
 void test_a_request_over_a_socket(Which which) {
     Server s;
-    check(s.start(which), "the server would not start");
-    check(s.port() != 0, "no port was bound");
+    if (!started(s, which)) return;
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -547,7 +600,7 @@ void test_a_request_over_a_socket(Which which) {
  */
 void test_a_finished_connection_closes_its_socket(Which which) {
     Server s;
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -580,7 +633,7 @@ void test_a_finished_connection_closes_its_socket(Which which) {
  */
 void test_two_requests_on_one_socket(Which which) {
     Server s;
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -623,7 +676,7 @@ void test_two_requests_on_one_socket(Which which) {
  */
 void test_four_sockets_at_once(Which which) {
     Server s;
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c[4];
 
@@ -689,7 +742,7 @@ void test_four_sockets_at_once(Which which) {
  */
 void test_an_idle_socket_holds_no_buffer(Which which) {
     Server s;
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -772,7 +825,7 @@ void test_both_directions_at_once_over_a_socket(Which which) {
     Server s;
     s.handler.wordy = true;
 
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c;
     check(c.open(s.port()), "the client could not connect");
@@ -867,7 +920,7 @@ void test_a_batch_costs_one_trip(Which which) {
     if (which != Which::Uring) return;
 
     Server s;
-    check(s.start(which), "the server would not start");
+    if (!started(s, which)) return;
 
     Client c[4];
 
@@ -954,18 +1007,23 @@ void test_a_batch_costs_one_trip(Which which) {
  */
 void run_every_case(Which which) {
     against = which_name(which);
-    std::printf("  -- %s --\n", against);
 
-    test_a_request_over_a_socket(which);
-    test_a_finished_connection_closes_its_socket(which);
-    test_two_requests_on_one_socket(which);
-    test_four_sockets_at_once(which);
-    test_an_idle_socket_holds_no_buffer(which);
-    test_both_directions_at_once_over_a_socket(which);
+    static const char *const kLoopbacks[] = {"127.0.0.1", "::1"};
+    for (const char *on : kLoopbacks) {
+        loopback = on;
+        std::printf("  -- %s over %s --\n", against, loopback);
+
+        test_a_request_over_a_socket(which);
+        test_a_finished_connection_closes_its_socket(which);
+        test_two_requests_on_one_socket(which);
+        test_four_sockets_at_once(which);
+        test_an_idle_socket_holds_no_buffer(which);
+        test_both_directions_at_once_over_a_socket(which);
 
 #ifndef _WIN32
-    test_a_batch_costs_one_trip(which);
+        test_a_batch_costs_one_trip(which);
 #endif
+    }
 }
 
 } // namespace

@@ -247,27 +247,12 @@ int32_t IocpBackend::open_datagram(const char *host, uint16_t port,
     bound.len = 0;
     if (iocp_ == nullptr || host == nullptr) return -1;
 
-    union {
-        sockaddr_in v4;
-        sockaddr_in6 v6;
-    } addr;
-    util::vesta_memset(&addr, 0, sizeof addr);
-
-    int family = AF_INET;
-    int len = sizeof addr.v4;
-
-    if (InetPtonA(AF_INET, host, &addr.v4.sin_addr) == 1) {
-        addr.v4.sin_family = AF_INET;
-        addr.v4.sin_port = htons(port);
-    } else if (InetPtonA(AF_INET6, host, &addr.v6.sin6_addr) == 1) {
-        family = AF_INET6;
-        len = sizeof addr.v6;
-        addr.v6.sin6_family = AF_INET6;
-        addr.v6.sin6_port = htons(port);
-    } else {
+    WinAddress where;
+    if (!win_address(host, port, where)) {
         last_error_ = WSAEINVAL;
         return -1;
     }
+    const int family = where.family;
 
     const SOCKET s = WSASocketW(family, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
                                 WSA_FLAG_OVERLAPPED);
@@ -295,7 +280,7 @@ int32_t IocpBackend::open_datagram(const char *host, uint16_t port,
     const bool fine =
         (!v6 || setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
                            reinterpret_cast<const char *>(&on), sizeof on) == 0) &&
-        bind(s, reinterpret_cast<const sockaddr *>(&addr), len) == 0 &&
+        bind(s, reinterpret_cast<const sockaddr *>(&where.raw), where.len) == 0 &&
         setsockopt(s, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
                    v6 ? IPV6_PKTINFO : IP_PKTINFO,
                    reinterpret_cast<const char *>(&on), sizeof on) == 0 &&

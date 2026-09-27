@@ -14,6 +14,7 @@
  */
 
 #include "epoll_waiting.h"
+#include "socket_open.h"
 
 #include "util/alloc/alloc_tag.h"
 #include "util/alloc/host_allocator.h"
@@ -154,54 +155,8 @@ bool EpollBackend::reset(BufferPool &pool, uint32_t max_fds) noexcept {
 bool EpollBackend::listen(const char *host, uint16_t port, int backlog) noexcept {
     if (queue_ < 0) return false;
 
-    const int s = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                           IPPROTO_TCP);
-    if (s < 0) {
-        last_error_ = errno;
-        return false;
-    }
-
-    /* \~english
-     * `SO_REUSEADDR`, which on Linux means what a server wants it to mean: a
-     * port whose last connection is still in `TIME_WAIT` can be bound again.
-     * Without it, a server that restarts fails to start for a minute or two
-     * after having worked perfectly -- which reads as a broken build.
-     * \~spanish
-     * `SO_REUSEADDR`, que en Linux quiere decir lo que un servidor quiere que
-     * quiera decir: un puerto cuya ultima conexion siga en `TIME_WAIT` se puede
-     * volver a atar.  Sin el, un servidor que se reinicia no arranca durante un
-     * minuto o dos despues de haber funcionado perfectamente -- que se lee como
-     * una construccion rota.
-     * \~ */
-    int on = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-
-    sockaddr_in addr;
-    util::vesta_memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-        last_error_ = errno;
-        ::close(s);
-        return false;
-    }
-
-    if (bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof addr) < 0) {
-        last_error_ = errno;
-        ::close(s);
-        return false;
-    }
-
-    if (::listen(s, backlog) < 0) {
-        last_error_ = errno;
-        ::close(s);
-        return false;
-    }
-
-    socklen_t len = sizeof addr;
-    if (getsockname(s, reinterpret_cast<sockaddr *>(&addr), &len) == 0)
-        port_ = ntohs(addr.sin_port);
+    const int s = open_listener(host, port, backlog, true, port_, last_error_);
+    if (s < 0) return false;
 
     if (static_cast<uint32_t>(s) >= max_fds_) {
         last_error_ = EMFILE;

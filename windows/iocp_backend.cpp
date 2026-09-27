@@ -43,6 +43,7 @@
 #include "util/alloc/host_allocator.h"
 #include "util/mem/vesta_memset.h"
 
+#include <cstddef>
 #include <new>
 
 namespace http_vx {
@@ -95,25 +96,37 @@ bool IocpBackend::reset(BufferPool &pool, uint32_t pending) noexcept {
 bool IocpBackend::listen(const char *host, uint16_t port, int backlog) noexcept {
     if (iocp_ == nullptr) return false;
 
-    const SOCKET s = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+    WinAddress addr;
+    if (!win_address(host, port, addr)) {
+        last_error_ = WSAEINVAL;
+        return false;
+    }
+
+    const SOCKET s = WSASocketW(addr.family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
                                 WSA_FLAG_OVERLAPPED);
     if (s == INVALID_SOCKET) {
         last_error_ = WSAGetLastError();
         return false;
     }
 
-    sockaddr_in addr;
-    util::vesta_memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-
-    if (InetPtonA(AF_INET, host, &addr.sin_addr) != 1) {
+    /* \~english
+     * A v6 listener is v6 ONLY, as the datagram sockets are: a dual-stack one
+     * would take v4 clients as mapped addresses, one peer with two spellings.
+     * \~spanish
+     * Un socket de escucha v6 es SOLO v6, como los de datagramas: uno de doble
+     * pila cogeria clientes v4 como direcciones mapeadas, un extremo con dos
+     * grafias.
+     * \~ */
+    const DWORD on = 1;
+    if (addr.family == AF_INET6 &&
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&on),
+                   sizeof on) == SOCKET_ERROR) {
         last_error_ = WSAGetLastError();
         closesocket(s);
         return false;
     }
 
-    if (bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof addr) ==
+    if (bind(s, reinterpret_cast<const sockaddr *>(&addr.raw), addr.len) ==
         SOCKET_ERROR) {
         last_error_ = WSAGetLastError();
         closesocket(s);
@@ -135,9 +148,12 @@ bool IocpBackend::listen(const char *host, uint16_t port, int backlog) noexcept 
      * hecho.  Quien dijo cero queria decir "cualquiera", y el unico sitio donde
      * existe la respuesta es este.
      * \~ */
-    int len = sizeof addr;
-    if (getsockname(s, reinterpret_cast<sockaddr *>(&addr), &len) == 0)
-        port_ = ntohs(addr.sin_port);
+    WinAddress name;
+    int len = sizeof name.raw;
+    if (getsockname(s, reinterpret_cast<sockaddr *>(&name.raw), &len) == 0)
+        port_ = ntohs(name.raw.v4.sin_port);
+    static_assert(offsetof(sockaddr_in, sin_port) == offsetof(sockaddr_in6, sin6_port),
+                  "the port is read from the same place for both families");
 
     /* \~english
      * `AcceptEx` is not in any library: it is asked of the socket at run time,
@@ -171,6 +187,7 @@ bool IocpBackend::listen(const char *host, uint16_t port, int backlog) noexcept 
 
     accept_fn_ = reinterpret_cast<void *>(fn);
     listener_ = static_cast<uintptr_t>(s);
+    listener_family_ = addr.family;
     return true;
 }
 
@@ -213,7 +230,18 @@ bool IocpBackend::start_accept(const Op &op, Context *c) noexcept {
 
     if (listener_ == kNoSocket || accept_fn_ == nullptr) return false;
 
-    c->sock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+    /* \~english
+     * The socket accepted into is made of the listener's family.  The Windows
+     * this was tried on accepts a v4 socket for a v6 listener as well, but
+     * that is not written anywhere, and a socket that matches the one it is
+     * accepted from is the one nothing has to tolerate.
+     * \~spanish
+     * El socket en el que se acepta se hace de la familia del de escucha.  El
+     * Windows en el que se probo acepta tambien un socket v4 para uno de escucha
+     * v6, pero eso no esta escrito en ningun sitio, y un socket que coincide con
+     * aquel del que se acepta es el que nadie tiene que tolerar.
+     * \~ */
+    c->sock = WSASocketW(listener_family_, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
                          WSA_FLAG_OVERLAPPED);
     if (c->sock == INVALID_SOCKET) {
         last_error_ = WSAGetLastError();

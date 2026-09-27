@@ -74,6 +74,28 @@ struct Options {
     void parse(int argc, char **argv) noexcept;
 };
 
+/**
+ * @brief
+ * \~english A host and a port as a URL writes them: `[::1]:443` for v6, `127.0.0.1:443` for v4.
+ * \~spanish Un anfitrion y un puerto como los escribe una URL: `[::1]:443` para v6, `127.0.0.1:443` para v4.
+ * \~
+ *
+ * \~english
+ * A v6 address has colons of its own, so `::1:443` does not say where the
+ * address ends (RFC 3986, 3.2.2).
+ * \~spanish
+ * Una direccion v6 tiene sus propios dos puntos, asi que `::1:443` no dice
+ * donde acaba la direccion (RFC 3986, 3.2.2).
+ * \~
+ */
+struct Endpoint {
+    char text[80];
+};
+
+/// \~english Formats @p host and @p port; a host too long is cut, never overrun.
+/// \~spanish Formatea @p host y @p port; un anfitrion demasiado largo se corta, nunca se desborda.  \~
+Endpoint endpoint(const char *host, uint16_t port) noexcept;
+
 /// \~english Prints how the server is run, with the backends of this build.
 /// \~spanish Imprime como se ejecuta el servidor, con los backends de esta construccion.  \~
 void print_usage(std::FILE *out, const Reactors &reactors) noexcept;

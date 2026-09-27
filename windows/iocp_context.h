@@ -90,6 +90,31 @@ constexpr size_t kControlRoom = 128;
 /// \~spanish Lo que es un socket cuando no hay ninguno.  \~
 constexpr uintptr_t kNoSocket = static_cast<uintptr_t>(INVALID_SOCKET);
 
+/**
+ * @brief
+ * \~english The socket address a host and a port name, in room for either family.
+ * \~spanish La direccion de socket que nombran un anfitrion y un puerto, en sitio para cualquier familia.
+ * \~
+ */
+struct WinAddress {
+    union {
+        sockaddr_in v4;
+        sockaddr_in6 v6;
+    } raw;
+    int len = 0;
+    int family = AF_INET;
+};
+
+/**
+ * @brief
+ * \~english Reads @p host as an IPv4 or IPv6 literal; the one reader for TCP and UDP.
+ * \~spanish Lee @p host como un literal IPv4 o IPv6; el unico lector para TCP y UDP.
+ * \~
+ *
+ * @return \~english false if it is neither  \~spanish false si no es ninguno  \~
+ */
+bool win_address(const char *host, uint16_t port, WinAddress &out) noexcept;
+
 /// \~english Turns a socket into the number the rest of the project uses.
 /// \~spanish Convierte un socket en el numero que usa el resto del proyecto.  \~
 inline int32_t as_fd(SOCKET s) noexcept { return static_cast<int32_t>(s); }

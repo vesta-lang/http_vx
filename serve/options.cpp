@@ -94,6 +94,14 @@ void Options::parse(int argc, char **argv) noexcept {
     if (h3 && cert == nullptr) error = "--h3 needs --tls: QUIC has no unencrypted form";
 }
 
+Endpoint endpoint(const char *host, uint16_t port) noexcept {
+    Endpoint e;
+    const bool v6 = std::strchr(host, ':') != nullptr;
+    std::snprintf(e.text, sizeof e.text, v6 ? "[%s]:%u" : "%s:%u", host,
+                  static_cast<unsigned>(port));
+    return e;
+}
+
 void print_usage(std::FILE *out, const Reactors &reactors) noexcept {
     std::fprintf(out,
                  "usage: http_vx_listen [--tls CERT KEY [--tls-provider NAME] [--h3]]\n"

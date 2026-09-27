@@ -300,8 +300,8 @@ int main(int argc, char **argv) {
 
     if (!reactors.make(want, shard.buffers(), cfg.connections, host, port)) {
         std::fprintf(stderr,
-                     "http_vx: cannot listen on %s:%u with %s (error %d)\n",
-                     host, static_cast<unsigned>(port), want, reactors.error());
+                     "http_vx: cannot listen on %s with %s (error %d)\n",
+                     serve::endpoint(host, port).text, want, reactors.error());
         return 1;
     }
 
@@ -310,8 +310,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::fprintf(stderr, "http_vx: listening on %s:%u, %s backend\n", host,
-                 static_cast<unsigned>(reactors.port()), reactors.io()->name());
+    std::fprintf(stderr, "http_vx: listening on %s, %s backend\n",
+                 serve::endpoint(host, reactors.port()).text, reactors.io()->name());
 
     // \~english HTTP/3: the same identity as TLS over TCP, on UDP at the port TCP got.
     // \~spanish HTTP/3: la misma identidad que TLS sobre TCP, sobre UDP en el puerto que obtuvo TCP.  \~
@@ -320,8 +320,8 @@ int main(int argc, char **argv) {
         http_vx::NetAddress bound;
         const int32_t udp = reactors.open_udp(host, reactors.port(), bound);
         if (udp < 0) {
-            std::fprintf(stderr, "http_vx: cannot open UDP on %s:%u (error %d)\n", host,
-                         static_cast<unsigned>(reactors.port()), reactors.error());
+            std::fprintf(stderr, "http_vx: cannot open UDP on %s (error %d)\n",
+                         serve::endpoint(host, reactors.port()).text, reactors.error());
             return 1;
         }
         http_vx::DatagramConfig dcfg;
@@ -332,8 +332,8 @@ int main(int argc, char **argv) {
                          h3.why() != nullptr ? h3.why() : "the shard would not take the datagram side");
             return 1;
         }
-        std::fprintf(stderr, "http_vx: HTTP/3 on udp %s:%u, 0-RTT after the replay window (%llu s)\n", host,
-                     static_cast<unsigned>(reactors.port()),
+        std::fprintf(stderr, "http_vx: HTTP/3 on udp %s, 0-RTT after the replay window (%llu s)\n",
+                     serve::endpoint(host, reactors.port()).text,
                      static_cast<unsigned long long>(serve::H3Setup::kReplayWindowMs / 1000));
     }
     serve::Report report;

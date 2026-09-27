@@ -191,6 +191,7 @@ void IocpBackend::release() noexcept {
     failed_count_ = 0;
     accept_fn_ = nullptr;
     port_ = 0;
+    listener_family_ = 0;
 
     if (started_) {
         WSACleanup();

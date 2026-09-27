@@ -14,6 +14,7 @@
  */
 
 #include "datagram_linux.h"
+#include "socket_open.h"
 
 #include "http_vx/reactor_ops.h"
 
@@ -74,25 +75,9 @@ int open_socket(const char *host, uint16_t port, bool nonblock,
                 NetAddress &bound, int32_t &error) noexcept {
     bound.len = 0;
 
-    sockaddr_in6 addr;
-    util::vesta_memset(&addr, 0, sizeof addr);
-
-    sockaddr_in *v4 = reinterpret_cast<sockaddr_in *>(&addr);
-    int family = AF_INET;
-    socklen_t len = sizeof(sockaddr_in);
-
-    if (host != nullptr && inet_pton(AF_INET, host, &v4->sin_addr) == 1) {
-        v4->sin_family = AF_INET;
-        v4->sin_port = htons(port);
-    } else if (host != nullptr && inet_pton(AF_INET6, host, &addr.sin6_addr) == 1) {
-        family = AF_INET6;
-        len = sizeof addr;
-        addr.sin6_family = AF_INET6;
-        addr.sin6_port = htons(port);
-    } else {
-        error = EINVAL;
-        return -1;
-    }
+    SocketAddress where;
+    if (!socket_address(host, port, where, error)) return -1;
+    const int family = where.family;
 
     const int s = ::socket(family,
                            SOCK_DGRAM | SOCK_CLOEXEC | (nonblock ? SOCK_NONBLOCK : 0),
@@ -123,7 +108,7 @@ int open_socket(const char *host, uint16_t port, bool nonblock,
     const bool v6 = family == AF_INET6;
     const bool fine =
         (!v6 || setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on) == 0) &&
-        bind(s, reinterpret_cast<const sockaddr *>(&addr), len) == 0 &&
+        bind(s, reinterpret_cast<const sockaddr *>(&where.raw), where.len) == 0 &&
         setsockopt(s, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
                    v6 ? IPV6_RECVPKTINFO : IP_PKTINFO, &on, sizeof on) == 0 &&
         setsockopt(s, v6 ? IPPROTO_IPV6 : IPPROTO_IP,

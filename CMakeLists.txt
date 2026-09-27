@@ -388,6 +388,7 @@ target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
 # ---------------------------------------------------------------------------
 if (WIN32)
     add_library(http_vx_windows STATIC
+            windows/iocp_address.cpp
             windows/iocp_backend.cpp
             windows/iocp_datagram.cpp
             windows/iocp_release.cpp)
@@ -413,6 +414,7 @@ if (UNIX)
             linux/epoll_backend.cpp
             linux/epoll_datagram.cpp
             linux/epoll_ready.cpp
+            linux/socket_open.cpp
             linux/uring_backend.cpp
             linux/uring_datagram.cpp)
     target_include_directories(http_vx_linux
