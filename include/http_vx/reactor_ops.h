@@ -268,7 +268,6 @@ struct Op {
 
     /// \~english Which pooled buffer, or @c kNoBuffer when there is none.
     /// \~spanish Que buffer del pozo, o @c kNoBuffer cuando no hay.  \~
-    /// \~spanish Que buffer del pozo, o @c kNoBuffer cuando no hay.  \~
     uint32_t buffer = kNoBuffer;
 
     /**

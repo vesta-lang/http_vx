@@ -810,29 +810,11 @@ class Echo final : public http_vx::DatagramService {
 
 /**
  * @brief
- * \~english No stream service is used; the shard needs one to be made.
- * \~spanish No se usa ningun servicio de flujos; el fragmento necesita uno para hacerse.
- * \~
- */
-class NoStreams final : public http_vx::Service {
-  public:
-    bool on_bytes(http_vx::ConnHandle c, http_vx::Buffer &in,
-                  http_vx::Buffer &out) noexcept override {
-        (void)c;
-        (void)in;
-        (void)out;
-        return false;
-    }
-};
-
-/**
- * @brief
  * \~english A datagram service driven by the shard over a real socket, end to end.
  * \~spanish Un servicio de datagramas movido por el fragmento sobre un socket de verdad, de punta a punta.
  * \~
  */
 void test_a_shard_serves_datagrams(Which which, const Family &f) {
-    NoStreams streams;
     Echo echo;
     http_vx::Shard shard;
 
@@ -856,7 +838,7 @@ void test_a_shard_serves_datagrams(Which which, const Family &f) {
     cfg.connections = 4;
     cfg.buffers = 32;
     cfg.idle_ticks = 100;
-    check(shard.reset(cfg, *io, streams, 0), "the shard would not start");
+    check(shard.reset(cfg, *io, 0), "the shard would not start");
 
     http_vx::DatagramConfig dc;
     dc.receives = 4;

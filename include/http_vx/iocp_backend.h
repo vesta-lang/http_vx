@@ -224,11 +224,70 @@ class IocpBackend final : public Backend {
     /// \~spanish Cuantas operaciones tiene el nucleo.  \~
     size_t in_flight() const noexcept { return in_flight_; }
 
-    /// \~english Gives everything back and stops listening.
-    /// \~spanish Devuelve todo y deja de escuchar.  \~
+    /**
+     * @brief
+     * \~english How many operations @c release had to leave with the kernel.
+     * \~spanish Cuantas operaciones tuvo que dejarle @c release al nucleo.
+     * \~
+     *
+     * \~english
+     * Zero unless the kernel did not give back, in time, operations that were
+     * cancelled.  Their records are then deliberately NOT freed -- the kernel
+     * may still write into them -- and this says how many were left, across
+     * every @c release: a number that is not zero is memory kept on purpose
+     * and a sign that something did not answer a cancellation.
+     * \~spanish
+     * Cero salvo que el nucleo no devolviera a tiempo operaciones canceladas.
+     * Sus registros NO se liberan entonces, a proposito -- el nucleo todavia
+     * puede escribir en ellos --, y esto dice cuantas se quedaron, sumando todos
+     * los @c release: un numero que no es cero es memoria guardada a proposito y
+     * la senal de que algo no contesto a una cancelacion.
+     * \~
+     */
+    uint64_t stranded() const noexcept { return stranded_; }
+
+    /**
+     * @brief
+     * \~english Gives everything back and stops listening.
+     * \~spanish Devuelve todo y deja de escuchar.
+     * \~
+     *
+     * \~english
+     * Everything the kernel holds is cancelled and WAITED for before a record
+     * is freed, including reads and writes on sockets that belong to the
+     * caller: until its completion is taken, an operation still names its
+     * record and its buffer, and the kernel writes into both whenever it
+     * finishes.  The caller's sockets stay open.
+     * \~spanish
+     * Todo lo que tiene el nucleo se cancela y se ESPERA antes de liberar un
+     * registro, incluidas las lecturas y escrituras en sockets que son de quien
+     * llama: hasta que se recoge su finalizacion, una operacion sigue nombrando
+     * su registro y su buffer, y el nucleo escribe en los dos cuando acaba.  Los
+     * sockets de quien llama siguen abiertos.
+     * \~
+     */
     void release() noexcept;
 
   private:
+    /// \~english Cancels every operation the kernel holds on a caller's socket.
+    /// \~spanish Cancela toda operacion que tenga el nucleo en un socket de quien llama.  \~
+    void cancel_pending() noexcept;
+
+    /**
+     * @brief
+     * \~english Takes back from the port every operation still held.
+     * \~spanish Recoge del puerto toda operacion que siga pendiente.
+     * \~
+     *
+     * @return \~english false, with @c last_error set, if the kernel stopped answering first
+     *         \~spanish false, con @c last_error puesto, si el nucleo dejo de contestar antes  \~
+     */
+    bool drain() noexcept;
+
+    /// \~english Operations left with the kernel by @c release.
+    /// \~spanish Operaciones que @c release le dejo al nucleo.  \~
+    uint64_t stranded_ = 0;
+
     /**
      * \~english
      * One operation the kernel is holding.  Defined in the translation unit,

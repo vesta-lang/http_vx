@@ -86,6 +86,10 @@ constexpr size_t kAddressRoom = sizeof(sockaddr_in6) + 16;
  */
 constexpr size_t kControlRoom = 128;
 
+/// \~english What a socket handle is when there is none.
+/// \~spanish Lo que es un socket cuando no hay ninguno.  \~
+constexpr uintptr_t kNoSocket = static_cast<uintptr_t>(INVALID_SOCKET);
+
 /// \~english Turns a socket into the number the rest of the project uses.
 /// \~spanish Convierte un socket en el numero que usa el resto del proyecto.  \~
 inline int32_t as_fd(SOCKET s) noexcept { return static_cast<int32_t>(s); }
@@ -136,6 +140,19 @@ struct IocpBackend::Context {
 
     /// \~english The next free record.  \~spanish El registro libre siguiente.  \~
     uint32_t next;
+
+    /**
+     * \~english
+     * Whether the kernel holds it.  What @c release asks to know which
+     * operations to cancel: the free list says which records are free, not
+     * which are taken.
+     * \~spanish
+     * Si lo tiene el nucleo.  Lo que pregunta @c release para saber que
+     * operaciones cancelar: la lista libre dice que registros estan libres, no
+     * cuales estan cogidos.
+     * \~
+     */
+    bool busy;
 
     /**
      * \~english

@@ -115,6 +115,7 @@ add_library(http_vx_core STATIC
         reactor/memory_datagram.cpp
         reactor/shard.cpp
         reactor/shard_datagram.cpp
+        reactor/shard_streamless.cpp
         reactor/stdio_backend.cpp
         reactor/timer_wheel.cpp
 )
@@ -388,7 +389,8 @@ target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
 if (WIN32)
     add_library(http_vx_windows STATIC
             windows/iocp_backend.cpp
-            windows/iocp_datagram.cpp)
+            windows/iocp_datagram.cpp
+            windows/iocp_release.cpp)
     target_include_directories(http_vx_windows
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PUBLIC ${HTTP_VX_ALLOC_INCLUDE})
@@ -410,6 +412,7 @@ if (UNIX)
             linux/datagram_linux.cpp
             linux/epoll_backend.cpp
             linux/epoll_datagram.cpp
+            linux/epoll_ready.cpp
             linux/uring_backend.cpp
             linux/uring_datagram.cpp)
     target_include_directories(http_vx_linux
@@ -678,6 +681,19 @@ if (HTTP_VX_BUILD_TESTS)
     else ()
         target_link_libraries(test_socket_datagram PRIVATE http_vx_linux)
     endif ()
+
+    # Lo que cada backend debe no perder nunca, con las piezas que solo tiene el:
+    # la lista de finalizaciones de epoll, y lo que IOCP tiene que esperar al
+    # soltar.
+    if (WIN32)
+        http_vx_add_test(test_iocp_release tests/test_iocp_release.cpp)
+        target_link_libraries(test_iocp_release PRIVATE http_vx_windows)
+    else ()
+        http_vx_add_test(test_epoll_ready tests/test_epoll_ready.cpp)
+        target_link_libraries(test_epoll_ready PRIVATE http_vx_linux)
+    endif ()
+
+    http_vx_add_test(test_shard_streamless tests/test_shard_streamless.cpp)
 endif ()
 
 # ---------------------------------------------------------------------------

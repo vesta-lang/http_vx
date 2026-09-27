@@ -111,6 +111,9 @@ struct OpRing {
         head = (head + 1) % kDgramQueue;
         --count;
     }
+
+    /// \~english Takes back the one pushed last.  \~spanish Retira el ultimo metido.  \~
+    void unpush() noexcept { --count; }
 };
 
 } // namespace
@@ -210,7 +213,22 @@ bool EpollBackend::dgram_submit(const Op &op, int32_t i) noexcept {
         if (d.receives.full()) return false;
         d.receives.push(op);
         ++in_flight_;
-        arm(d.fd);
+
+        /* \~english
+         * A receive the queue will not watch for is refused, and what already
+         * waited on the socket fails: left there, it would wait for a
+         * readiness nobody is going to report.
+         * \~spanish
+         * Una recepcion por la que la cola no quiere vigilar se rechaza, y lo que
+         * ya esperaba en el socket falla: dejado ahi, esperaria una
+         * disponibilidad que no va a informar nadie.
+         * \~ */
+        if (!arm(d.fd)) {
+            d.receives.unpush();
+            --in_flight_;
+            dgram_fail(i);
+            return false;
+        }
         return true;
     }
 
@@ -240,17 +258,14 @@ void EpollBackend::dgram_flush(int32_t i) noexcept {
 
     while (d.sends.count != 0) {
         /* \~english
-         * No more than there is room to report: a datagram sent with nowhere
-         * to say so would leave its buffer with the kernel's word and the
-         * loop's ignorance.
+         * All of them: each was given room in the ready list when it was
+         * accepted, so a datagram sent here always has somewhere to be
+         * reported.
          * \~spanish
-         * No mas de las que hay sitio para informar: un datagrama mandado sin
-         * donde decirlo dejaria su buffer con la palabra del nucleo y la
-         * ignorancia del bucle.
+         * Todos: a cada uno se le dio sitio en la lista de listas al aceptarlo,
+         * asi que un datagrama mandado aqui siempre tiene donde informarse.
          * \~ */
-        size_t n = d.sends.count;
-        if (n > 256 - ready_count_) n = 256 - ready_count_;
-        if (n == 0) return;
+        const size_t n = d.sends.count;
 
         size_t k = 0;
         while (k < n) {
@@ -289,7 +304,7 @@ void EpollBackend::dgram_flush(int32_t i) noexcept {
         if (sent < 0) {
             if (not_now(errno)) {
                 d.blocked = true;
-                arm(d.fd);
+                if (!arm(d.fd)) dgram_fail(i);
                 return;
             }
 
@@ -404,15 +419,21 @@ size_t EpollBackend::dgram_ready(int32_t i, bool readable, bool writable,
     return made;
 }
 
-void EpollBackend::dgram_close(int32_t i) noexcept {
+void EpollBackend::dgram_fail(int32_t i) noexcept {
     DgramSocket &d = dgram_[i];
 
     /* \~english
      * Everything waiting is answered, as a failure: each holds a buffer, and
-     * an operation never answered is a buffer never given back.
+     * an operation never answered is a buffer never given back.  Into the
+     * ready list, which has room for every one of them (see @c ready_) --
+     * this is the path that used to lose them, closing a socket with a full
+     * queue into a list with 256 places.
      * \~spanish
      * Todo lo que espera se contesta, como fallo: cada una tiene un buffer, y
      * una operacion que no se contesta nunca es un buffer que no vuelve nunca.
+     * A la lista de listas, que tiene sitio para todas (ver @c ready_) -- este
+     * es el camino que las perdia, al cerrar un socket con la cola llena en una
+     * lista de 256 sitios.
      * \~ */
     while (d.receives.count != 0) {
         remember(d.receives.at(0), -1, -1);
@@ -424,6 +445,13 @@ void EpollBackend::dgram_close(int32_t i) noexcept {
         d.sends.pop();
         --in_flight_;
     }
+    d.blocked = false;
+}
+
+void EpollBackend::dgram_close(int32_t i) noexcept {
+    DgramSocket &d = dgram_[i];
+
+    dgram_fail(i);
 
     if (d.fd >= 0 && static_cast<uint32_t>(d.fd) < max_fds_)
         waiting_[d.fd].dgram = -1;

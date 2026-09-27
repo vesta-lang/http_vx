@@ -208,6 +208,23 @@ class EpollBackend final : public Backend {
     /// \~spanish Cuantas operaciones esperan a que un socket este listo.  \~
     size_t in_flight() const noexcept { return in_flight_; }
 
+    /**
+     * @brief
+     * \~english How many submissions were refused because the memory to complete them could not be had.
+     * \~spanish Cuantas entregas se rechazaron porque no se pudo conseguir la memoria para acabarlas.
+     * \~
+     *
+     * \~english
+     * The only refusal that is not a caller's mistake or a socket's answer,
+     * and so counted apart: a server where this moves is out of memory.
+     * \~spanish
+     * El unico rechazo que no es un error de quien llama ni la respuesta de un
+     * socket, y por eso contado aparte: un servidor donde esto se mueve se ha
+     * quedado sin memoria.
+     * \~
+     */
+    uint64_t refused() const noexcept { return refused_; }
+
     /// \~english Gives everything back and stops listening.
     /// \~spanish Devuelve todo y deja de escuchar.  \~
     void release() noexcept;
@@ -232,9 +249,9 @@ class EpollBackend final : public Backend {
     /// \~spanish Hace lo que pide @p op, ahora, si el socket deja.  \~
     int try_now(const Op &op) noexcept;
 
-    /// \~english Remembers a completion that is already true.
-    /// \~spanish Recuerda una finalizacion que ya es cierta.  \~
-    bool remember(const Op &op, int32_t result, int32_t fd) noexcept;
+    /// \~english Remembers a completion that is already true; there is always room (see @c ready_).
+    /// \~spanish Recuerda una finalizacion que ya es cierta; siempre hay sitio (ver @c ready_).  \~
+    void remember(const Op &op, int32_t result, int32_t fd) noexcept;
 
     /// \~english Keeps @p op until its socket is ready.
     /// \~spanish Guarda @p op hasta que su socket este listo.  \~
@@ -292,6 +309,10 @@ class EpollBackend final : public Backend {
     size_t dgram_ready(int32_t i, bool readable, bool writable, Completion *out,
                        size_t room) noexcept;
 
+    /// \~english Fails everything waiting on socket @p i, which stays open.
+    /// \~spanish Hace fallar todo lo que espera en el socket @p i, que sigue abierto.  \~
+    void dgram_fail(int32_t i) noexcept;
+
     /// \~english Fails everything waiting on socket @p i and forgets it.
     /// \~spanish Hace fallar todo lo que espera en el socket @p i y lo olvida.  \~
     void dgram_close(int32_t i) noexcept;
@@ -318,19 +339,69 @@ class EpollBackend final : public Backend {
 
     /**
      * \~english
-     * The completions that were already true when they were asked for.  Fixed,
-     * and when it is full the operation is parked instead of tried -- which
-     * costs a turn of the loop and cannot be wrong, rather than costing a
-     * completion that nobody would ever be told about.
+     * The completions that are true and not yet handed out, as a ring.
+     *
+     * **It always has room for every operation this backend has accepted**:
+     * the ones already in it plus every one still waiting (@c in_flight_).
+     * The room is made when an operation is ACCEPTED -- the one moment a
+     * refusal can still be said, by @c submit returning false with nothing
+     * done -- and never when a completion has to be written.  A fixed list
+     * that could fill up lost completions exactly when it mattered most: a
+     * datagram socket closed with a hundred receives waiting answered them
+     * into a list with no room, and each one lost was a pooled buffer that
+     * never came back.
      * \~spanish
-     * Las finalizaciones que ya eran ciertas cuando se pidieron.  Fija, y cuando
-     * esta llena la operacion se guarda en vez de intentarse -- lo que cuesta una
-     * vuelta del bucle y no puede estar mal, en vez de costar una finalizacion de
-     * la que no se enteraria nadie.
+     * Las finalizaciones que son ciertas y no se han entregado, en anillo.
+     *
+     * **Siempre tiene sitio para toda operacion que este backend ha aceptado**:
+     * las que ya estan en el mas todas las que siguen esperando
+     * (@c in_flight_).  El sitio se hace cuando se ACEPTA una operacion -- el
+     * unico momento en que todavia se puede decir que no, con un @c submit que
+     * devuelve false sin haber hecho nada -- y nunca cuando hay que escribir una
+     * finalizacion.  Una lista fija que se podia llenar perdia finalizaciones
+     * justo cuando mas importaba: un socket de datagramas cerrado con cien
+     * recepciones esperando las contestaba en una lista sin sitio, y cada una
+     * perdida era un buffer del pozo que no volvia nunca.
      * \~
      */
-    Completion ready_[256];
+    Completion *ready_ = nullptr;
+    size_t ready_room_ = 0;
+    size_t ready_head_ = 0;
     size_t ready_count_ = 0;
+
+    /// \~english Submissions refused because no room could be had.
+    /// \~spanish Entregas rechazadas porque no se pudo conseguir sitio.  \~
+    uint64_t refused_ = 0;
+
+    /**
+     * @brief
+     * \~english Makes sure one more accepted operation has room to complete.
+     * \~spanish Se asegura de que una operacion aceptada mas tiene sitio para acabar.
+     * \~
+     *
+     * @return \~english false, counted and with @c last_error set, if the memory could not be had
+     *         \~spanish false, contado y con @c last_error puesto, si no se pudo conseguir la memoria  \~
+     */
+    bool make_room() noexcept;
+
+    /// \~english Gives the ready list back.  \~spanish Devuelve la lista de listas.  \~
+    void drop_ready() noexcept;
+
+    /**
+     * @brief
+     * \~english Fails whatever still waits on stream socket @p fd.
+     * \~spanish Hace fallar lo que todavia espera en el socket de flujo @p fd.
+     * \~
+     *
+     * \~english
+     * For when the queue refused to watch @p fd: an operation left waiting on
+     * a socket nobody watches would wait for ever.
+     * \~spanish
+     * Para cuando la cola se nego a vigilar @p fd: una operacion que se quedara
+     * esperando en un socket que no vigila nadie esperaria para siempre.
+     * \~
+     */
+    void fail_waiting(int32_t fd) noexcept;
 
     uint16_t port_ = 0;
     int32_t last_error_ = 0;

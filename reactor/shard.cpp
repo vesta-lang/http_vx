@@ -36,11 +36,27 @@ bool closing(const ConnHot &h) noexcept { return (h.flags & kClosing) != 0; }
 
 bool Shard::reset(const ShardConfig &cfg, Backend &io, Service &service,
                   uint64_t now) noexcept {
+    return start(cfg, io, &service, now);
+}
+
+bool Shard::start(const ShardConfig &cfg, Backend &io, Service *service,
+                  uint64_t now) noexcept {
     release();
+
+    /* \~english
+     * Accepting with nothing to hand a connection to is a configuration that
+     * cannot work, and it is refused as one: every accept would open a socket
+     * only to close it.
+     * \~spanish
+     * Aceptar sin nadie a quien dar una conexion es una configuracion que no
+     * puede funcionar, y se rechaza como tal: cada aceptacion abriria un socket
+     * solo para cerrarlo.
+     * \~ */
+    if (service == nullptr && cfg.accepts != 0) return false;
 
     cfg_ = cfg;
     io_ = &io;
-    service_ = &service;
+    service_ = service;
 
     if (!conns_.reset(cfg.connections)) return false;
     if (!pool_.reset(cfg.buffers, cfg.buffer_ceiling)) return false;
@@ -151,6 +167,7 @@ void Shard::release() noexcept {
     wheel_.release();
     io_ = nullptr;
     service_ = nullptr;
+    counts_ = ShardCounts();
 }
 
 void Shard::drop_queue(ConnHot &h) noexcept {
@@ -473,6 +490,18 @@ void Shard::send_next(ConnHandle c, ConnHot &h) noexcept {
 
 ConnHandle Shard::adopt(int32_t fd, uint64_t now) noexcept {
     (void)now;
+
+    /* \~english
+     * No stream side, no connection: the caller keeps the socket, as when
+     * the table is full, and the refusal is counted apart from a full table.
+     * \~spanish
+     * Sin lado de flujos no hay conexion: el socket se lo queda quien llama,
+     * como con la tabla llena, y el rechazo se cuenta aparte de una tabla llena.
+     * \~ */
+    if (service_ == nullptr) {
+        ++counts_.refused_adoptions;
+        return ConnHandle();
+    }
 
     const ConnHandle c = conns_.open(fd, now);
     if (!c.valid()) return c;
@@ -893,6 +922,19 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
     const size_t made = io_->wait(done, cap, timeout_ms);
 
     for (size_t i = 0; i < made; ++i) {
+        /* \~english
+         * A shard with no stream side has nobody to hand a stream completion
+         * to, and dropping it would drop its buffer or its socket.
+         * \~spanish
+         * Un fragmento sin lado de flujos no tiene a quien dar una finalizacion
+         * de flujo, y tirarla tiraria su buffer o su socket.
+         * \~ */
+        if (service_ == nullptr && done[i].kind != OpKind::RecvFrom &&
+            done[i].kind != OpKind::SendTo && done[i].kind != OpKind::Close) {
+            unserved(done[i]);
+            continue;
+        }
+
         switch (done[i].kind) {
         case OpKind::Ready:
             on_ready(done[i]);

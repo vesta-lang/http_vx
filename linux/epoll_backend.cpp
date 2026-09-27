@@ -70,6 +70,16 @@ bool not_now(int e) noexcept {
 #endif
 }
 
+/// \~english Writes into @p c that @p op failed.
+/// \~spanish Escribe en @p c que @p op fallo.  \~
+void answer_failed(Completion &c, const Op &op) noexcept {
+    c.conn = op.conn;
+    c.kind = op.kind;
+    c.buffer = op.buffer;
+    c.result = -1;
+    c.fd = -1;
+}
+
 } // namespace
 
 EpollBackend::~EpollBackend() { release(); }
@@ -93,9 +103,10 @@ void EpollBackend::release() noexcept {
         waiting_ = nullptr;
     }
 
+    drop_ready();
+
     max_fds_ = 0;
     in_flight_ = 0;
-    ready_count_ = 0;
     port_ = 0;
 }
 
@@ -132,7 +143,7 @@ bool EpollBackend::reset(BufferPool &pool, uint32_t max_fds) noexcept {
         waiting_[i].dgram = -1;
     }
 
-    if (!dgram_reset()) {
+    if (!dgram_reset() || !make_room()) {
         release();
         return false;
     }
@@ -199,19 +210,6 @@ bool EpollBackend::listen(const char *host, uint16_t port, int backlog) noexcept
     }
 
     listener_ = s;
-    return true;
-}
-
-bool EpollBackend::remember(const Op &op, int32_t result, int32_t fd) noexcept {
-    if (ready_count_ == 256) return false;
-
-    Completion &c = ready_[ready_count_];
-    c.conn = op.conn;
-    c.kind = op.kind;
-    c.buffer = op.buffer;
-    c.result = result;
-    c.fd = fd;
-    ++ready_count_;
     return true;
 }
 
@@ -333,7 +331,24 @@ bool EpollBackend::park(const Op &op) noexcept {
     ++in_flight_;
 
     if (!arm(op.fd)) {
-        forget(op.fd);
+        /* \~english
+         * This one is refused -- the caller still holds it and hears "no" --
+         * and whatever ALREADY waited on the socket is failed, into the ready
+         * list, where it has room.  It used to be forgotten along with this
+         * one: an accepted operation that simply stopped existing, its buffer
+         * with it.
+         * \~spanish
+         * Esta se rechaza -- quien llama la sigue teniendo y oye "no" -- y lo
+         * que YA esperaba en el socket se hace fallar, a la lista de listas,
+         * donde tiene sitio.  Antes se olvidaba junto con esta: una operacion
+         * aceptada que dejaba de existir sin mas, y su buffer con ella.
+         * \~ */
+        if (reads(op.kind))
+            w.has_read = false;
+        else
+            w.has_write = false;
+        --in_flight_;
+        fail_waiting(op.fd);
         return false;
     }
 
@@ -472,6 +487,23 @@ bool EpollBackend::submit(const Op &want) noexcept {
      * \~ */
     if (op.kind == OpKind::Accept) op.fd = listener_;
 
+    /* \~english
+     * Room for this operation's completion is made FIRST, before anything is
+     * done: after this line every path below either completes it or keeps it
+     * waiting, and both have somewhere to report to.  The one refusal left is
+     * here, with nothing touched -- a @c Close that had already closed its
+     * socket and then said "no room" would be retried on a number the system
+     * may by then have given to somebody else.
+     * \~spanish
+     * El sitio para la finalizacion de esta operacion se hace PRIMERO, antes de
+     * hacer nada: a partir de esta linea todos los caminos de abajo o la acaban o
+     * la dejan esperando, y los dos tienen donde informar.  El unico rechazo que
+     * queda esta aqui, sin haber tocado nada -- un @c Close que ya hubiera
+     * cerrado su socket y despues dijera "no hay sitio" se reintentaria sobre un
+     * numero que el sistema puede haberle dado ya a otro.
+     * \~ */
+    if (!make_room()) return false;
+
     if (op.kind == OpKind::Close) {
         /* \~english
          * Everything this socket was waiting for is forgotten BEFORE it is
@@ -492,12 +524,14 @@ bool EpollBackend::submit(const Op &want) noexcept {
             forget(op.fd);
             ::close(op.fd);
         }
-        return remember(op, 0, -1);
+        remember(op, 0, -1);
+        return true;
     }
 
     if (op.fd < 0 || static_cast<uint32_t>(op.fd) >= max_fds_) {
         last_error_ = EBADF;
-        return remember(op, -1, -1);
+        remember(op, -1, -1);
+        return true;
     }
 
     /* \~english
@@ -520,12 +554,14 @@ bool EpollBackend::submit(const Op &want) noexcept {
             ++dgram_counts_.receive_errors;
         else
             ++dgram_counts_.send_errors;
-        return remember(op, -1, -1);
+        remember(op, -1, -1);
+        return true;
     }
 
     if (waiting_[op.fd].dgram >= 0) {
         last_error_ = EINVAL;
-        return remember(op, -1, -1);
+        remember(op, -1, -1);
+        return true;
     }
 
     /* \~english
@@ -554,18 +590,14 @@ bool EpollBackend::submit(const Op &want) noexcept {
     if (op.kind == OpKind::Ready) return park(op);
 
     /* \~english
-     * With no room to report a completion, the operation is PARKED rather than
-     * tried.  Doing it and having nowhere to say so would lose bytes that had
-     * already left a socket, and nothing would ever ask for them again; waiting
-     * costs a turn of the loop and cannot be wrong.
+     * Tried at once, even with completions piling up: the room for this one
+     * was made above, so doing it now can never leave bytes that moved with
+     * nowhere to say so.
      * \~spanish
-     * Sin sitio para dar una finalizacion, la operacion se GUARDA en vez de
-     * intentarse.  Hacerla y no tener donde decirlo perderia unos bytes que ya
-     * habian salido de un socket, y no volveria a pedirlos nadie; esperar cuesta
-     * una vuelta del bucle y no puede estar mal.
+     * Se intenta en el acto, aunque se amontonen finalizaciones: el sitio para
+     * esta se hizo arriba, asi que hacerla ahora no puede dejar nunca unos bytes
+     * que se movieron sin donde decirlo.
      * \~ */
-    if (ready_count_ == 256) return park(op);
-
     const int n = try_now(op);
 
     if (n >= 0) {
@@ -573,36 +605,21 @@ bool EpollBackend::submit(const Op &want) noexcept {
             if (static_cast<uint32_t>(n) >= max_fds_) {
                 ::close(n);
                 last_error_ = EMFILE;
-                return remember(op, -1, -1);
+                remember(op, -1, -1);
+                return true;
             }
-            return remember(op, 0, n);
+            remember(op, 0, n);
+            return true;
         }
-        return remember(op, n, -1);
+        remember(op, n, -1);
+        return true;
     }
 
     if (not_now(errno)) return park(op);
 
     last_error_ = errno;
-    return remember(op, -1, -1);
-}
-
-size_t EpollBackend::take_ready(Completion *out, size_t cap,
-                                size_t made) noexcept {
-    size_t taken = 0;
-
-    while (made < cap && taken < ready_count_) {
-        out[made] = ready_[taken];
-        ++made;
-        ++taken;
-    }
-
-    if (taken != 0) {
-        for (size_t i = taken; i < ready_count_; ++i)
-            ready_[i - taken] = ready_[i];
-        ready_count_ -= taken;
-    }
-
-    return made;
+    remember(op, -1, -1);
+    return true;
 }
 
 size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
@@ -701,7 +718,7 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
         if (w.dgram >= 0) {
             made += dgram_ready(w.dgram, readable, writable, out + made,
                                 cap - made);
-            arm(fd);
+            if (!arm(fd)) fail_waiting(fd);
             continue;
         }
 
@@ -722,8 +739,17 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
                  * Listo y luego no: otra finalizacion de este mismo lote se llevo
                  * los bytes, o el nucleo cambio de idea.  Vuelve a esperar, que es
                  * la unica respuesta que no se inventa un resultado.
+                 *
+                 * \~english
+                 * And if the queue will not watch it again, it is answered
+                 * here as a failure rather than dropped: it was accepted, and
+                 * its slot in @p out is still free.
+                 * \~spanish
+                 * Y si la cola no lo quiere volver a vigilar, se contesta aqui
+                 * como fallo en vez de tirarla: se acepto, y su sitio en @p out
+                 * sigue libre.
                  * \~ */
-                park(op);
+                if (!park(op)) answer_failed(out[made++], op);
             } else if (op.kind == OpKind::Accept) {
                 if (n >= 0 && static_cast<uint32_t>(n) >= max_fds_) {
                     ::close(n);
@@ -758,7 +784,7 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
             const int n = try_now(op);
 
             if (n < 0 && not_now(errno)) {
-                park(op);
+                if (!park(op)) answer_failed(out[made++], op);
             } else {
                 out[made].conn = op.conn;
                 out[made].kind = op.kind;
@@ -769,7 +795,14 @@ size_t EpollBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
             }
         }
 
-        arm(fd);
+        /* \~english
+         * Re-armed for what is still waiting; a queue that refuses fails it
+         * instead, because nothing else would ever report on it again.
+         * \~spanish
+         * Rearmado para lo que sigue esperando; una cola que se niega lo hace
+         * fallar en su lugar, porque nada mas volveria a informar de ello.
+         * \~ */
+        if (!arm(fd)) fail_waiting(fd);
     }
 
     /* \~english

@@ -332,6 +332,34 @@ struct ShardConfig {
 
 /**
  * @brief
+ * \~english What a shard refused or could not serve, each counted apart.
+ * \~spanish Lo que un fragmento rechazo o no pudo servir, cada cosa contada aparte.
+ * \~
+ */
+struct ShardCounts {
+    /**
+     * \~english
+     * Stream completions -- a read, a write, a notice, an accept -- that
+     * reached a shard with no stream side.  Each gave its buffer back and an
+     * accepted socket was closed; a number that moves means something is
+     * submitting stream operations to a shard that cannot serve them.
+     * \~spanish
+     * Finalizaciones de flujo -- una lectura, una escritura, un aviso, una
+     * aceptacion -- que llegaron a un fragmento sin lado de flujos.  Cada una
+     * devolvio su buffer y se cerro el socket aceptado; un numero que se mueve
+     * quiere decir que algo esta entregando operaciones de flujo a un fragmento
+     * que no puede servirlas.
+     * \~
+     */
+    uint64_t unserved = 0;
+
+    /// \~english Sockets @c adopt refused because there is no stream side.
+    /// \~spanish Sockets que @c adopt rechazo porque no hay lado de flujos.  \~
+    uint64_t refused_adoptions = 0;
+};
+
+/**
+ * @brief
  * \~english One thread's worth of server.
  * \~spanish Lo que le toca de servidor a un hilo.
  * \~
@@ -360,6 +388,50 @@ class Shard {
      */
     bool reset(const ShardConfig &cfg, Backend &io, Service &service,
                uint64_t now) noexcept;
+
+    /**
+     * @brief
+     * \~english Makes it ready with no stream side: a shard for datagrams only.
+     * \~spanish Lo deja listo sin lado de flujos: un fragmento solo de datagramas.
+     * \~
+     *
+     * \~english
+     * What a UDP-only server needs, followed by @c attach_datagrams.  Such a
+     * shard adopts no connection (@c adopt returns an invalid handle, counted
+     * in @c ShardCounts::refused_adoptions) and a configuration that asks it
+     * to accept is refused here, where it is a sentence.  A stream completion
+     * that reaches it anyway -- from an operation somebody else submitted --
+     * is NOT dropped: its buffer goes back, an accepted socket is closed, and
+     * it is counted in @c ShardCounts::unserved.
+     *
+     * The connection table and the deadline wheel are still made, sized by
+     * @p cfg as always; a datagram-only caller keeps @c connections small.
+     * \~spanish
+     * Lo que necesita un servidor solo UDP, seguido de @c attach_datagrams.  Un
+     * fragmento asi no adopta ninguna conexion (@c adopt devuelve una referencia
+     * invalida, contada en @c ShardCounts::refused_adoptions) y una
+     * configuracion que le pida aceptar se rechaza aqui, donde es una frase.
+     * Una finalizacion de flujo que le llegue igualmente -- de una operacion
+     * que entrego otro -- NO se tira: su buffer vuelve, un socket aceptado se
+     * cierra, y se cuenta en @c ShardCounts::unserved.
+     *
+     * La tabla de conexiones y la rueda de plazos se hacen igual, del tamano
+     * que diga @p cfg; quien solo quiera datagramas pone @c connections pequeno.
+     * \~
+     *
+     * @param cfg \~english the sizes  \~spanish los tamanos  \~
+     * @param io  \~english where operations go  \~spanish donde van las operaciones  \~
+     * @param now \~english what tick it is  \~spanish en que tic se esta  \~
+     * @return    \~english false if the memory could not be had, or @p cfg asks to accept
+     *            \~spanish false si no se pudo conseguir la memoria, o @p cfg pide aceptar  \~
+     */
+    bool reset(const ShardConfig &cfg, Backend &io, uint64_t now) noexcept;
+
+    /// \~english Whether it has a stream side.  \~spanish Si tiene lado de flujos.  \~
+    bool serves_streams() const noexcept { return service_ != nullptr; }
+
+    /// \~english What it refused or could not serve.  \~spanish Lo que rechazo o no pudo servir.  \~
+    const ShardCounts &counts() const noexcept { return counts_; }
 
     /**
      * @brief
@@ -568,6 +640,15 @@ class Shard {
     /// \~spanish Pide una conexion mas.  \~
     void want_accept() noexcept;
 
+    /// \~english What both @c reset forms do; @p service is null for no stream side.
+    /// \~spanish Lo que hacen las dos formas de @c reset; @p service es nulo sin lado de flujos.  \~
+    bool start(const ShardConfig &cfg, Backend &io, Service *service,
+               uint64_t now) noexcept;
+
+    /// \~english A stream completion on a shard with no stream side: given back, counted.
+    /// \~spanish Una finalizacion de flujo en un fragmento sin lado de flujos: devuelta, contada.  \~
+    void unserved(const Completion &done) noexcept;
+
     ConnTable conns_;
     BufferPool pool_;
     TimerWheel wheel_;
@@ -591,8 +672,12 @@ class Shard {
     uint32_t *queue_next_ = nullptr;
 
     Backend *io_ = nullptr;
+
+    /// \~english The stream side, or null for a shard of datagrams only.
+    /// \~spanish El lado de flujos, o nulo para un fragmento solo de datagramas.  \~
     Service *service_ = nullptr;
     ShardConfig cfg_;
+    ShardCounts counts_;
 };
 
 } // namespace http_vx

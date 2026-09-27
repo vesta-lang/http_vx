@@ -47,62 +47,7 @@
 
 namespace http_vx {
 
-namespace {
-
-/// \~english What a socket handle is when there is none.
-/// \~spanish Lo que es un socket cuando no hay ninguno.  \~
-constexpr uintptr_t kNoSocket = static_cast<uintptr_t>(INVALID_SOCKET);
-
-} // namespace
-
 IocpBackend::~IocpBackend() { release(); }
-
-void IocpBackend::release() noexcept {
-    if (listener_ != kNoSocket) {
-        closesocket(static_cast<SOCKET>(listener_));
-        listener_ = kNoSocket;
-    }
-
-    close_datagrams();
-
-    /* \~english
-     * The port is closed before the records are given back, and the order
-     * matters: closing it releases every operation the kernel was still
-     * holding, and a record freed while an operation named it would be the
-     * kernel writing into memory that has gone.
-     * \~spanish
-     * El puerto se cierra antes de devolver los registros, y el orden importa:
-     * cerrarlo suelta todas las operaciones que tuviera el nucleo, y un registro
-     * liberado mientras lo nombrara una operacion seria el nucleo escribiendo en
-     * una memoria que ya no esta.
-     * \~ */
-    if (iocp_ != nullptr) {
-        CloseHandle(static_cast<HANDLE>(iocp_));
-        iocp_ = nullptr;
-    }
-
-    if (contexts_ != nullptr) {
-        for (uint32_t i = 0; i < context_count_; ++i) {
-            if (contexts_[i].sock != INVALID_SOCKET)
-                closesocket(contexts_[i].sock);
-            contexts_[i].~Context();
-        }
-        util::host_free(contexts_);
-        contexts_ = nullptr;
-    }
-
-    context_count_ = 0;
-    free_head_ = 0xFFFFFFFF;
-    in_flight_ = 0;
-    failed_count_ = 0;
-    accept_fn_ = nullptr;
-    port_ = 0;
-
-    if (started_) {
-        WSACleanup();
-        started_ = false;
-    }
-}
 
 bool IocpBackend::reset(BufferPool &pool, uint32_t pending) noexcept {
     release();
@@ -139,6 +84,7 @@ bool IocpBackend::reset(BufferPool &pool, uint32_t pending) noexcept {
     for (uint32_t i = 0; i < pending; ++i) {
         new (&contexts_[i]) Context();
         contexts_[i].sock = INVALID_SOCKET;
+        contexts_[i].busy = false;
         contexts_[i].next = i + 1 == pending ? 0xFFFFFFFF : i + 1;
     }
     free_head_ = 0;
@@ -236,12 +182,14 @@ IocpBackend::Context *IocpBackend::take() noexcept {
 
     util::vesta_memset(&c->ov, 0, sizeof c->ov);
     c->sock = INVALID_SOCKET;
+    c->busy = true;
     ++in_flight_;
     return c;
 }
 
 void IocpBackend::give(Context *c) noexcept {
     c->sock = INVALID_SOCKET;
+    c->busy = false;
     c->next = free_head_;
     free_head_ = static_cast<uint32_t>(c - contexts_);
     --in_flight_;
@@ -414,6 +362,17 @@ bool IocpBackend::start_send(const Op &op, Context *c) noexcept {
 }
 
 bool IocpBackend::start_close(const Op &op) noexcept {
+    /* \~english
+     * Room to report it is looked for BEFORE the socket is closed.  A close
+     * that closed and then said "no room" would be asked for again, on a
+     * number the system may by then have given to somebody else's socket.
+     * \~spanish
+     * El sitio para contarlo se busca ANTES de cerrar el socket.  Un cierre que
+     * cerrara y despues dijera "no hay sitio" se volveria a pedir, sobre un
+     * numero que el sistema puede haberle dado ya al socket de otro.
+     * \~ */
+    if (failed_count_ == 64) return false;
+
     if (op.fd >= 0) {
         dgram_.remove(op.fd);
         closesocket(as_socket(op.fd));

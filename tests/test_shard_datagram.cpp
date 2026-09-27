@@ -142,21 +142,7 @@ class Reply final : public http_vx::DatagramService {
     uint64_t fired_at = 0;
 };
 
-/// \~english The shard takes a stream service to be made; none is used here.
-/// \~spanish El fragmento necesita un servicio de flujos para hacerse; aqui no se usa.  \~
-class NoStreams final : public http_vx::Service {
-  public:
-    bool on_bytes(http_vx::ConnHandle c, http_vx::Buffer &in,
-                  http_vx::Buffer &out) noexcept override {
-        (void)c;
-        (void)in;
-        (void)out;
-        return false;
-    }
-};
-
 struct Rig {
-    NoStreams streams;
     Reply service;
     Shard shard;
     MemoryBackend io;
@@ -169,7 +155,7 @@ struct Rig {
         cfg.buffers = buffers;
         cfg.idle_ticks = 10;
         cfg.wheel_slots = 64;
-        if (!shard.reset(cfg, io, streams, 0)) return false;
+        if (!shard.reset(cfg, io, 0)) return false;
 
         http_vx::DatagramConfig dc;
         dc.receives = receives;
@@ -452,7 +438,6 @@ void test_failures_are_counted() {
  * \~
  */
 void test_a_stray_datagram_completion_keeps_the_pool_whole() {
-    NoStreams streams;
     Shard shard;
     MemoryBackend io(shard.buffers());
 
@@ -461,7 +446,7 @@ void test_a_stray_datagram_completion_keeps_the_pool_whole() {
     cfg.buffers = 4;
     cfg.idle_ticks = 10;
     cfg.wheel_slots = 64;
-    check(shard.reset(cfg, io, streams, 0), "the shard would not start");
+    check(shard.reset(cfg, io, 0), "the shard would not start");
 
     const uint32_t b = shard.buffers().acquire();
     DatagramPath a;
