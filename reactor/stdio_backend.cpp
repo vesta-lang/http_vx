@@ -41,6 +41,29 @@
 namespace http_vx {
 
 bool StdioBackend::submit(const Op &op) noexcept {
+    /* \~english
+     * A cancel is not queued: the read outstanding for that socket is marked
+     * and completes as a failure on the next wait, having read nothing.  A
+     * read the platform already has in flight is abandoned first, so its
+     * buffer is nobody's when it comes back.
+     * \~spanish
+     * Una cancelacion no se encola: la lectura pendiente de ese socket se marca
+     * y acaba como fallo en la espera siguiente, sin haber leido nada.  Una
+     * lectura que la plataforma ya tenga en vuelo se abandona antes, para que su
+     * buffer no sea de nadie cuando vuelva.
+     * \~ */
+    if (op.kind == OpKind::Cancel) {
+        for (size_t k = 0; k < count_; ++k) {
+            Op &p = pending_[(head_ + k) % kStdioPending];
+            if ((p.kind == OpKind::Ready || p.kind == OpKind::Recv) && p.fd == op.fd) {
+                abandon_read();
+                p.fd = kCancelledFd;
+                break;
+            }
+        }
+        return true;
+    }
+
     if (count_ == kStdioPending) return false;
 
     pending_[(head_ + count_) % kStdioPending] = op;
@@ -56,9 +79,16 @@ bool StdioBackend::finish(const Op &op, Completion &c, int timeout_ms) noexcept 
 
     Buffer *b = pool_ == nullptr ? nullptr : pool_->at(op.buffer);
 
+    // \~english A cancelled read: a failure, and nothing read.  \~spanish Una lectura cancelada: un fallo, y nada leido.  \~
+    if (op.fd == kCancelledFd) {
+        c.result = -1;
+        return true;
+    }
+
     switch (op.kind) {
     case OpKind::Accept:
     case OpKind::Close:
+    case OpKind::Cancel:
         return true;
 
     case OpKind::Ready:
@@ -195,6 +225,13 @@ bool StdioBackend::finish(const Op &op, Completion &c, int timeout_ms) noexcept 
 size_t StdioBackend::wait(Completion *done, size_t cap,
                           int timeout_ms) noexcept {
     size_t made = 0;
+
+    // \~english Nothing pending: sleep until a wake or the deadline (see idle).
+    // \~spanish Nada pendiente: dormir hasta un despertar o el plazo (ver idle).  \~
+    if (count_ == 0) {
+        if (timeout_ms != 0) idle(timeout_ms);
+        return 0;
+    }
 
     /* \~english
      * Writes are finished first, and that is the one ordering decision here.

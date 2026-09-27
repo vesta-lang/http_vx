@@ -208,7 +208,7 @@ class Http1Service final : public Service, public KickTarget {
     void on_open(ConnHandle c) noexcept override;
     void on_close(ConnHandle c) noexcept override;
     void attach(StreamPort *port) noexcept override { port_ = port; }
-    bool on_writable(ConnHandle c, Buffer &out) noexcept override;
+    bool on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept override;
     void on_kick(BodySource &source) noexcept override;
 
     /**
@@ -223,6 +223,21 @@ class Http1Service final : public Service, public KickTarget {
      * \~
      */
     static constexpr size_t kFillRoom = 16384;
+
+    /**
+     * \~english
+     * The most framing one fill takes: the chunk header (at most the four
+     * digits of @c kFillRoom, 0x4000, and a CRLF), the CRLF after the bytes,
+     * and the last chunk.  A budget is spent on framing first and body with
+     * the rest.
+     * \~spanish
+     * Lo mas de enmarcado que lleva un relleno: la cabecera del trozo (como
+     * mucho las cuatro cifras de @c kFillRoom, 0x4000, y un CRLF), el CRLF tras
+     * los bytes, y el ultimo trozo.  Un presupuesto se gasta primero en
+     * enmarcado y en cuerpo con el resto.
+     * \~
+     */
+    static constexpr size_t kFramingMax = 4 + 2 + 2 + 5;
 
     /// \~english How many whole requests have been answered.
     /// \~spanish Cuantas peticiones enteras se han contestado.  \~
@@ -329,13 +344,13 @@ class Http1Service final : public Service, public KickTarget {
 
     /**
      * @brief
-     * \~english Asks the open source for one piece and frames it into @p out.
-     * \~spanish Le pide un trozo a la fuente abierta y lo enmarca en @p out.
+     * \~english Asks the open source for one piece and frames it into @p out, in at most @p budget bytes.
+     * \~spanish Le pide un trozo a la fuente abierta y lo enmarca en @p out, en como mucho @p budget bytes.
      * \~
      *
      * @return \~english false to end the connection  \~spanish false para acabar la conexion  \~
      */
-    bool fill_open(ConnHandle c, State &s, Buffer &out) noexcept;
+    bool fill_open(ConnHandle c, State &s, Buffer &out, size_t budget) noexcept;
 
     /// \~english Ends the open response of @p s with @p why.  \~spanish Acaba la respuesta abierta de @p s con @p why.  \~
     void end_open(State &s, GoneReason why) noexcept;

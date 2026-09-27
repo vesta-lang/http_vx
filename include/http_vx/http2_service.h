@@ -61,6 +61,7 @@
 
 #include "http_vx/buffer_pool.h"
 #include "http_vx/h2_connection.h"
+#include "http_vx/h2_open.h"
 #include "http_vx/h2_writer.h"
 #include "http_vx/http1_service.h"
 #include "http_vx/response_lines.h"
@@ -84,10 +85,37 @@ constexpr uint32_t kNoWork = 0xFFFFFFFF;
  * \~spanish Lee HTTP/2 de una conexion y escribe las respuestas.
  * \~
  */
-class Http2Service final : public Service {
+class Http2Service final : public Service, public KickTarget {
   public:
     Http2Service() noexcept = default;
     ~Http2Service() override;
+
+    /**
+     * \~english
+     * How many responses may be open at once when @c reset is not told.  The
+     * same number as the shard's own default limit, so neither runs out
+     * before the other unless somebody sizes one of them.
+     * \~spanish
+     * Cuantas respuestas pueden estar abiertas a la vez cuando a @c reset no se
+     * le dice.  El mismo numero que el tope por defecto del fragmento, para que
+     * ninguno se agote antes que el otro salvo que alguien le de tamano a uno.
+     * \~
+     */
+    static constexpr uint32_t kOpenResponses = 1024;
+
+    /**
+     * \~english
+     * The most body one fill is offered.  What bounds it is the buffer an open
+     * response writes into, like @c Http1Service::kFillRoom; the windows, the
+     * peer's frame size and the caller's budget may bound it further.
+     * \~spanish
+     * Lo mas de cuerpo que se ofrece en un relleno.  Lo que lo acota es el
+     * buffer en el que escribe una respuesta abierta, como
+     * @c Http1Service::kFillRoom; las ventanas, el tamano de trama del otro
+     * extremo y el presupuesto de quien llama pueden acotarlo mas.
+     * \~
+     */
+    static constexpr size_t kFillRoom = 16384;
 
     /**
      * @brief
@@ -133,15 +161,41 @@ class Http2Service final : public Service {
      * @param handler     \~english what answers  \~spanish lo que contesta  \~
      * @param limits      \~english what this server accepts
      *                    \~spanish lo que acepta este servidor  \~
+     * @param opens       \~english how many responses may be open at once; their own table, apart from @p requests (HVX-5, 7.2)
+     *                    \~spanish cuantas respuestas pueden estar abiertas a la vez; su propia tabla, aparte de @p requests (HVX-5, 7.2)  \~
      * @return            \~english false if the memory could not be had
      *                    \~spanish false si no se pudo conseguir la memoria  \~
      */
     bool reset(uint32_t connections, uint32_t requests, size_t max_body,
-               Handler &handler, const h2::Limits &limits) noexcept;
+               Handler &handler, const h2::Limits &limits,
+               uint32_t opens = kOpenResponses) noexcept;
 
     bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override;
     void on_open(ConnHandle c) noexcept override;
     void on_close(ConnHandle c) noexcept override;
+    void attach(StreamPort *port) noexcept override { port_ = port; }
+    bool on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept override;
+    void on_kick(BodySource &source) noexcept override;
+
+    /**
+     * @brief
+     * \~english How many opens were answered 503 because this service's own table of open responses was full.
+     * \~spanish Cuantas aperturas se contestaron 503 porque la tabla propia de respuestas abiertas de este servicio estaba llena.
+     * \~
+     *
+     * \~english
+     * Apart from the shard's @c OpenCounts::refused, which counts its own
+     * limits: this is the service's table being smaller than the shard allows.
+     * \~spanish
+     * Aparte de @c OpenCounts::refused del fragmento, que cuenta sus propios
+     * topes: esto es la tabla del servicio siendo mas pequena de lo que deja el
+     * fragmento.
+     * \~
+     */
+    size_t open_full() const noexcept { return open_full_; }
+
+    /// \~english How many responses are open right now.  \~spanish Cuantas respuestas estan abiertas ahora mismo.  \~
+    uint32_t open_now() const noexcept { return opens_.in_use(); }
 
     /// \~english How many whole requests have been answered.
     /// \~spanish Cuantas peticiones enteras se han contestado.  \~
@@ -284,7 +338,132 @@ class Http2Service final : public Service {
         /// \~english The requests of this connection that are not finished with.
         /// \~spanish Las peticiones de esta conexion sin acabar.  \~
         uint32_t works;
+
+        /// \~english Which connection this is, with its life: what an open response is opened on.
+        /// \~spanish Que conexion es, con su vida: sobre lo que se abre una respuesta abierta.  \~
+        ConnHandle handle;
+
+        /// \~english The open responses of this connection, in the order they are served.
+        /// \~spanish Las respuestas abiertas de esta conexion, en el orden en que se atienden.  \~
+        h2::OpenList opens;
     };
+
+    /**
+     * @brief
+     * \~english What the handler is given to open with: the shard's port, behind this service's own table.
+     * \~spanish Lo que se le da al manejador para abrir: la puerta del fragmento, detras de la tabla propia de este servicio.
+     * \~
+     *
+     * \~english
+     * The shard checks its limits; this checks that the service has an entry
+     * to keep the response in, BEFORE the shard counts it open -- so a full
+     * table is a refusal the handler sees and the client gets as a 503, never
+     * a response opened and then dropped.
+     * \~spanish
+     * El fragmento comprueba sus topes; esto comprueba que el servicio tenga una
+     * entrada donde guardar la respuesta, ANTES de que el fragmento la cuente
+     * abierta -- asi que una tabla llena es un rechazo que ve el manejador y que
+     * el cliente recibe como 503, nunca una respuesta abierta y luego tirada.
+     * \~
+     */
+    class OpenGate final : public OpenPort {
+      public:
+        explicit OpenGate(Http2Service &service) noexcept : service_(&service) {}
+
+        OpenResponse open(ConnHandle c, uint64_t stream, BodySource &s,
+                          KickTarget &target) noexcept override;
+        size_t fill(BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept override;
+        void end(BodySource &s, GoneReason why) noexcept override;
+
+      private:
+        Http2Service *service_;
+    };
+
+    /// \~english How writing a header block went.  \~spanish Como fue escribir un bloque de cabeceras.  \~
+    enum class HeadWrite : uint8_t {
+        /// \~english It is in the output.  \~spanish Esta en la salida.  \~
+        Written,
+        /// \~english It could not be written; the stream is to be reset.  \~spanish No se pudo escribir; hay que reiniciar el flujo.  \~
+        StreamFailed,
+        /// \~english The connection must end.  \~spanish La conexion tiene que acabar.  \~
+        ConnectionFailed,
+    };
+
+    /// \~english What asking an open response for one frame left behind.  \~spanish Lo que dejo pedirle una trama a una respuesta abierta.  \~
+    enum class Feed : uint8_t {
+        /// \~english Still open, to be kept in its connection's list.  \~spanish Sigue abierta, se guarda en la lista de su conexion.  \~
+        Kept,
+        /// \~english Over, its entry given back.  \~spanish Acabada, con su entrada devuelta.  \~
+        Ended,
+        /// \~english No memory for the output: the connection must end.  \~spanish Sin memoria para la salida: la conexion tiene que acabar.  \~
+        Failed,
+    };
+
+    /**
+     * @brief
+     * \~english Writes the header block of @p res on @p stream into @p out.
+     * \~spanish Escribe el bloque de cabeceras de @p res en @p stream en @p out.
+     * \~
+     *
+     * @param head       \~english whether it answers a HEAD  \~spanish si contesta a un HEAD  \~
+     * @param end_stream \~english whether the block ends the stream  \~spanish si el bloque acaba el flujo  \~
+     * @return           \~english how it went  \~spanish como fue  \~
+     */
+    HeadWrite put_head(State &s, uint32_t stream, const ResponseBuilder &res,
+                       size_t count, bool head, bool end_stream, Buffer &out) noexcept;
+
+    /**
+     * @brief
+     * \~english Writes the head of an opened response, what was written before opening, and its first fill.
+     * \~spanish Escribe la cabecera de una respuesta abierta, lo escrito antes de abrir, y su primer relleno.
+     * \~
+     *
+     * @return \~english false if the connection must end  \~spanish false si la conexion tiene que acabar  \~
+     */
+    bool start_open(State &s, uint32_t stream, const ResponseBuilder &res,
+                    size_t count, Work *w, Buffer &out) noexcept;
+
+    /**
+     * @brief
+     * \~english Asks open response @p i for what it has, one DATA frame at most (the kept prefix may take a few).
+     * \~spanish Le pide a la respuesta abierta @p i lo que tenga, una trama DATA como mucho (el prefijo guardado puede llevar varias).
+     * \~
+     *
+     * @param left \~english the budget left, spent by what is written  \~spanish el presupuesto que queda, que gasta lo que se escribe  \~
+     * @return     \~english what it left behind  \~spanish lo que dejo  \~
+     */
+    Feed feed_open(State &s, uint32_t i, Buffer &out, size_t &left) noexcept;
+
+    /**
+     * @brief
+     * \~english The body one DATA frame of @p st may carry now: zero if a window is shut or @p left takes no frame.
+     * \~spanish El cuerpo que puede llevar ahora una trama DATA de @p st: cero si una ventana esta cerrada o @p left no admite una trama.
+     * \~
+     */
+    size_t open_room(State &s, const h2::Stream &st, size_t left) noexcept;
+
+    /**
+     * @brief
+     * \~english Sends @p p from @p at in DATA frames without END_STREAM, while the room lasts.
+     * \~spanish Manda @p p desde @p at en tramas DATA sin END_STREAM, mientras dure el sitio.
+     * \~
+     *
+     * @return \~english false if the output could not grow  \~spanish false si la salida no pudo crecer  \~
+     */
+    bool put_prefix(State &s, h2::Stream &st, uint32_t stream, const uint8_t *p,
+                    size_t n, size_t &at, Buffer &out, size_t &left) noexcept;
+
+    /// \~english Asks for room on the connection if an open response wants it and the windows have some.
+    /// \~spanish Pide sitio en la conexion si una respuesta abierta lo quiere y las ventanas tienen.  \~
+    void wake_open(State &s) noexcept;
+
+    /// \~english Ends open response @p i, which is in no list, with @p why, and gives its entry back.
+    /// \~spanish Acaba la respuesta abierta @p i, que no esta en ninguna lista, con @p why, y devuelve su entrada.  \~
+    void drop_open(uint32_t i, GoneReason why) noexcept;
+
+    /// \~english Ends the open response of @p stream, if there is one, with @p why.
+    /// \~spanish Acaba la respuesta abierta de @p stream, si la hay, con @p why.  \~
+    void end_stream_open(State &s, uint32_t stream, GoneReason why) noexcept;
 
     /// \~english Takes a piece of work for @p stream, or says there is none.
     /// \~spanish Coge un trabajo para @p stream, o dice que no hay.  \~
@@ -443,6 +622,17 @@ class Http2Service final : public Service {
     size_t served_ = 0;
     size_t bad_answers_ = 0;
     const char *last_bad_answer_ = nullptr;
+
+    /// \~english The open responses, apart from @c works_ and @c bodies_ (HVX-5, 7.2).
+    /// \~spanish Las respuestas abiertas, aparte de @c works_ y @c bodies_ (HVX-5, 7.2).  \~
+    h2::OpenTable opens_;
+
+    /// \~english The shard's side of open responses, or null: then nothing opens.
+    /// \~spanish El lado del fragmento de las respuestas abiertas, o nulo: entonces no se abre nada.  \~
+    StreamPort *port_ = nullptr;
+
+    OpenGate gate_{*this};
+    size_t open_full_ = 0;
 };
 
 } // namespace http_vx

@@ -234,6 +234,38 @@ public:
 
     /**
      * @brief
+     * \~english Readies a record written in place: a key update owed or due goes out first, into @p out.
+     * \~spanish Prepara un registro escrito en su sitio: una actualizacion de claves debida o que toca sale antes, en @p out.
+     * \~
+     *
+     * \~english
+     * Then the caller keeps @c kRecordHeader bytes, has the content written
+     * right behind them, and calls @c seal_in_place.  It is how an open
+     * response is sealed with no copy (HVX-5, 7.4).
+     * \~spanish
+     * Despues quien llama guarda @c kRecordHeader bytes, hace escribir el
+     * contenido justo detras, y llama a @c seal_in_place.  Es como se sella una
+     * respuesta abierta sin copia (HVX-5, 7.4).
+     * \~
+     * @return \~english false before the handshake completed, after closing, or if the update failed
+     *         \~spanish falso antes de completar el saludo, tras cerrar, o si fallo la actualizacion  \~
+     */
+    bool begin_in_place(Buffer &out) noexcept;
+
+    /**
+     * @brief
+     * \~english Seals as one application-data record what lies in @p out from @p record_at on: header kept, content behind it.
+     * \~spanish Sella como un registro de datos de aplicacion lo que hay en @p out desde @p record_at: cabecera guardada, contenido detras.
+     * \~
+     *
+     * @param record_at \~english offset in @p out of the kept header  \~spanish desplazamiento en @p out de la cabecera guardada  \~
+     * @return \~english false, with the channel failed, if the content is empty, over 2^14, or cannot be sealed
+     *         \~spanish falso, con el canal fallado, si el contenido esta vacio, pasa de 2^14, o no se puede sellar  \~
+     */
+    bool seal_in_place(Buffer &out, size_t record_at) noexcept;
+
+    /**
+     * @brief
      * \~english Sends a KeyUpdate and moves this end's writing to the next generation (4.6.3).
      * \~spanish Manda un KeyUpdate y pasa la escritura de este extremo a la generacion siguiente (4.6.3).
      * \~
@@ -318,6 +350,9 @@ private:
     bool make_session() noexcept;
     void drop_session() noexcept;
     bool emit(ContentType type, const uint8_t *p, size_t n, uint16_t version, Buffer &out) noexcept;
+
+    /// \~english The padding a record of @p take content bytes gets (5.4).  \~spanish El relleno que lleva un registro de @p take bytes de contenido (5.4).  \~
+    size_t padding_for(size_t take) const noexcept;
     bool send_alert(uint8_t level, uint8_t description, Buffer &out) noexcept;
     bool enter_write(quic::Space level, Buffer &out) noexcept;
     bool enter_read(quic::Space level, Buffer &out) noexcept;

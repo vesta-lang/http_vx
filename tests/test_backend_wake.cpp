@@ -295,6 +295,11 @@ void test_stdio(int read_fd, int write_fd) {
     http_vx::StdioBackend io(pool, read_fd, write_fd);
     check(io.ready(), "the stdio backend's wake could not be made");
 
+    // \~english With nothing pending it still sleeps until woken, and does not spin.
+    // \~spanish Sin nada pendiente sigue durmiendo hasta que la despiertan, y no da vueltas.  \~
+    against = "stdio, nothing pending";
+    test_a_blocked_wait_is_woken(io);
+
     http_vx::Op read;
     read.kind = http_vx::OpKind::Recv;
     read.buffer = pool.acquire();
@@ -324,6 +329,38 @@ void test_stdio(int read_fd, int write_fd) {
     check(io.wait(done, 2, 2000) == 1 && done[0].result == 3, "the second read did not get what came next");
     const http_vx::Buffer *b = pool.at(read.buffer);
     check(b->size() == 6 && std::memcmp(b->data(), "abcdef", 6) == 0, "the bytes were read twice or out of place");
+
+    /* \~english
+     * A read in flight is cancelled: it comes back as a failure, once, and
+     * the next read works as ever -- on Windows the helper was taken out of
+     * its ReadFile and is ready for the next one.
+     * \~spanish
+     * Una lectura en vuelo se cancela: vuelve como fallo, una vez, y la lectura
+     * siguiente funciona como siempre -- en Windows al auxiliar se le saco de su
+     * ReadFile y esta listo para la siguiente.
+     * \~ */
+    check(io.submit(read), "the read to cancel was not taken");
+    check(io.wait(done, 2, 50) == 0, "an empty pipe answered the read to cancel");
+    http_vx::Op cancel;
+    cancel.kind = http_vx::OpKind::Cancel;
+    cancel.buffer = http_vx::kNoBuffer;
+    cancel.fd = read.fd;
+    check(io.submit(cancel), "the cancel was refused");
+    check(io.wait(done, 2, 2000) == 1 && done[0].result < 0 && done[0].kind == http_vx::OpKind::Recv,
+          "the cancelled read did not come back as a failure");
+    check(io.pending() == 0, "the cancelled read is still pending");
+
+    // \~english Into another buffer: a read left running in the old one would land there.
+    // \~spanish En otro buffer: una lectura que siguiera en el viejo caeria alli.  \~
+    http_vx::Op again = read;
+    again.buffer = pool.acquire();
+    check(io.submit(again), "the read after the cancel was not taken");
+    check(put(write_fd, "gh", 2), "the pipe could not be written");
+    check(io.wait(done, 2, 2000) == 1 && done[0].result == 2, "the read after a cancel did not work");
+    const http_vx::Buffer *nb = pool.at(again.buffer);
+    check(nb != nullptr && nb->size() == 2 && std::memcmp(nb->data(), "gh", 2) == 0,
+          "the read after a cancel landed somewhere else");
+    check(b->size() == 6, "the cancelled read still wrote into its buffer");
 
     /* \~english
      * The peer closing its end is the end of the stream, not an error -- on

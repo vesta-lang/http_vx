@@ -81,6 +81,11 @@ bool IocpBackend::reset(BufferPool &pool, uint32_t pending) noexcept {
         return false;
     }
 
+    if (!reads_.reset(pending)) {
+        release();
+        return false;
+    }
+
     context_count_ = pending;
     for (uint32_t i = 0; i < pending; ++i) {
         new (&contexts_[i]) Context();
@@ -426,6 +431,7 @@ bool IocpBackend::submit(const Op &op) noexcept {
     if (iocp_ == nullptr) return false;
 
     if (op.kind == OpKind::Close) return start_close(op);
+    if (op.kind == OpKind::Cancel) return start_cancel(op);
 
     Context *c = take();
     if (c == nullptr) return false;
@@ -460,10 +466,14 @@ bool IocpBackend::submit(const Op &op) noexcept {
         break;
 
     case OpKind::Close:
+    case OpKind::Cancel:
         break;
     }
 
-    if (started) return true;
+    if (started) {
+        if (op.kind == OpKind::Ready || op.kind == OpKind::Recv) note_read(c);
+        return true;
+    }
 
     /* \~english
      * It never began, so there will be no packet and the caller has to be told
@@ -614,6 +624,7 @@ size_t IocpBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept {
             }
         }
 
+        if (c->op.kind == OpKind::Ready || c->op.kind == OpKind::Recv) forget_read(c);
         give(c);
 
         out[made] = done;

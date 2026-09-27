@@ -271,6 +271,25 @@ public:
 
     /**
      * @brief
+     * \~english The same, with the @p n bytes of content already where they go: at @p out + kRecordHeader.
+     * \~spanish Lo mismo, con los @p n bytes de contenido ya donde van: en @p out + kRecordHeader.
+     * \~
+     *
+     * \~english
+     * What lets a body written by the service be sealed with no copy: the
+     * header is written in front of it, the type, padding and tag behind, and
+     * the provider seals the inner plaintext where it lies.
+     * \~spanish
+     * Lo que permite sellar sin copia un cuerpo escrito por el servicio: la
+     * cabecera se escribe delante, el tipo, el relleno y la marca detras, y el
+     * proveedor sella el texto interior donde esta.
+     * \~
+     * @return \~english the record's size, or 0 as @c seal refuses  \~spanish el tamano del registro, o 0 como rechaza @c seal  \~
+     */
+    size_t seal_in_place(ContentType type, size_t n, size_t padding, uint8_t *out, size_t room) noexcept;
+
+    /**
+     * @brief
      * \~english Opens the whole record at @p record (header included, @p total bytes) into @p out.
      * \~spanish Abre el registro entero de @p record (cabecera incluida, @p total bytes) en @p out.
      * \~

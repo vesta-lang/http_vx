@@ -436,6 +436,26 @@ class Buffer {
 
     /**
      * @brief
+     * \~english Takes back the last @p n committed bytes, clamped to what is live.
+     * \~spanish Retira los ultimos @p n bytes confirmados, recortado a lo que esta vivo.
+     * \~
+     *
+     * \~english
+     * For room kept in front of what somebody else may or may not write -- a
+     * record header -- that turns out not to be needed.
+     * \~spanish
+     * Para un sitio guardado delante de lo que otro puede escribir o no -- la
+     * cabecera de un registro -- que resulta no hacer falta.
+     * \~
+     * @param n \~english how many bytes  \~spanish cuantos bytes  \~
+     */
+    void uncommit(size_t n) noexcept {
+        const size_t live = tail_ - head_;
+        tail_ -= n < live ? n : live;
+    }
+
+    /**
+     * @brief
      * \~english Drops the first @p n live bytes: a message is done with.
      * \~spanish Descarta los primeros @p n bytes vivos: un mensaje ya esta.
      * \~

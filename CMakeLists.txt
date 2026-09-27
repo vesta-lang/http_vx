@@ -154,10 +154,12 @@ add_library(http_vx_proto STATIC
         proto/h2/frame.cpp
         proto/h2/hpack.cpp
         proto/h2/huffman.cpp
+        proto/h2/open_table.cpp
         proto/h2/table.cpp
         proto/h2/reader.cpp
         proto/h2/service.cpp
         proto/h2/service_answer.cpp
+        proto/h2/service_open.cpp
         proto/h2/service_read.cpp
         proto/h2/service_write.cpp
         proto/h2/settings.cpp
@@ -264,6 +266,7 @@ target_link_libraries(http_vx_tls_stream PUBLIC http_vx_tls http_vx_core vesta_a
 # ---------------------------------------------------------------------------
 add_library(http_vx_h3 STATIC
         proto/h3/connection.cpp
+        proto/h3/connection_fill.cpp
         proto/h3/frame.cpp
 )
 target_include_directories(http_vx_h3
@@ -278,6 +281,7 @@ target_link_libraries(http_vx_h3 PUBLIC http_vx_proto http_vx_quic http_vx_core 
 add_library(http_vx_h3_service STATIC
         proto/h3/service.cpp
         proto/h3/service_requests.cpp
+        proto/h3/service_open.cpp
         proto/h3/service_datagrams.cpp
         proto/h3/service_route.cpp
 )
@@ -382,10 +386,12 @@ endif ()
 # Se construye SIEMPRE, tambien cuando las pruebas estan apagadas: si lo que se
 # publica no compila, eso hay que saberlo al construir y no al publicar.
 # ---------------------------------------------------------------------------
-add_executable(http_vx_serve serve/main.cpp)
+# El flujo de eventos de la demostracion (/events) lo alimenta un hilo propio.
+find_package(Threads REQUIRED)
+add_executable(http_vx_serve serve/main.cpp serve/events.cpp)
 target_include_directories(http_vx_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_serve PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core)
+target_link_libraries(http_vx_serve PRIVATE http_vx_proto http_vx_core Threads::Threads)
 # El backend de stdio esta en la biblioteca de cada plataforma: su despertar es de ella.
 if (WIN32)
     target_link_libraries(http_vx_serve PRIVATE http_vx_windows)
@@ -411,6 +417,7 @@ if (WIN32)
     add_library(http_vx_windows STATIC
             windows/iocp_address.cpp
             windows/iocp_backend.cpp
+            windows/iocp_cancel.cpp
             windows/iocp_datagram.cpp
             windows/iocp_release.cpp
             windows/iocp_wake.cpp
@@ -442,6 +449,7 @@ if (UNIX)
             linux/socket_open.cpp
             linux/stdio_wake.cpp
             linux/uring_backend.cpp
+            linux/uring_cancel.cpp
             linux/uring_datagram.cpp
             linux/uring_wake.cpp
             linux/wake_fd.cpp
@@ -464,10 +472,11 @@ endif ()
 # enlaza una libreria de plataforma, y esas se definen justo arriba.
 # ---------------------------------------------------------------------------
 add_executable(http_vx_listen serve/listen.cpp serve/options.cpp serve/reactors.cpp
-        serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp)
+        serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp serve/events.cpp)
 target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_listen PRIVATE http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core)
+target_link_libraries(http_vx_listen PRIVATE http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core
+        Threads::Threads)
 # HTTPS con los proveedores que haya; sin ninguno, `--tls` se niega a arrancar (R24).
 if (TARGET http_vx_crypto_openssl)
     target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_openssl)
@@ -532,6 +541,7 @@ if (HTTP_VX_BUILD_TESTS)
     http_vx_add_test(test_h2_encoder tests/test_h2_encoder.cpp)
     http_vx_add_test(test_h2_frame tests/test_h2_frame.cpp)
     http_vx_add_test(test_h2_hpack tests/test_h2_hpack.cpp)
+    http_vx_add_test(test_h2_open tests/test_h2_open.cpp)
     http_vx_add_test(test_h2_huffman tests/test_h2_huffman.cpp)
     http_vx_add_test(test_h2_settings tests/test_h2_settings.cpp)
     http_vx_add_test(test_h2_stream tests/test_h2_stream.cpp)
@@ -680,6 +690,8 @@ if (HTTP_VX_BUILD_TESTS)
         target_link_libraries(test_http3_service PRIVATE http_vx_crypto_cng)
         target_compile_definitions(test_http3_service PRIVATE HTTP_VX_HAVE_CNG=1)
     endif ()
+    http_vx_add_test(test_h3_open tests/test_h3_open.cpp)
+    target_link_libraries(test_h3_open PRIVATE http_vx_h3_service)
     http_vx_add_test(test_message tests/test_message.cpp)
     http_vx_add_test(test_method tests/test_method.cpp)
     http_vx_add_test(test_reactor_ops tests/test_reactor_ops.cpp)
@@ -697,7 +709,10 @@ if (HTTP_VX_BUILD_TESTS)
     find_package(Threads REQUIRED)
     http_vx_add_test(test_stdio_backend tests/test_stdio_backend.cpp)
     http_vx_add_test(test_backend_wake tests/test_backend_wake.cpp)
-    foreach (_wake_test test_stdio_backend test_backend_wake)
+    # El flujo de eventos de la demostracion, con su hilo y el manejador de verdad.
+    http_vx_add_test(test_serve_events tests/test_serve_events.cpp serve/events.cpp)
+    target_include_directories(test_serve_events PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    foreach (_wake_test test_stdio_backend test_backend_wake test_serve_events)
         target_link_libraries(${_wake_test} PRIVATE Threads::Threads)
         if (WIN32)
             target_link_libraries(${_wake_test} PRIVATE http_vx_windows)
@@ -741,6 +756,11 @@ if (HTTP_VX_BUILD_TESTS)
     else ()
         http_vx_add_test(test_epoll_ready tests/test_epoll_ready.cpp)
         target_link_libraries(test_epoll_ready PRIVATE http_vx_linux)
+
+        # Cancelar una lectura pendiente, contra los dos backends de Linux:
+        # acaba una vez como fallo con su buffer, y la escritura no se toca.
+        http_vx_add_test(test_backend_cancel tests/test_backend_cancel.cpp)
+        target_link_libraries(test_backend_cancel PRIVATE http_vx_linux)
     endif ()
 
     http_vx_add_test(test_shard_streamless tests/test_shard_streamless.cpp)

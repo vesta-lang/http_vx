@@ -38,8 +38,10 @@
 #define HTTP_VX_SERVE_GREETING_H
 
 #include "http_vx/http1_service.h"
+#include "serve/events.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace serve {
 
@@ -55,6 +57,15 @@ class Greeting final : public http_vx::Handler {
                 const uint8_t *body, size_t n,
                 http_vx::ResponseBuilder &res) noexcept override {
         (void)body;
+
+        // \~english The event stream, opened and fed from another thread (serve/events.h).
+        // \~spanish El flujo de eventos, abierto y alimentado desde otro hilo (serve/events.h).  \~
+        static const char kEvents[] = "/events";
+        if (events != nullptr && req.target.len == sizeof kEvents - 1 &&
+            std::memcmp(head + req.target.off, kEvents, sizeof kEvents - 1) == 0) {
+            events->answer(res);
+            return;
+        }
 
         char text[512];
         const int len = std::snprintf(
@@ -98,6 +109,10 @@ class Greeting final : public http_vx::Handler {
         res.field(http_vx::FieldId::ContentType, "text/plain", 10);
         res.body(text, static_cast<size_t>(len));
     }
+
+    /// \~english The event streams `/events` answers with, or null: then it is greeted like the rest.
+    /// \~spanish Los flujos de eventos con los que contesta `/events`, o nulo: entonces se saluda como al resto.  \~
+    Events *events = nullptr;
 };
 
 } // namespace serve

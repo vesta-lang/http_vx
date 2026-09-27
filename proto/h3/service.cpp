@@ -109,6 +109,8 @@ bool Http3Service::start(const Http3Config &cfg) noexcept {
             return refuse_start("the acceptor and the connections answer stateless resets with different keys (RFC 9000, 10.3)");
     if (!accepts_h3(cfg.tls)) return refuse_start("the TLS configuration does not accept \"h3\" (RFC 9114, 3.1)");
     if (cfg.h3.max_requests == 0) return refuse_start("no room for a single request");
+    if (cfg.max_open_per_conn > cfg.h3.max_requests)
+        return refuse_start("more open responses per connection than requests a connection follows");
 
     const util::AllocScope scope(util::AllocUse::Long, util::AllocShape::Fixed, util::AllocFill::Sparse);
     acceptor_ = static_cast<quic::Acceptor *>(util::host_alloc(sizeof(quic::Acceptor)));
@@ -259,7 +261,22 @@ Http3Service::Slot *Http3Service::accept(const quic::Admission &ad, const quic::
 
 void Http3Service::touch(uint32_t i, uint64_t now_us) noexcept {
     Slot &s = slots_[i];
+    /* \~english
+     * What the datagram did to open responses is looked at BEFORE HTTP/3
+     * runs: a stream the peer stopped may be gone from QUIC, and HTTP/3 would
+     * give its message's place to the next request.  After, too: HTTP/3
+     * failing closes the connection.  A connection with none open pays one
+     * comparison (R39).
+     * \~spanish
+     * Lo que el datagrama le hizo a las respuestas abiertas se mira ANTES de que
+     * corra HTTP/3: un flujo que el otro paro puede haberse ido de QUIC, y HTTP/3
+     * daria el sitio de su mensaje a la peticion siguiente.  Despues tambien: que
+     * falle HTTP/3 cierra la conexion.  Una conexion sin ninguna abierta paga una
+     * comparacion (R39).
+     * \~ */
+    if (s.open_head != kNone) watch_open(s);
     pump(s, now_us);
+    if (s.open_head != kNone) watch_open(s);
     // \~english Gone for good: its IDs, its timer and its memory go with it.
     // \~spanish Terminada del todo: sus identificadores, su temporizador y su memoria se van con ella.  \~
     if (s.quic->state() == quic::ConnState::Closed) {
@@ -287,6 +304,18 @@ size_t Http3Service::next_datagram(quic::Path &path, uint8_t *out, size_t room, 
         --send_count_;
         Slot &s = slots_[i];
         if (s.quic != nullptr) {
+            /* \~english
+             * Open responses are filled here, right before the datagram that
+             * carries them is built: the loop drained its kicks before
+             * pulling, and room freed by acknowledgements or a raised limit is
+             * seen now (HVX-5, 4.3).
+             * \~spanish
+             * Las respuestas abiertas se rellenan aqui, justo antes de construir
+             * el datagrama que las lleva: el bucle vacio sus avisos antes de
+             * tirar, y el sitio liberado por confirmaciones o un limite subido se
+             * ve ahora (HVX-5, 4.3).
+             * \~ */
+            if (s.open_head != kNone) feed_open(s);
             const size_t n = s.quic->build_datagram(path, out, room, now_us);
             if (n != 0) {
                 // \~english To the back of the queue: one connection with much to say does not starve the rest.
@@ -333,6 +362,18 @@ void Http3Service::free_slot(uint32_t i) noexcept {
             last_end_.why = s.tls->why();
         ++counts_.ended[static_cast<size_t>(last_end_.reason)];
     }
+    // \~english What is still open goes with the connection, each source told why.
+    // \~spanish Lo que siga abierto se va con la conexion, y a cada fuente se le dice por que.  \~
+    if (s.open_head != kNone) {
+        const bool idle = s.quic != nullptr && s.quic->end_reason() == quic::EndReason::IdleTimeout;
+        end_all_open(s, idle ? GoneReason::IdleTimeout : GoneReason::ConnectionClosed);
+    }
+    if (s.opens != nullptr) {
+        for (size_t k = 0; k < cfg_.h3.max_requests; ++k) s.opens[k].~OpenStream();
+        util::host_free(s.opens);
+        s.opens = nullptr;
+    }
+    ++s.life;
     for (size_t r = 0; r < s.route_count; ++r) routes_.remove(s.routes[r].bytes, s.routes[r].len);
     s.route_count = 0;
     s.first.len = 0;

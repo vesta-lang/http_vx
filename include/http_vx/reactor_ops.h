@@ -234,6 +234,36 @@ enum class OpKind : uint8_t {
      * \~
      */
     Close,
+
+    /**
+     * \~english
+     * End the read -- @c Ready or @c Recv -- outstanding on socket @c fd.
+     * It completes as a failure, soon, with its buffer; a write outstanding
+     * on the same socket is left alone.  The cancel itself completes as
+     * nothing.  With no read outstanding -- it finished already and its
+     * completion is on its way -- it does nothing.
+     *
+     * What lets a connection be closed while its peer is silent: a quiet
+     * connection has a read with the operating system that only its peer
+     * would complete, and a connection does not leave while an operation of
+     * it is outstanding.  Without this, a deadline that passed on a peer that
+     * is gone for good would close nothing.
+     *
+     * \~spanish
+     * Acabar la lectura -- @c Ready o @c Recv -- pendiente en el socket @c fd.
+     * Acaba como fallo, pronto, con su buffer; una escritura pendiente en el
+     * mismo socket no se toca.  La cancelacion en si no acaba como nada.  Sin
+     * lectura pendiente -- ya acabo y su finalizacion va de camino -- no hace
+     * nada.
+     *
+     * Lo que permite cerrar una conexion cuyo otro extremo calla: una conexion
+     * callada tiene una lectura en el sistema operativo que solo completaria su
+     * otro extremo, y una conexion no se va mientras tenga una operacion
+     * pendiente.  Sin esto, un plazo vencido con un extremo que se fue para
+     * siempre no cerraria nada.
+     * \~
+     */
+    Cancel,
 };
 
 /**

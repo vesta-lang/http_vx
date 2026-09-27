@@ -600,6 +600,45 @@ void test_a_connection_without_a_buffer_still_expires() {
 
 /**
  * @brief
+ * \~english An expired connection leaves although its peer never says anything again: its read is cancelled.
+ * \~spanish Una conexion vencida se va aunque su otro extremo no vuelva a decir nada: su lectura se cancela.
+ * \~
+ *
+ * \~english
+ * The read outstanding on a quiet connection is one only the peer would
+ * complete.  Closing it has to END that read (OpKind::Cancel) and not wait
+ * for it, or a peer gone for good keeps its connection for ever.  Nothing
+ * here ends the stream by hand, which is what hid this.
+ * \~spanish
+ * La lectura pendiente en una conexion callada es una que solo completaria el
+ * otro extremo.  Cerrarla tiene que ACABAR esa lectura (OpKind::Cancel) y no
+ * esperarla, o un extremo que se fue para siempre conserva su conexion para
+ * siempre.  Aqui nada acaba el flujo a mano, que es lo que tapaba esto.
+ * \~
+ */
+void test_an_expired_connection_leaves_without_its_peer() {
+    Rig r;
+    check(r.start(4, 5), "the shard would not start");
+
+    const ConnHandle c = r.shard.adopt(7, 0);
+    check(c.valid(), "the connection was not adopted");
+    r.shard.poll(1, 0);
+
+    const http_vx::ConnHot *h = r.shard.conns().hot(c);
+    check(h != nullptr && (h->flags & kReadPending) != 0, "a quiet connection is not waiting to be told");
+
+    check(r.shard.expire(6) == 1, "the quiet connection was not closed");
+    for (int i = 0; i < 4; ++i) r.shard.poll(7, 0);
+
+    check(r.io.cancelled() == 1, "its outstanding read was not cancelled");
+    check(r.shard.conns().count() == 0, "the connection is still in the table");
+    check(r.io.closed() == 1, "its socket was not shut");
+    check(r.shard.buffers().lent() == 0, "a buffer was kept");
+    check(r.shard.counts().uncancelled == 0, "a cancel was refused");
+}
+
+/**
+ * @brief
  * \~english A service that answers nothing does not lose the buffer it was given.
  * \~spanish Un servicio que no contesta nada no pierde el buffer que le dieron.
  * \~
@@ -962,6 +1001,7 @@ int main() {
     test_an_idle_connection_holds_no_buffer();
     test_activity_pushes_the_deadline();
     test_a_connection_without_a_buffer_still_expires();
+    test_an_expired_connection_leaves_without_its_peer();
     test_answering_nothing_keeps_the_pool_whole();
     test_a_service_can_end_it();
 

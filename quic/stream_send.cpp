@@ -125,6 +125,58 @@ StreamError SendStream::write(const uint8_t *p, size_t n, size_t &accepted) noex
     return StreamError::None;
 }
 
+uint8_t *SendStream::reserve(size_t front, size_t &room) noexcept {
+    room = 0;
+    if (finished_ || done_or_reset()) return nullptr;
+
+    // \~english The same room as write: capacity minus what waits unacknowledged.
+    // \~spanish El mismo sitio que write: la capacidad menos lo que espera sin confirmar.  \~
+    const uint64_t free_bytes = capacity_ - (written_ - acked_);
+    if (free_bytes <= front) return nullptr;
+
+    const uint64_t at = written_ + front;
+    Chunk *c = chunk_for(at / kRecvChunk, true);
+    if (c == nullptr) return nullptr;
+    const size_t in = static_cast<size_t>(at % kRecvChunk);
+    room = static_cast<size_t>(min64(free_bytes - front, kRecvChunk - in));
+    return c->data + in;
+}
+
+StreamError SendStream::commit(const uint8_t *front, size_t front_len, size_t n) noexcept {
+    if (finished_ || done_or_reset()) return StreamError::None;
+
+    if (front_len == 0 && n == 0) {
+        /* \~english
+         * Given back.  The chunk reserve made holds nothing written when it
+         * starts at or past the write point: freed now, or a silent writer
+         * would keep a chunk for as long as it stays silent.
+         * \~spanish
+         * Devuelta.  El trozo que hizo reserve no tiene nada escrito cuando
+         * empieza en el punto de escritura o despues: se libera ya, o quien
+         * calla guardaria un trozo mientras siga callado.
+         * \~ */
+        const uint64_t next = (written_ + kRecvChunk - 1) / kRecvChunk;
+        if (next * kRecvChunk >= written_) free_chunk(next);
+        return StreamError::None;
+    }
+
+    // \~english The framing may straddle two chunks; the body is already where it goes.
+    // \~spanish El enmarcado puede caer entre dos trozos; el cuerpo ya esta donde va.  \~
+    uint64_t pos = written_;
+    size_t done = 0;
+    while (done < front_len) {
+        Chunk *c = chunk_for(pos / kRecvChunk, true);
+        if (c == nullptr) return StreamError::OutOfMemory;
+        const size_t in = static_cast<size_t>(pos % kRecvChunk);
+        const size_t take = front_len - done < kRecvChunk - in ? front_len - done : kRecvChunk - in;
+        util::vesta_memcpy(c->data + in, front + done, take);
+        done += take;
+        pos += take;
+    }
+    written_ += front_len + n;
+    return StreamError::None;
+}
+
 void SendStream::finish() noexcept {
     finished_ = true;
 }

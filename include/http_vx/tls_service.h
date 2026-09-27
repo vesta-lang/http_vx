@@ -157,6 +157,8 @@ public:
     bool on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept override;
     void on_open(ConnHandle c) noexcept override;
     void on_close(ConnHandle c) noexcept override;
+    void attach(StreamPort *port) noexcept override;
+    bool on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept override;
 
     /// \~english The clock for tickets, in microseconds; the loop sets it.  \~spanish El reloj de los tickets, en microsegundos; lo pone el bucle.  \~
     void set_clock(uint64_t now_us) noexcept { clock_us_ = now_us; }

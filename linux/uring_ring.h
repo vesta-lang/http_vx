@@ -111,6 +111,74 @@ struct UringBackend::Ring {
     bool ext_arg = false;
 };
 
+/**
+ * @brief
+ * \~english What an operation was for, kept until its number comes back.
+ * \~spanish De que era una operacion, guardado hasta que vuelva su numero.
+ * \~
+ *
+ * \~english
+ * Here and not in `uring_backend.cpp` because the cancel (`uring_cancel.cpp`)
+ * has to name the number of the read it ends.
+ * \~spanish
+ * Aqui y no en `uring_backend.cpp` porque la cancelacion (`uring_cancel.cpp`)
+ * tiene que nombrar el numero de la lectura que acaba.
+ * \~
+ */
+struct UringBackend::Slot {
+    Op op;
+    uint32_t next;
+
+    /**
+     * \~english
+     * Which of this slot's lives the operation in it is, bumped every time
+     * the slot is taken, and carried in the high half of the number the ring
+     * gives back.  It is what lets a cancel name ONE operation: a cancel that
+     * reached the kernel after the read it meant had completed, and after its
+     * slot had been taken by somebody else's write, would otherwise end that
+     * write -- the number alone would match.
+     * \~spanish
+     * Cual de las vidas de esta casilla es la operacion que tiene, subida cada
+     * vez que se coge la casilla, y llevada en la mitad alta del numero que
+     * devuelve el anillo.  Es lo que deja que una cancelacion nombre UNA
+     * operacion: una cancelacion que llegara al nucleo despues de acabar la
+     * lectura que queria decir, y despues de que otro cogiera su casilla para
+     * una escritura, acabaria esa escritura -- el numero solo coincidiria.
+     * \~
+     */
+    uint32_t life;
+
+    bool busy;
+
+    /// \~english Whether a cancel of it is already with the kernel.
+    /// \~spanish Si ya tiene el nucleo una cancelacion suya.  \~
+    bool cancelling;
+};
+
+/**
+ * @brief
+ * \~english The number the ring carries for the operation in slot @p index, life @p life.
+ * \~spanish El numero que lleva el anillo para la operacion de la casilla @p index, vida @p life.
+ * \~
+ *
+ * @param index \~english the slot  \~spanish la casilla  \~
+ * @param life  \~english its life  \~spanish su vida  \~
+ * @return      \~english the ring's @c user_data  \~spanish el @c user_data del anillo  \~
+ */
+inline uint64_t slot_user_data(uint32_t index, uint32_t life) noexcept {
+    return (static_cast<uint64_t>(life) << 32) | index;
+}
+
+/// \~english The slot a ring number names.  \~spanish La casilla que nombra un numero del anillo.  \~
+inline uint32_t slot_index_of(uint64_t user_data) noexcept {
+    return static_cast<uint32_t>(user_data);
+}
+
+/// \~english The life a ring number names.  \~spanish La vida que nombra un numero del anillo.  \~
+inline uint32_t slot_life_of(uint64_t user_data) noexcept {
+    return static_cast<uint32_t>(user_data >> 32);
+}
+
 } // namespace http_vx
 
 #endif // HTTP_VX_LINUX_URING_RING_H

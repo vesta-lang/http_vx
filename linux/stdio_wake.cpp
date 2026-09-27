@@ -57,6 +57,24 @@ bool StdioBackend::wake() noexcept {
     return false;
 }
 
+void StdioBackend::abandon_read() noexcept {
+    // \~english A read here is made inside a wait, never left in flight between waits.
+    // \~spanish Aqui una lectura se hace dentro de una espera, nunca queda en vuelo entre esperas.  \~
+}
+
+void StdioBackend::idle(int timeout_ms) noexcept {
+    if (wake_fd_ < 0) return;
+    pollfd one;
+    one.fd = wake_fd_;
+    one.events = POLLIN;
+    one.revents = 0;
+    int ready = 0;
+    while ((ready = ::poll(&one, 1, timeout_ms < 0 ? -1 : timeout_ms)) < 0) {
+        if (errno != EINTR) return;
+    }
+    if (ready > 0 && (one.revents & POLLIN) != 0) wake_fd_drain(wake_fd_);
+}
+
 long StdioBackend::read_or_wake(uint8_t *room, uint32_t n, int timeout_ms, bool &woken) noexcept {
     woken = false;
     if (wake_fd_ < 0) return -1;

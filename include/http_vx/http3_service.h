@@ -110,6 +110,21 @@ struct Http3Config {
     /// \~english The largest request body taken; a larger one is answered 413.
     /// \~spanish El cuerpo de peticion mas grande que se acepta; uno mayor se contesta 413.  \~
     size_t max_body = size_t{1} << 20;
+    /**
+     * \~english
+     * How many open responses (HVX-5) one connection may have at once; one
+     * more is answered 503.  The shard's port keeps the shard's limit and not
+     * this one, because a datagram service's connections are its own.  At
+     * most h3.max_requests: an open response is a request still answering.
+     * \~spanish
+     * Cuantas respuestas abiertas (HVX-5) puede tener una conexion a la vez; una
+     * mas se contesta 503.  La puerta del fragmento lleva el tope del fragmento y
+     * no este, porque las conexiones de un servicio de datagramas son suyas.  Como
+     * mucho h3.max_requests: una respuesta abierta es una peticion que sigue
+     * contestandose.
+     * \~
+     */
+    uint32_t max_open_per_conn = 16;
 };
 
 /**
@@ -142,6 +157,12 @@ struct Http3Counts {
     uint64_t early_refused = 0;
     /// \~english Connections gone, by why they ended.  \~spanish Conexiones terminadas, por que acabaron.  \~
     uint64_t ended[static_cast<size_t>(quic::EndReason::kCount)] = {};
+    /// \~english Opens refused by max_open_per_conn (the shard counts its own), and requests answered 503 for either.
+    /// \~spanish Aperturas rechazadas por max_open_per_conn (el fragmento cuenta las suyas), y peticiones contestadas 503 por cualquiera.  \~
+    uint64_t open_limited = 0;
+    uint64_t unavailable = 0;
+    /// \~english Kicks for a source this service no longer feeds.  \~spanish Avisos a una fuente que este servicio ya no alimenta.  \~
+    uint64_t stray_kicks = 0;
 };
 
 /**
@@ -164,11 +185,23 @@ struct Http3End {
  * \~english A QUIC server speaking HTTP/3, without input or output.
  * \~spanish Un servidor QUIC que habla HTTP/3, sin entrada ni salida.
  * \~
+ *
+ * \~english
+ * It is the kick target of the responses it opens (HVX-5, 7.3): a kick only
+ * marks the stream and queues its connection, and the fill happens when the
+ * loop pulls datagrams -- after it drained the kicks -- so what a source
+ * writes leaves in the datagram built right after.
+ * \~spanish
+ * Es el destino de los avisos de las respuestas que abre (HVX-5, 7.3): un aviso
+ * solo marca el flujo y pone su conexion en la cola, y el relleno ocurre cuando
+ * el bucle saca datagramas -- despues de vaciar los avisos --, asi que lo que
+ * escribe una fuente sale en el datagrama que se construye justo despues.
+ * \~
  */
-class Http3Service {
+class Http3Service final : public KickTarget {
   public:
     Http3Service(quic::Crypto &crypto, Handler &handler) noexcept;
-    ~Http3Service();
+    ~Http3Service() override;
     Http3Service(const Http3Service &) = delete;
     Http3Service &operator=(const Http3Service &) = delete;
 
@@ -232,7 +265,63 @@ class Http3Service {
     /// \~spanish Devuelve la memoria y olvida todas las conexiones.  \~
     void release() noexcept;
 
+    /**
+     * @brief
+     * \~english Takes the loop's side of open responses; without one, nothing opens.
+     * \~spanish Toma el lado del bucle de las respuestas abiertas; sin el, no se abre nada.
+     * \~
+     *
+     * @param port \~english the shard's port; it outlives every response it opens
+     *             \~spanish la puerta del fragmento; vive mas que toda respuesta que abra  \~
+     */
+    void attach(OpenPort *port) noexcept { port_ = port; }
+
+    /// \~english The loop lets go: every open response ends with GoneReason::Shutdown.
+    /// \~spanish El bucle lo suelta todo: cada respuesta abierta acaba con GoneReason::Shutdown.  \~
+    void on_shutdown() noexcept;
+
+    /**
+     * @brief
+     * \~english @p source was kicked: its stream is marked and its connection queued; the fill comes with the next pull.
+     * \~spanish Avisaron a @p source: su flujo se marca y su conexion entra en la cola; el relleno llega con el siguiente tiron.
+     * \~
+     */
+    void on_kick(BodySource &source) noexcept override;
+
+    /// \~english How many responses are open now, on every connection.  \~spanish Cuantas respuestas hay abiertas ahora, en todas las conexiones.  \~
+    size_t open_now() const noexcept { return open_now_; }
+
   private:
+    /**
+     * @brief
+     * \~english The port a handler opens through: this service's limit per connection, then the loop's.
+     * \~spanish La puerta por la que abre un manejador: el tope por conexion de este servicio, y despues el del bucle.
+     * \~
+     *
+     * \~english
+     * The loop's port checks the shard's limit only; the connection's is kept
+     * here, and a handler can only meet it through ResponseBuilder::open --
+     * so the builder is given this, which refuses past the limit and hands
+     * everything else on.
+     * \~spanish
+     * La puerta del bucle solo comprueba el tope del fragmento; el de la conexion
+     * se lleva aqui, y un manejador solo puede toparse con el por
+     * ResponseBuilder::open -- asi que al constructor se le da esto, que rechaza
+     * pasado el tope y pasa todo lo demas.
+     * \~
+     */
+    class OpenGate final : public OpenPort {
+      public:
+        explicit OpenGate(Http3Service &service) noexcept : service_(&service) {}
+        OpenResponse open(ConnHandle c, uint64_t stream, BodySource &s, KickTarget &target) noexcept override;
+        size_t fill(BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept override;
+        void end(BodySource &s, GoneReason why) noexcept override;
+
+      private:
+        Http3Service *service_;
+    };
+
+    struct OpenStream;
     /// \~english How many IDs route to one connection: its own, plus the client's first.
     /// \~spanish Cuantos identificadores llevan a una conexion: los suyos, mas el primero del cliente.  \~
     static constexpr size_t kRoutes = 9;
@@ -273,6 +362,20 @@ class Http3Service {
     void sync_routes(uint32_t i, uint64_t now_us) noexcept;
     void queue_send(uint32_t i) noexcept;
 
+    // \~english A handler's head section, shared by whole and open answers (service_requests.cpp).
+    // \~spanish La seccion de cabecera de un manejador, comun a respuestas enteras y abiertas (service_requests.cpp).  \~
+    bool send_head(Slot &s, uint64_t stream, const ResponseBuilder &res, bool head_request, bool end) noexcept;
+
+    // \~english Open responses (service_open.cpp).  \~spanish Respuestas abiertas (service_open.cpp).  \~
+    ConnHandle handle_of(uint32_t i) const noexcept;
+    Slot *slot_of(ConnHandle c) noexcept;
+    void start_open(uint32_t i, size_t place, uint64_t stream, const ResponseBuilder &res) noexcept;
+    void fill_open(Slot &s, uint32_t place) noexcept;
+    void feed_open(Slot &s) noexcept;
+    void watch_open(Slot &s) noexcept;
+    void end_open(Slot &s, uint32_t place, GoneReason why) noexcept;
+    void end_all_open(Slot &s, GoneReason why) noexcept;
+
     quic::Crypto &crypto_;
     Handler &handler_;
     Http3Config cfg_;
@@ -309,6 +412,12 @@ class Http3Service {
     Http3Counts counts_;
     Http3End last_end_;
     const char *last_early_refused_ = nullptr;
+
+    /// \~english The loop's side of open responses, or null: then nothing opens.
+    /// \~spanish El lado del bucle de las respuestas abiertas, o nulo: entonces no se abre nada.  \~
+    OpenPort *port_ = nullptr;
+    OpenGate gate_{*this};
+    size_t open_now_ = 0;
 };
 
 } // namespace http_vx

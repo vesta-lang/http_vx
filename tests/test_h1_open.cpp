@@ -365,6 +365,74 @@ void test_http10_ends_by_closing() {
     check(s.source.gones == 1 && s.source.last == GoneReason::Finished, "gone(Finished) did not come");
 }
 
+/**
+ * @brief
+ * \~english A service that, like TLS, keeps what it was given in a buffer of its own before the inner one sees it.
+ * \~spanish Un servicio que, como TLS, guarda lo que le dan en un buffer propio antes de que lo vea el de dentro.
+ * \~
+ */
+class Holding final : public http_vx::Service {
+  public:
+    explicit Holding(Http1Service &inner) : inner_(&inner) {}
+
+    bool on_bytes(ConnHandle c, http_vx::Buffer &in, http_vx::Buffer &out) noexcept override {
+        if (!in.empty()) {
+            uint8_t *at = mine_.reserve(in.size());
+            std::memcpy(at, in.data(), in.size());
+            mine_.commit(in.size());
+            in.consume(in.size());
+        }
+        return mine_.empty() || inner_->on_bytes(c, mine_, out);
+    }
+    void on_open(ConnHandle c) noexcept override { inner_->on_open(c); }
+    void on_close(ConnHandle c) noexcept override { inner_->on_close(c); }
+    void attach(http_vx::StreamPort *port) noexcept override { inner_->attach(port); }
+    bool on_writable(ConnHandle c, http_vx::Buffer &out, size_t budget) noexcept override {
+        return inner_->on_writable(c, out, budget);
+    }
+
+  private:
+    Http1Service *inner_;
+    http_vx::Buffer mine_;
+};
+
+/**
+ * @brief
+ * \~english The request behind is served on resume even when the shard holds none of it: the wrapper does.
+ * \~spanish La peticion de detras se sirve al reanudar aunque el fragmento no guarde nada de ella: la guarda el envoltorio.
+ * \~
+ */
+void test_resume_reaches_a_wrapper() {
+    Opener handler;
+    Stream source;
+    handler.next = &source;
+    Http1Service inner;
+    Holding outer(inner);
+    Shard shard;
+    MemoryBackend io(shard.buffers());
+
+    http_vx::h1::Limits limits;
+    check(inner.reset(8, handler, limits), "the inner service would not start");
+    ShardConfig cfg;
+    cfg.connections = 8;
+    cfg.buffers = 16;
+    cfg.idle_ticks = 10;
+    cfg.wheel_slots = 64;
+    check(shard.reset(cfg, io, outer, 0), "the shard would not start");
+    check(shard.adopt(7, 0).valid(), "the connection was not adopted");
+
+    const char req[] = "GET /open HTTP/1.1\r\nHost: a\r\n\r\nGET /next HTTP/1.1\r\nHost: a\r\n\r\n";
+    io.feed(reinterpret_cast<const uint8_t *>(req), sizeof req - 1);
+    for (int i = 0; i < 64; ++i) shard.poll(1, 0);
+    check(handler.calls == 1, "the request behind was answered before the open one ended");
+
+    source.finish = true;
+    source.kick();
+    for (int i = 0; i < 64; ++i) shard.poll(1, 0);
+    check(handler.calls == 2, "the request the wrapper held was not handed over on resume");
+    shard.release();
+}
+
 } // namespace
 
 int main() {
@@ -377,6 +445,7 @@ int main() {
     test_idle_timeout();
     test_shutdown();
     test_http10_ends_by_closing();
+    test_resume_reaches_a_wrapper();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d failures\n", failures);

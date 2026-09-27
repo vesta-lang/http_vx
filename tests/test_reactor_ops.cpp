@@ -710,7 +710,68 @@ void test_the_datagram_helpers() {
 
 } // namespace
 
+/**
+ * @brief
+ * \~english A cancelled read comes back once, as a failure, with its buffer; a write beside it is left alone.
+ * \~spanish Una lectura cancelada vuelve una vez, como fallo, con su buffer; una escritura al lado no se toca.
+ * \~
+ */
+void test_a_cancelled_read_fails_and_nothing_else_does() {
+    Shard s;
+    const ConnHandle c = s.conns.open(3, 0);
+    check(c.valid(), "a connection could not be opened");
+
+    const uint32_t rb = s.pool.acquire();
+    Op read;
+    read.conn = c;
+    read.kind = OpKind::Recv;
+    read.buffer = rb;
+    read.length = 4096;
+    read.fd = 3;
+    check(s.io.submit(read), "the read was not taken");
+
+    const uint32_t wb = s.pool.acquire();
+    Buffer *w = s.pool.at(wb);
+    uint8_t *room = w->reserve(2);
+    room[0] = 'o';
+    room[1] = 'k';
+    w->commit(2);
+    Op write;
+    write.conn = c;
+    write.kind = OpKind::Send;
+    write.buffer = wb;
+    write.length = 2;
+    write.fd = 3;
+    check(s.io.submit(write), "the write was not taken");
+
+    Op cancel;
+    cancel.conn = c;
+    cancel.kind = OpKind::Cancel;
+    cancel.buffer = kNoBuffer;
+    cancel.fd = 3;
+    check(s.io.submit(cancel), "the cancel was refused");
+
+    Completion done[8];
+    const size_t n = s.io.wait(done, 8, 0);
+    check(n == 2, "not exactly the read and the write came back");
+    bool read_failed = false;
+    bool write_ok = false;
+    for (size_t i = 0; i < n; ++i) {
+        if (done[i].kind == OpKind::Recv) read_failed = !done[i].ok() && done[i].buffer == rb;
+        if (done[i].kind == OpKind::Send) write_ok = done[i].ok() && done[i].result == 2;
+    }
+    check(read_failed, "the cancelled read did not come back as a failure with its buffer");
+    check(write_ok, "the write beside it did not go out");
+    check(s.io.cancelled() == 1, "the cancel was not counted");
+
+    // \~english Nothing outstanding: a cancel does nothing and produces nothing.
+    // \~spanish Nada pendiente: una cancelacion no hace nada ni produce nada.  \~
+    check(s.io.submit(cancel), "a cancel with nothing to cancel was refused");
+    check(s.io.wait(done, 8, 0) == 0 && s.io.cancelled() == 1, "a cancel with nothing to cancel did something");
+}
+
 int main() {
+    test_a_cancelled_read_fails_and_nothing_else_does();
     test_the_datagram_helpers();
     test_a_datagram_comes_back_with_its_path();
     test_empty_and_cut_datagrams();

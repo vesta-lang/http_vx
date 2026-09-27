@@ -136,18 +136,52 @@ void Http3Service::answer(Slot &s, Work &w) noexcept {
     const Request *req = s.h3->request(w.stream, head);
     if (req == nullptr) return;
     const uint8_t *body = w.body.empty() ? nullptr : w.body.data();
+    const bool head_request = req->method == MethodId::Head;
     ResponseBuilder res(said_);
+
+    /* \~english
+     * Opening is allowed where the response can have a body: the answer to a
+     * HEAD goes whole with its head (HVX-5, 4.1).  Through the gate, which
+     * keeps this connection's limit before the loop's.
+     * \~spanish
+     * Abrir se permite donde la respuesta puede tener cuerpo: la de un HEAD sale
+     * entera con su cabecera (HVX-5, 4.1).  Por la compuerta, que lleva el tope de
+     * esta conexion antes que el del bucle.
+     * \~ */
+    const uint32_t i = static_cast<uint32_t>(&s - slots_);
+    if (port_ != nullptr && !head_request) res.allow_open(gate_, handle_of(i), w.stream, *this);
+
     handler_.handle(*req, head->data(), body, w.body.size(), res);
 
-    WireField wf[kMostFields];
-    size_t count = 0;
-    // \~english An answer that cannot travel as written is this server's fault: 500, never a changed answer.
-    // \~spanish Una respuesta que no puede viajar tal como se escribio es culpa de este servidor: 500, nunca una respuesta cambiada.  \~
-    if (res.failed() || wire_fields(res, names_, wf, kMostFields, count) != nullptr) {
+    if (res.opened_source() != nullptr) {
+        start_open(i, static_cast<size_t>(&w - s.works), w.stream, res);
+        return;
+    }
+    if (res.open_refused()) {
+        // \~english A limit, answered and never silent (HVX-1, 12).  \~spanish Un tope, contestado y nunca callado (HVX-1, 12).  \~
+        ++counts_.unavailable;
+        respond_status(s, w.stream, 503);
+        return;
+    }
+
+    const Span content = res.body();
+    const bool end_now = head_request || content.len == 0;
+    if (!send_head(s, w.stream, res, head_request, end_now)) {
         ++counts_.bad_answers;
         respond_status(s, w.stream, 500);
         return;
     }
+    if (!end_now) s.h3->send_body(w.stream, res.bytes() + content.off, content.len, true);
+    ++counts_.served;
+}
+
+bool Http3Service::send_head(Slot &s, uint64_t stream, const ResponseBuilder &res, bool head_request,
+                             bool end) noexcept {
+    WireField wf[kMostFields];
+    size_t count = 0;
+    // \~english An answer that cannot travel as written is this server's fault: 500, never a changed answer.
+    // \~spanish Una respuesta que no puede viajar tal como se escribio es culpa de este servidor: 500, nunca una respuesta cambiada.  \~
+    if (res.failed() || wire_fields(res, names_, wf, kMostFields, count) != nullptr) return false;
     qpack::Line lines[kMostFields + 1];
     bool has_length = false;
     for (size_t i = 0; i < count; ++i) {
@@ -158,8 +192,6 @@ void Http3Service::answer(Slot &s, Work &w) noexcept {
         lines[i].indexing = field_is_secret(wf[i].id) ? qpack::Indexing::Never : qpack::Indexing::Insert;
         if (wf[i].id == FieldId::ContentLength) has_length = true;
     }
-    const Span content = res.body();
-    const bool head_request = req->method == MethodId::Head;
     // \~english HEAD: the length GET would have had, and no content (RFC 9110, 9.3.2).
     // \~spanish HEAD: la longitud que habria tenido GET, y sin contenido (RFC 9110, 9.3.2).  \~
     uint8_t length[kContentLengthDigits];
@@ -167,17 +199,10 @@ void Http3Service::answer(Slot &s, Work &w) noexcept {
         lines[count].name = reinterpret_cast<const uint8_t *>(field_name(FieldId::ContentLength));
         lines[count].name_len = field_name_len(FieldId::ContentLength);
         lines[count].value = length;
-        lines[count].value_len = write_content_length(length, content.len);
+        lines[count].value_len = write_content_length(length, res.body().len);
         ++count;
     }
-    const bool end_now = head_request || content.len == 0;
-    if (!s.h3->respond(w.stream, res.status(), lines, count, end_now)) {
-        ++counts_.bad_answers;
-        respond_status(s, w.stream, 500);
-        return;
-    }
-    if (!end_now) s.h3->send_body(w.stream, res.bytes() + content.off, content.len, true);
-    ++counts_.served;
+    return s.h3->respond(stream, res.status(), lines, count, end);
 }
 
 void Http3Service::respond_status(Slot &s, uint64_t stream, StatusCode status) noexcept {

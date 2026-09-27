@@ -99,6 +99,13 @@ void RecordKeys::nonce(uint8_t *out) const noexcept {
 
 size_t RecordKeys::seal(ContentType type, const uint8_t *content, size_t n, size_t padding, uint8_t *out,
                         size_t room) noexcept {
+    if (n > kMaxFragment || kRecordHeader + n > room) return 0;
+    if (n != 0) util::vesta_memcpy(out + kRecordHeader, content, n);
+    return seal_in_place(type, n, padding, out, room);
+}
+
+size_t RecordKeys::seal_in_place(ContentType type, size_t n, size_t padding, uint8_t *out,
+                                 size_t room) noexcept {
     if (!installed() || exhausted()) return 0;
     const size_t inner = n + 1 + padding;
     if (n > kMaxFragment || inner > kMaxInnerPlaintext) return 0;
@@ -108,7 +115,6 @@ size_t RecordKeys::seal(ContentType type, const uint8_t *content, size_t n, size
     // \~spanish El tipo exterior es siempre application_data y la version 0x0303 (5.2).  \~
     write_header(out, ContentType::ApplicationData, kRecordVersion, inner + quic::kTagSize);
     uint8_t *body = out + kRecordHeader;
-    if (n != 0) util::vesta_memcpy(body, content, n);
     body[n] = static_cast<uint8_t>(type);
     // \~english Padding octets MUST be zeros (5.4).  \~spanish Los octetos de relleno DEBEN ser ceros (5.4).  \~
     if (padding != 0) util::vesta_memset(body + n + 1, 0, padding);

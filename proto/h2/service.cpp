@@ -52,6 +52,7 @@ void Http2Service::release() noexcept {
     in_hand_ = 0;
 
     bodies_.release_all();
+    opens_.release();
     said_.release();
     block_.release();
     names_.release();
@@ -59,7 +60,7 @@ void Http2Service::release() noexcept {
 
 bool Http2Service::reset(uint32_t connections, uint32_t requests,
                          size_t max_body, Handler &handler,
-                         const h2::Limits &limits) noexcept {
+                         const h2::Limits &limits, uint32_t opens) noexcept {
     release();
 
     if (connections == 0 || requests == 0) return false;
@@ -70,6 +71,7 @@ bool Http2Service::reset(uint32_t connections, uint32_t requests,
     served_ = 0;
     bad_answers_ = 0;
     last_bad_answer_ = nullptr;
+    open_full_ = 0;
 
     const util::AllocScope scope(util::AllocUse::Long, util::AllocShape::Fixed,
                                  util::AllocFill::Sparse);
@@ -132,6 +134,13 @@ bool Http2Service::reset(uint32_t connections, uint32_t requests,
         return false;
     }
 
+    // \~english The open responses have a table of their own, so a long one never holds a request's entry (HVX-5, 7.2).
+    // \~spanish Las respuestas abiertas tienen su propia tabla, para que una larga no ocupe nunca la entrada de una peticion (HVX-5, 7.2).  \~
+    if (!opens_.reset(opens)) {
+        release();
+        return false;
+    }
+
     return true;
 }
 
@@ -157,6 +166,8 @@ void Http2Service::on_open(ConnHandle c) noexcept {
     s.headers.recycle();
     s.req.clear();
     s.works = kNoWork;
+    s.handle = c;
+    s.opens = h2::OpenList();
 }
 
 void Http2Service::on_close(ConnHandle c) noexcept {
@@ -176,6 +187,14 @@ void Http2Service::on_close(ConnHandle c) noexcept {
      * esperando otra conexion.
      * \~ */
     while (s.works != kNoWork) drop_work(s, &works_[s.works]);
+
+    // \~english The open responses go with their connection, and each source is told why.
+    // \~spanish Las respuestas abiertas se van con su conexion, y a cada fuente se le dice por que.  \~
+    if (s.opens.count != 0 && port_ != nullptr) {
+        const GoneReason why = port_->closing_reason(c);
+        for (uint32_t i = opens_.pop(s.opens); i != h2::kNoOpen; i = opens_.pop(s.opens))
+            drop_open(i, why);
+    }
 
     s.conn.release();
     s.headers.release();

@@ -73,6 +73,7 @@
 
 #include "http_vx/buffer_pool.h"
 #include "http_vx/datagram.h"
+#include "http_vx/id_index.h"
 #include "http_vx/reactor_ops.h"
 
 #include <atomic>
@@ -268,6 +269,66 @@ class UringBackend final : public Backend {
      * \~
      */
     static constexpr uint64_t kWakeData = ~uint64_t{0};
+
+    /**
+     * \~english
+     * The ring carries this back for a cancel's own answer, which is
+     * swallowed: the cancel completes as nothing, and what it ended comes
+     * back through that operation's own slot.  No slot has it either -- a
+     * slot's number has its index in the low half, and no ring has this many
+     * entries.
+     * \~spanish
+     * El anillo devuelve esto para la respuesta propia de una cancelacion, que
+     * se traga: la cancelacion acaba como nada, y lo que acabo vuelve por la
+     * casilla de esa operacion.  Tampoco lo tiene ninguna casilla -- el numero
+     * de una casilla lleva su indice en la mitad baja, y ningun anillo tiene
+     * tantas entradas.
+     * \~
+     */
+    static constexpr uint64_t kCancelData = ~uint64_t{0} - 1;
+
+    /**
+     * @brief
+     * \~english Asks the kernel to end the read outstanding on @p op.fd.
+     * \~spanish Le pide al nucleo que acabe la lectura pendiente en @p op.fd.
+     * \~
+     *
+     * \~english
+     * An `IORING_OP_ASYNC_CANCEL` naming the read's exact number, found in
+     * @c reads_ without a scan.  The read then completes through its own
+     * slot, with `-ECANCELED` -- or normally, if it won the race, and both
+     * are what the contract allows.  No read outstanding is nothing to do.
+     * \~spanish
+     * Un `IORING_OP_ASYNC_CANCEL` que nombra el numero exacto de la lectura,
+     * encontrado en @c reads_ sin recorrer nada.  La lectura acaba entonces por
+     * su propia casilla, con `-ECANCELED` -- o normalmente, si gano la carrera,
+     * y las dos cosas son lo que permite el contrato.  Sin lectura pendiente no
+     * hay nada que hacer.
+     * \~
+     *
+     * @param op \~english the @c Cancel  \~spanish el @c Cancel  \~
+     * @return   \~english false if the ring had no room to ask
+     *           \~spanish false si el anillo no tenia sitio para pedirlo  \~
+     */
+    bool submit_cancel(const Op &op) noexcept;
+
+    /**
+     * \~english
+     * The slot of the read -- @c Ready or @c Recv -- outstanding on each
+     * socket, by descriptor.  What turns "end the read on this socket" into
+     * the number the kernel needs, in constant time; one entry per read, so
+     * never more than there are slots.  An entry goes when its read's
+     * completion is taken, or when its socket is closed.
+     * \~spanish
+     * La casilla de la lectura -- @c Ready o @c Recv -- pendiente en cada
+     * socket, por descriptor.  Lo que convierte "acaba la lectura de este
+     * socket" en el numero que necesita el nucleo, en tiempo constante; una
+     * entrada por lectura, asi que nunca mas que casillas.  Una entrada se va
+     * cuando se recoge la finalizacion de su lectura, o cuando se cierra su
+     * socket.
+     * \~
+     */
+    IdIndex reads_;
 
     /// \~english Opens the wake eventfd.  \~spanish Abre el eventfd de despertar.  \~
     bool wake_open() noexcept;

@@ -468,7 +468,11 @@ El detalle esta en HVX-2.  Lo que fija este documento:
   la discrepancia entre la longitud declarada y los datos del flujo.
 - **Agotar por lentitud es agotar igual.**  Cada fase DEBE tener su plazo, y de
   ahi R3.  En h2 esto incluye la inundacion de tramas de control, que fue un
-  ataque real y masivo.
+  ataque real y masivo.  Un plazo vencido DEBE cerrar aunque el otro extremo no
+  vuelva a hablar: la lectura que una conexion callada tiene en el sistema
+  operativo solo la completaria el, asi que cerrar la ACABA (`OpKind::Cancel`,
+  que cada backend implementa sin tocar las escrituras pendientes) en vez de
+  esperarla.
 - **Un analizador que retrocede es un ataque** (R12).
 - **QUIC trae amenazas propias**: amplificacion antes de validar la direccion
   -- de ahi el limite de respuesta --, agotamiento por identificadores de

@@ -55,6 +55,28 @@ bool MemoryBackend::feed(const uint8_t *p, size_t n) noexcept {
 }
 
 bool MemoryBackend::submit(const Op &op) noexcept {
+    /* \~english
+     * A cancel is not queued: it marks the read outstanding on that socket,
+     * which then completes as a failure on the next wait, bytes or not.  A
+     * scan, because this backend exists for tests and holds a few operations.
+     * \~spanish
+     * Una cancelacion no se encola: marca la lectura pendiente en ese socket,
+     * que acaba como fallo en la espera siguiente, haya bytes o no.  Una
+     * busqueda, porque este backend existe para las pruebas y tiene pocas
+     * operaciones.
+     * \~ */
+    if (op.kind == OpKind::Cancel) {
+        for (size_t k = 0; k < pending_count_; ++k) {
+            Op &p = pending_[(pending_head_ + k) % kMaxPending];
+            if ((p.kind == OpKind::Ready || p.kind == OpKind::Recv) && p.fd == op.fd) {
+                p.fd = kCancelledFd;
+                ++cancelled_;
+                break;
+            }
+        }
+        return true;
+    }
+
     if (pending_count_ == kMaxPending) return false;
 
     const size_t at = (pending_head_ + pending_count_) % kMaxPending;
@@ -68,6 +90,12 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
     c.conn = op.conn;
     c.kind = op.kind;
     c.buffer = op.buffer;
+
+    // \~english A cancelled read: a failure, and nothing read.  \~spanish Una lectura cancelada: un fallo, y nada leido.  \~
+    if (op.fd == kCancelledFd) {
+        c.result = -1;
+        return c;
+    }
 
     /* \~english
      * A failure is checked before anything else, so that an operation which
@@ -132,6 +160,11 @@ Completion MemoryBackend::finish(const Op &op) noexcept {
          * la diferencia entre una conexion rechazada y un descriptor perdido.
          * \~ */
         ++closed_;
+        c.result = 0;
+        return c;
+
+    // \~english Never queued (see submit).  \~spanish Nunca se encola (ver submit).  \~
+    case OpKind::Cancel:
         c.result = 0;
         return c;
 

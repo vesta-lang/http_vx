@@ -86,6 +86,55 @@ struct Http3Service::Slot {
 
     /// \~english The next free slot, while free.  \~spanish La casilla libre siguiente, mientras esta libre.  \~
     uint32_t next_free = kNone;
+
+    /// \~english Moves on each time the slot is freed: a stale ConnHandle finds nothing.
+    /// \~spanish Avanza cada vez que se libera la casilla: un ConnHandle caducado no encuentra nada.  \~
+    uint32_t life = 0;
+
+    /**
+     * \~english
+     * The open responses, one place per HTTP/3 message place (h3::Event::slot),
+     * so a stream reaches its own in constant time; made at the connection's
+     * first open and not before (R39), and freed with the connection.  The
+     * open ones are linked, so whoever looks at them looks at those alone.
+     * \~spanish
+     * Las respuestas abiertas, un sitio por cada sitio de mensaje de HTTP/3
+     * (h3::Event::slot), asi que un flujo llega a la suya en tiempo constante; se
+     * hace en la primera apertura de la conexion y no antes (R39), y se libera con
+     * la conexion.  Las abiertas van enlazadas, asi que quien las mira solo mira
+     * esas.
+     * \~
+     */
+    OpenStream *opens = nullptr;
+    uint32_t open_head = kNone;
+    uint32_t open_count = 0;
+};
+
+/**
+ * @brief
+ * \~english One open response: its source, its stream, and whether it wants to be filled.
+ * \~spanish Una respuesta abierta: su fuente, su flujo, y si quiere que la rellenen.
+ * \~
+ */
+struct Http3Service::OpenStream {
+    /// \~english Null while the place is free.  \~spanish Nulo mientras el sitio esta libre.  \~
+    BodySource *source = nullptr;
+    uint64_t stream = 0;
+    /// \~english Neighbours among the connection's open ones.  \~spanish Vecinos entre las abiertas de la conexion.  \~
+    uint32_t prev = kNone;
+    uint32_t next = kNone;
+    /// \~english Kicked since its last fill.  \~spanish Avisada desde su ultimo relleno.  \~
+    bool kicked = false;
+    /**
+     * \~english
+     * Its last fill took all the room, or it was never asked: filled again as
+     * soon as there is room, without a kick (HVX-5, 4.3).
+     * \~spanish
+     * Su ultimo relleno uso todo el sitio, o nunca se le pregunto: se vuelve a
+     * rellenar en cuanto hay sitio, sin aviso (HVX-5, 4.3).
+     * \~
+     */
+    bool hungry = false;
 };
 
 } // namespace http_vx

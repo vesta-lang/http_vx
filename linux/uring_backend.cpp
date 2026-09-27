@@ -70,18 +70,6 @@ int ring_enter(int fd, uint32_t to_submit, uint32_t min_complete,
 
 } // namespace
 
-/**
- * @brief
- * \~english What an operation was for, kept until its number comes back.
- * \~spanish De que era una operacion, guardado hasta que vuelva su numero.
- * \~
- */
-struct UringBackend::Slot {
-    Op op;
-    uint32_t next;
-    bool busy;
-};
-
 bool uring_available() noexcept {
     io_uring_params p;
     util::vesta_memset(&p, 0, sizeof p);
@@ -138,6 +126,8 @@ void UringBackend::release() noexcept {
         util::host_free(slots_);
         slots_ = nullptr;
     }
+
+    reads_.release();
 
     slot_count_ = 0;
     free_head_ = 0xFFFFFFFF;
@@ -283,9 +273,19 @@ bool UringBackend::reset(BufferPool &pool, uint32_t entries) noexcept {
     for (uint32_t i = 0; i < slot_count_; ++i) {
         new (&slots_[i]) Slot();
         slots_[i].busy = false;
+        slots_[i].cancelling = false;
+        slots_[i].life = 0;
         slots_[i].next = i + 1 == slot_count_ ? 0xFFFFFFFF : i + 1;
     }
     free_head_ = 0;
+
+    // \~english One read at most per slot, so never more entries than slots.
+    // \~spanish Una lectura como mucho por casilla, asi que nunca mas entradas que casillas.  \~
+    if (!reads_.reset(slot_count_)) {
+        last_error_ = ENOMEM;
+        release();
+        return false;
+    }
 
     if (!wake_open()) {
         release();
@@ -310,6 +310,8 @@ UringBackend::Slot *UringBackend::take() noexcept {
     Slot *s = &slots_[free_head_];
     free_head_ = s->next;
     s->busy = true;
+    s->cancelling = false;
+    ++s->life;
     ++in_flight_;
     return s;
 }
@@ -337,6 +339,32 @@ bool UringBackend::remember(const Op &op, int32_t result, int32_t fd) noexcept {
 bool UringBackend::submit(const Op &op) noexcept {
     if (ring_ == nullptr) return false;
 
+    // \~english A cancel takes no slot: it completes as nothing.
+    // \~spanish Una cancelacion no coge casilla: acaba como nada.  \~
+    if (op.kind == OpKind::Cancel) return submit_cancel(op);
+
+    const bool stream_read = op.kind == OpKind::Ready || op.kind == OpKind::Recv;
+
+    /* \~english
+     * One read per socket, as on epoll, because a cancel ends "the" read on a
+     * socket and the index keeps one.  A second would also be a stream's
+     * bytes landing in an order nobody chose.  It is failed, loudly, rather
+     * than handed over unindexed -- a read no cancel can reach is the very
+     * thing a cancel exists to prevent.
+     * \~spanish
+     * Una lectura por socket, como en epoll, porque una cancelacion acaba "la"
+     * lectura de un socket y el indice guarda una.  Una segunda seria ademas los
+     * bytes de un flujo cayendo en un orden que no eligio nadie.  Se hace fallar,
+     * en voz alta, en vez de entregarla sin indice -- una lectura a la que no
+     * llega ninguna cancelacion es justo lo que existe para evitar una
+     * cancelacion.
+     * \~ */
+    if (stream_read && op.fd >= 0 &&
+        reads_.find(static_cast<uint64_t>(op.fd)) != IdIndex::kAbsent) {
+        last_error_ = EBUSY;
+        return remember(op, -1, -1);
+    }
+
     /* \~english
      * Room in the ring is checked against what the KERNEL has read, not
      * against what this end has written.  The two differ by exactly the
@@ -363,7 +391,8 @@ bool UringBackend::submit(const Op &op) noexcept {
     io_uring_sqe *sqe = &ring_->sqes[tail & ring_->sq_mask];
     util::vesta_memset(sqe, 0, sizeof *sqe);
 
-    sqe->user_data = static_cast<uint64_t>(slot - slots_);
+    const uint32_t index = static_cast<uint32_t>(slot - slots_);
+    sqe->user_data = slot_user_data(index, slot->life);
 
     bool made = true;
 
@@ -414,7 +443,7 @@ bool UringBackend::submit(const Op &op) noexcept {
 
     case OpKind::RecvFrom:
     case OpKind::SendTo:
-        made = prep_datagram(op, sqe, static_cast<uint32_t>(slot - slots_));
+        made = prep_datagram(op, sqe, index);
         break;
 
     case OpKind::Recv: {
@@ -468,13 +497,55 @@ bool UringBackend::submit(const Op &op) noexcept {
             break;
         }
         dgram_.remove(op.fd);
+
+        /* \~english
+         * And its read, if one is still out, leaves the index: the number is
+         * about to be handed to the next socket the system opens, and that
+         * socket's first read must be indexable -- and cancellable -- and not
+         * refused as a second read of a socket that no longer exists.
+         * \~spanish
+         * Y su lectura, si queda alguna fuera, sale del indice: el numero se le
+         * va a dar al siguiente socket que abra el sistema, y la primera lectura
+         * de ese socket tiene que poder indexarse -- y cancelarse -- y no
+         * rechazarse como segunda lectura de un socket que ya no existe.
+         * \~ */
+        reads_.erase(static_cast<uint64_t>(op.fd));
+
         sqe->opcode = IORING_OP_CLOSE;
         sqe->fd = op.fd;
+        break;
+
+    // \~english Answered at the top, before any slot is taken.
+    // \~spanish Contestada arriba, antes de coger ninguna casilla.  \~
+    case OpKind::Cancel:
+        made = false;
         break;
     }
 
     if (!made) {
         give(slot);
+        return remember(op, -1, -1);
+    }
+
+    /* \~english
+     * Indexed only once it is certain to be handed over, so that the index
+     * never names a read the kernel was not given.
+     * \~spanish
+     * Se indexa solo cuando es seguro que se entrega, para que el indice no
+     * nombre nunca una lectura que no se le dio al nucleo.
+     * \~
+     * \~english
+     * It cannot be full -- one read per slot, and it holds as many as there
+     * are slots -- but if it ever were, the read is failed rather than handed
+     * over where no cancel could reach it.
+     * \~spanish
+     * No puede estar lleno -- una lectura por casilla, y caben tantas como
+     * casillas -- pero si lo estuviera alguna vez, la lectura se hace fallar en
+     * vez de entregarla donde no la alcanzaria ninguna cancelacion.
+     * \~ */
+    if (stream_read && !reads_.insert(static_cast<uint64_t>(op.fd), index)) {
+        give(slot);
+        last_error_ = ENOSPC;
         return remember(op, -1, -1);
     }
 
@@ -604,13 +675,50 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
             wake_armed_ = false;
             continue;
         }
-        if (which >= slot_count_) continue;
 
-        Slot *slot = &slots_[which];
-        if (!slot->busy) continue;
+        /* \~english
+         * A cancel's own answer, swallowed: what it ended comes back through
+         * that operation's slot.  Zero is "ended", `-ENOENT` is "it had
+         * already finished" and `-EALREADY` is "it is finishing" -- the
+         * races the contract allows.  Anything else is a cancel the kernel
+         * refused, which would leave a read nobody ends, so it is kept as
+         * the last error rather than dropped.
+         * \~spanish
+         * La respuesta propia de una cancelacion, tragada: lo que acabo vuelve
+         * por la casilla de esa operacion.  Cero es "acabada", `-ENOENT` es "ya
+         * habia acabado" y `-EALREADY` es "esta acabando" -- las carreras que
+         * permite el contrato.  Cualquier otra cosa es una cancelacion que el
+         * nucleo rechazo, que dejaria una lectura que no acaba nadie, asi que se
+         * guarda como ultimo error en vez de tirarse.
+         * \~ */
+        if (which == kCancelData) {
+            if (res < 0 && res != -ENOENT && res != -EALREADY) last_error_ = -res;
+            continue;
+        }
+
+        const uint32_t index = slot_index_of(which);
+        if (index >= slot_count_) continue;
+
+        Slot *slot = &slots_[index];
+        if (!slot->busy || slot->life != slot_life_of(which)) continue;
 
         const Op op = slot->op;
         give(slot);
+
+        /* \~english
+         * A read leaves the index when its completion is taken -- only if the
+         * index still names THIS slot: a socket closed with its read out left
+         * the index at the close, and its number may already have a read of
+         * the next socket.
+         * \~spanish
+         * Una lectura sale del indice cuando se recoge su finalizacion -- solo
+         * si el indice sigue nombrando ESTA casilla: un socket cerrado con su
+         * lectura fuera salio del indice al cerrarse, y su numero puede tener ya
+         * una lectura del socket siguiente.
+         * \~ */
+        if ((op.kind == OpKind::Ready || op.kind == OpKind::Recv) &&
+            reads_.find(static_cast<uint64_t>(op.fd)) == index)
+            reads_.erase(static_cast<uint64_t>(op.fd));
 
         Completion done;
         done.conn = op.conn;
@@ -637,7 +745,7 @@ size_t UringBackend::wait(Completion *out, size_t cap, int timeout_ms) noexcept 
              * \~ */
             done.result = res < 0 ? -1 : 0;
         } else if (op.kind == OpKind::RecvFrom || op.kind == OpKind::SendTo) {
-            done.result = finish_datagram(op, res, static_cast<uint32_t>(which));
+            done.result = finish_datagram(op, res, index);
         } else {
             done.result = res;
 

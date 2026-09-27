@@ -425,6 +425,36 @@ class EpollBackend final : public Backend {
      */
     void fail_waiting(int32_t fd) noexcept;
 
+    /**
+     * @brief
+     * \~english Ends the read -- @c Ready or @c Recv -- waiting on stream socket @p fd, as a failure.
+     * \~spanish Acaba la lectura -- @c Ready o @c Recv -- que espera en el socket de flujo @p fd, como fallo.
+     * \~
+     *
+     * \~english
+     * What @c OpKind::Cancel is here.  The read is only a note, so ending it
+     * is taking the note out and answering it into the ready list with
+     * @c -ECANCELED: it comes out of the next @c wait with its buffer, once.
+     * No room has to be made, because the room for that completion was made
+     * when the read was accepted and it simply stops counting as waiting.
+     * The socket is armed again for what it still waits for -- a write --
+     * and nothing else.  No read waiting (it already completed, or there
+     * never was one) is nothing to do.
+     * \~spanish
+     * Lo que es aqui @c OpKind::Cancel.  La lectura es solo una nota, asi que
+     * acabarla es quitar la nota y contestarla en la lista de listas con
+     * @c -ECANCELED: sale de la siguiente @c wait con su buffer, una vez.  No hay
+     * que hacer sitio, porque el sitio para esa finalizacion se hizo al aceptar
+     * la lectura y simplemente deja de contar como en espera.  El socket se
+     * vuelve a armar para lo que todavia espera -- una escritura -- y nada mas.
+     * Sin lectura esperando (ya acabo, o no la hubo nunca) no hay nada que hacer.
+     * \~
+     *
+     * @param fd \~english the socket the @c Cancel named
+     *           \~spanish el socket que nombro el @c Cancel  \~
+     */
+    void cancel_read(int32_t fd) noexcept;
+
     uint16_t port_ = 0;
     int32_t last_error_ = 0;
 };

@@ -334,9 +334,88 @@ void test_end_to_end() {
     }
 }
 
+/**
+ * @brief
+ * \~english Writing in place: framing kept in front, the body where it stays, and a reservation given back.
+ * \~spanish Escribir en su sitio: el enmarcado guardado delante, el cuerpo donde se queda, y una reserva devuelta.
+ * \~
+ */
+void test_in_place() {
+    {
+        SendStream s(65536, 1u << 20);
+        size_t room = 0;
+        uint8_t *at = s.reserve(3, room);
+        check(at != nullptr && room == kRecvChunk - 3, "the room reaches the end of the first chunk, after the framing");
+        std::memcpy(at, "hello", 5);
+        const uint8_t head[3] = {'X', 'Y', 'Z'};
+        check(s.commit(head, 3, 5) == StreamError::None && s.written() == 8, "framing and body are taken together");
+        StreamPiece p;
+        check(send_one(s, p, 100) && p.len == 8 && std::memcmp(p.data, "XYZhello", 8) == 0,
+              "they go out in order, framing first");
+    }
+    {
+        // \~english The framing straddles two chunks; the body starts in the second.
+        // \~spanish El enmarcado cae entre dos trozos; el cuerpo empieza en el segundo.  \~
+        SendStream s(65536, 1u << 20);
+        const std::vector<uint8_t> lead = pattern(kRecvChunk - 2);
+        size_t took = 0;
+        s.write(lead.data(), lead.size(), took);
+        size_t room = 0;
+        uint8_t *at = s.reserve(3, room);
+        check(at != nullptr && room == kRecvChunk - 1, "the body's room is the next chunk after the framing's last byte");
+        at[0] = 'b';
+        const uint8_t head[3] = {'1', '2', '3'};
+        check(s.commit(head, 3, 1) == StreamError::None && s.written() == kRecvChunk + 2, "taken across the chunks");
+        StreamPiece p;
+        check(send_one(s, p, kRecvChunk) && p.len == kRecvChunk && p.data[kRecvChunk - 2] == '1' &&
+                  p.data[kRecvChunk - 1] == '2',
+              "the first chunk ends with the framing's first bytes");
+        check(send_one(s, p, kRecvChunk) && p.len == 2 && p.data[0] == '3' && p.data[1] == 'b',
+              "and the second holds the rest, then the body");
+    }
+    {
+        // \~english Given back: the chunk the reservation made is freed, so silence holds nothing.
+        // \~spanish Devuelta: el trozo que hizo la reserva se libera, asi que callar no retiene nada.  \~
+        SendStream s(65536, 1u << 20);
+        size_t room = 0;
+        check(s.reserve(3, room) != nullptr && s.chunks_held() == 1, "a reservation makes its chunk");
+        check(s.commit(nullptr, 0, 0) == StreamError::None && s.chunks_held() == 0 && s.written() == 0,
+              "and giving it back frees it");
+        const std::vector<uint8_t> lead = pattern(100);
+        size_t took = 0;
+        s.write(lead.data(), lead.size(), took);
+        check(s.reserve(3, room) != nullptr && s.commit(nullptr, 0, 0) == StreamError::None && s.chunks_held() == 1,
+              "a chunk that holds written bytes is kept");
+    }
+    {
+        // \~english The capacity bounds it, framing included; a finished stream takes nothing.
+        // \~spanish La capacidad lo acota, enmarcado incluido; un flujo terminado no admite nada.  \~
+        SendStream s(kRecvChunk, 1u << 20);
+        const std::vector<uint8_t> lead = pattern(kRecvChunk - 3);
+        size_t took = 0;
+        s.write(lead.data(), lead.size(), took);
+        size_t room = 7;
+        check(s.reserve(3, room) == nullptr && room == 0, "no room when only the framing would fit");
+        SendStream t(65536, 1u << 20);
+        t.finish();
+        check(t.reserve(3, room) == nullptr && room == 0, "a finished stream takes nothing");
+
+        // \~english The capacity binds before the chunk's end: what is left of it, less the framing.
+        // \~spanish La capacidad limita antes del final del trozo: lo que queda de ella, menos el enmarcado.  \~
+        SendStream u(2 * kRecvChunk, 1u << 20);
+        const std::vector<uint8_t> full = pattern(2 * kRecvChunk);
+        u.write(full.data(), full.size(), took);
+        StreamPiece p;
+        check(send_one(u, p, 100) && p.len == 100, "the first hundred bytes go out");
+        u.on_acked(p.offset, p.len, false);
+        check(u.reserve(3, room) != nullptr && room == 97, "a hundred acknowledged make room for 97 after the framing");
+    }
+}
+
 } // namespace
 
 int main() {
+    test_in_place();
     test_basic();
     test_flow_control();
     test_loss_and_retransmission();

@@ -183,4 +183,48 @@ void EpollBackend::fail_waiting(int32_t fd) noexcept {
     }
 }
 
+void EpollBackend::cancel_read(int32_t fd) noexcept {
+    if (fd < 0 || static_cast<uint32_t>(fd) >= max_fds_) return;
+
+    Waiting &w = waiting_[fd];
+
+    /* \~english
+     * Only a stream read the contract names.  An @c Accept also waits in the
+     * read note -- on the listening socket -- and a datagram socket keeps its
+     * receives in queues of its own; ending either is not what a @c Cancel
+     * asks for, so neither is touched.
+     * \~spanish
+     * Solo una lectura de flujo de las que nombra el contrato.  Un @c Accept
+     * tambien espera en la nota de lectura -- en el socket de escucha -- y un
+     * socket de datagramas guarda sus recepciones en colas propias; acabar
+     * cualquiera de los dos no es lo que pide un @c Cancel, asi que no se tocan.
+     * \~ */
+    if (w.dgram >= 0 || !w.has_read) return;
+    if (w.read.kind != OpKind::Ready && w.read.kind != OpKind::Recv) return;
+
+    /* \~english
+     * `-ECANCELED` and not the bare -1 of the other failures: it is what
+     * io_uring says for the same thing, and a caller that ever needs to tell
+     * "ended on purpose" from "the socket broke" has the number to do it.
+     * \~spanish
+     * `-ECANCELED` y no el -1 pelado de los demas fallos: es lo que dice io_uring
+     * de lo mismo, y quien alguna vez necesite distinguir "acabada a proposito"
+     * de "se rompio el socket" tiene el numero para hacerlo.
+     * \~ */
+    remember(w.read, -ECANCELED, -1);
+    w.has_read = false;
+    --in_flight_;
+
+    /* \~english
+     * Re-armed for the write, if one waits.  With nothing left the socket is
+     * left as it is: oneshot reports it at most once more, to a note that is
+     * empty, and that report disarms it -- the reasoning in @c arm.
+     * \~spanish
+     * Rearmado para la escritura, si espera una.  Sin nada mas el socket se deja
+     * como esta: el oneshot lo informa como mucho una vez mas, a una nota vacia,
+     * y ese aviso lo desarma -- el razonamiento de @c arm.
+     * \~ */
+    if (!arm(fd)) fail_waiting(fd);
+}
+
 } // namespace http_vx

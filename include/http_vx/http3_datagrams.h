@@ -82,6 +82,14 @@ class Http3Datagrams final : public DatagramService {
 
     void on_timer(uint64_t now) noexcept override;
 
+    /// \~english Hands the shard's port to the service: it opens, fills and ends responses through it.
+    /// \~spanish Le pasa la puerta del fragmento al servicio: abre, rellena y acaba respuestas por ella.  \~
+    void attach(OpenPort *port) noexcept override { service_.attach(port); }
+
+    /// \~english The shard lets go: the service ends everything open with GoneReason::Shutdown.
+    /// \~spanish El fragmento lo suelta todo: el servicio acaba todo lo abierto con GoneReason::Shutdown.  \~
+    void on_shutdown() noexcept override { service_.on_shutdown(); }
+
     /// \~english How long the loop may sleep before the service's next timer, at most @p cap_ms.
     /// \~spanish Cuanto puede dormir el bucle antes del siguiente temporizador del servicio, como mucho @p cap_ms.  \~
     int wait_ms(int cap_ms) const noexcept;

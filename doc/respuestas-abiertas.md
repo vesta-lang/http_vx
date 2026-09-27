@@ -377,6 +377,25 @@ La salida de una respuesta abierta pasa por el mismo sellado que el resto:
 `fill` escribe en claro en la carga del registro, y se cifra en su sitio.  La
 fuente no sabe que TLS esta ahi, igual que no lo sabe el manejador.
 
+Lo que lo hace posible es que `Service::on_writable` recibe un presupuesto:
+cuantos bytes puede anadir esa llamada, enmarcado incluido.  El servicio TLS
+guarda la cabecera de un registro, llama al servicio de dentro con un
+presupuesto de 2^14 -- un registro --, y sella en su sitio lo que este escribio
+justo detras: tipo, relleno y marca se anaden detras y el proveedor cifra el
+texto interior donde esta.  Mientras el de dentro escriba y quepa otro registro
+entero en el presupuesto del fragmento, le vuelve a pedir.  Una llamada que no
+escribe nada no deja registro: la cabecera guardada se retira.  Una
+actualizacion de claves debida sale antes de guardar el sitio.
+
+La cabecera de la respuesta y el primer relleno salen con la peticion, por el
+camino corriente de TLS, que copia el texto en claro al sellarlo; los rellenos
+siguientes no copian.
+
+Al reanudar una conexion de HTTP/1.1 retenida, el fragmento llama al servicio
+aunque el no guarde nada de ella, y TLS entrega al de dentro siempre que tenga
+texto en claro: las peticiones que esperaron detras ya estan descifradas en su
+buffer, y si no, esperarian a que el otro extremo dijera algo nuevo.
+
 ## 8. Memoria
 
 - Una respuesta abierta ocupa su entrada de la tabla de respuestas abiertas

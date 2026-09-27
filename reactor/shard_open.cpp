@@ -144,7 +144,7 @@ void Shard::run_writable(ConnHandle c, ConnHot &h) noexcept {
     }
 
     Buffer *out = pool_.at(b);
-    const bool keep = service_->on_writable(c, *out);
+    const bool keep = service_->on_writable(c, *out, cfg_.write_size);
 
     ConnHot *now = conns_.hot(c);
     if (now == nullptr) {
@@ -201,14 +201,21 @@ void Shard::run_asked() noexcept {
              * primero -- las peticiones que esperaron detras de la respuesta
              * abierta -- y solo despues se lee algo mas.
              * \~ */
-            if ((h->flags & (kHeld | kClosing)) == 0) {
-                if (h->reading != kNoBuffer && (h->flags & kReadPending) == 0) {
-                    const uint32_t b = h->reading;
-                    h->reading = kNoBuffer;
-                    serve(c, *h, b);
-                } else {
-                    want_read(c, *h);
-                }
+            /* \~english
+             * The service is called even when the shard holds nothing of the
+             * connection: a service that wraps another -- TLS -- may hold what
+             * waited, already decrypted, and nothing else would hand it over
+             * until the peer said something new.
+             * \~spanish
+             * Se llama al servicio aunque el fragmento no guarde nada de la
+             * conexion: un servicio que envuelve a otro -- TLS -- puede tener lo
+             * que espero, ya descifrado, y nada mas lo entregaria hasta que el
+             * otro extremo dijera algo nuevo.
+             * \~ */
+            if ((h->flags & (kHeld | kClosing | kReadPending)) == 0) {
+                const uint32_t b = h->reading;
+                h->reading = kNoBuffer;
+                serve(c, *h, b);
             }
 
             h = conns_.hot(c);

@@ -411,6 +411,17 @@ int EpollBackend::try_now(const Op &op) noexcept {
 
     case OpKind::Close:
         return 0;
+
+    /* \~english
+     * Never here either: @c submit answers a cancel before anything is tried,
+     * and there is nothing to try -- it ends a note, not a socket call.
+     * \~spanish
+     * Tampoco aqui: @c submit contesta una cancelacion antes de intentar nada, y
+     * no hay nada que intentar -- acaba una nota, no una llamada sobre un socket.
+     * \~ */
+    case OpKind::Cancel:
+        errno = EINVAL;
+        return -1;
     }
 
     return -1;
@@ -446,6 +457,20 @@ bool EpollBackend::submit(const Op &want) noexcept {
      * servidor escuchaba en un puerto al que no miraba nunca.
      * \~ */
     if (op.kind == OpKind::Accept) op.fd = listener_;
+
+    /* \~english
+     * A @c Cancel before any room is made, because it needs none: it
+     * completes as nothing, and the read it ends had its room reserved when
+     * it was accepted.  So it is never refused.
+     * \~spanish
+     * Un @c Cancel antes de hacer ningun sitio, porque no le hace falta: acaba
+     * como nada, y la lectura que acaba tenia su sitio reservado desde que se
+     * acepto.  Asi que no se rechaza nunca.
+     * \~ */
+    if (op.kind == OpKind::Cancel) {
+        cancel_read(op.fd);
+        return true;
+    }
 
     /* \~english
      * Room for this operation's completion is made FIRST, before anything is

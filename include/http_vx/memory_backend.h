@@ -203,6 +203,9 @@ class MemoryBackend final : public Backend {
     /// \~spanish Cuantos sockets se le dijo a este backend que cerrara.  \~
     size_t closed() const noexcept { return closed_; }
 
+    /// \~english How many outstanding reads were cancelled.  \~spanish Cuantas lecturas pendientes se cancelaron.  \~
+    size_t cancelled() const noexcept { return cancelled_; }
+
     /**
      * @brief
      * \~english Says the peer has closed its end.
@@ -398,6 +401,11 @@ class MemoryBackend final : public Backend {
     size_t arrivals_count_ = 0;
 
     size_t closed_ = 0;
+    size_t cancelled_ = 0;
+
+    /// \~english The socket a cancelled read is left with: it completes as a failure.
+    /// \~spanish El socket con el que se queda una lectura cancelada: acaba como fallo.  \~
+    static constexpr int32_t kCancelledFd = -0x7FFFFFFF - 1;
 
     /// \~english The datagrams waiting to be received, as a ring.
     /// \~spanish Los datagramas esperando a recibirse, en anillo.  \~

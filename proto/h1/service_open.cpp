@@ -91,7 +91,7 @@ bool Http1Service::start_open(ConnHandle c, State &s, const ResponseBuilder &res
 
     // \~english And the first fill, since there is room right now (HVX-5, 4.3).
     // \~spanish Y el primer relleno, porque ahora mismo hay sitio (HVX-5, 4.3).  \~
-    if (!fill_open(c, s, out)) return false;
+    if (!fill_open(c, s, out, kFillRoom + kFramingMax)) return false;
 
     // \~english Still open: nothing behind it is read until it ends.
     // \~spanish Sigue abierta: no se lee nada de detras hasta que acabe.  \~
@@ -99,7 +99,7 @@ bool Http1Service::start_open(ConnHandle c, State &s, const ResponseBuilder &res
     return true;
 }
 
-bool Http1Service::fill_open(ConnHandle c, State &s, Buffer &out) noexcept {
+bool Http1Service::fill_open(ConnHandle c, State &s, Buffer &out, size_t budget) noexcept {
     /* \~english
      * The room for the framing is kept in front and behind, the source writes
      * its bytes where they will leave from, and the size goes in front once
@@ -111,18 +111,34 @@ bool Http1Service::fill_open(ConnHandle c, State &s, Buffer &out) noexcept {
      * ancho fijado antes, que es por lo que la cabecera del trozo se escribe con
      * ceros delante.  No se copia ningun byte.
      * \~ */
-    const size_t digits = s.chunked ? h1::chunk_size_digits(kFillRoom) : 0;
+    /* \~english
+     * The room is what the budget leaves after the framing, never more than
+     * one fill's worth.  The digits are those of the room, fixed before the
+     * source knows how much it will give.
+     * \~spanish
+     * El sitio es lo que deja el presupuesto tras el enmarcado, nunca mas que un
+     * relleno.  Las cifras son las del sitio, fijadas antes de que la fuente
+     * sepa cuanto va a dar.
+     * \~ */
+    // \~english No room for a byte of body: the kick stays for the next call.
+    // \~spanish Sin sitio para un byte de cuerpo: el aviso se queda para la llamada siguiente.  \~
+    const size_t framing = s.chunked ? kFramingMax : 0;
+    if (budget <= framing) return true;
+    s.kicked = false;
+    const size_t room = budget - framing < kFillRoom ? budget - framing : kFillRoom;
+
+    const size_t digits = s.chunked ? h1::chunk_size_digits(room) : 0;
     const size_t front = s.chunked ? digits + 2 : 0;
     const size_t back = s.chunked ? sizeof h1::kChunkEnd + sizeof h1::kLastChunk : 0;
 
-    uint8_t *base = out.reserve(front + kFillRoom + back);
+    uint8_t *base = out.reserve(front + room + back);
     if (base == nullptr) {
         end_open(s, GoneReason::ConnectionClosed);
         return false;
     }
 
     bool done = false;
-    const size_t n = port_->fill(*s.open, base + front, kFillRoom, done);
+    const size_t n = port_->fill(*s.open, base + front, room, done);
 
     size_t used = 0;
     if (!s.chunked) {
@@ -155,19 +171,18 @@ bool Http1Service::fill_open(ConnHandle c, State &s, Buffer &out) noexcept {
 
     // \~english All the room taken: it may have more, and is asked again when there is room.
     // \~spanish Uso todo el sitio: puede tener mas, y se le vuelve a pedir cuando haya sitio.  \~
-    s.hungry = n == kFillRoom;
+    s.hungry = n == room;
     if (s.hungry) port_->want_writable(c);
     return true;
 }
 
-bool Http1Service::on_writable(ConnHandle c, Buffer &out) noexcept {
+bool Http1Service::on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept {
     if (c.slot >= capacity_ || port_ == nullptr) return true;
 
     State &s = state_[c.slot];
     if (s.open == nullptr || (!s.kicked && !s.hungry)) return true;
 
-    s.kicked = false;
-    if (!fill_open(c, s, out)) return false;
+    if (!fill_open(c, s, out, budget)) return false;
 
     // \~english An HTTP/1.0 body ends with the connection.
     // \~spanish Un cuerpo de HTTP/1.0 acaba con la conexion.  \~

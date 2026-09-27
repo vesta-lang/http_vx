@@ -614,6 +614,42 @@ void test_a_finished_connection_closes_its_socket(Which which) {
 
 /**
  * @brief
+ * \~english A connection whose deadline passes is hung up on, although its peer says nothing.
+ * \~spanish A una conexion cuyo plazo vence se le cuelga, aunque su otro extremo no diga nada.
+ * \~
+ *
+ * \~english
+ * A quiet connection has a read with the operating system -- the notice
+ * that something arrived -- and a connection does not leave while an
+ * operation of it is outstanding.  So closing it has to END that read, not
+ * wait for it: a peer that is gone for good never completes it, and the
+ * deadline would close nothing.  A memory backend cannot show this, because
+ * its tests end the stream by hand.
+ * \~spanish
+ * Una conexion callada tiene una lectura en el sistema operativo -- el aviso
+ * de que llego algo -- y una conexion no se va mientras tenga una operacion
+ * pendiente.  Asi que cerrarla tiene que ACABAR esa lectura, no esperarla: un
+ * extremo que se fue para siempre no la completa nunca, y el plazo no cerraria
+ * nada.  Un backend de memoria no puede ensenar esto, porque sus pruebas acaban
+ * el flujo a mano.
+ * \~
+ */
+void test_an_expired_connection_is_hung_up_on(Which which) {
+    Server s;
+    if (!started(s, which)) return;
+
+    Client c;
+    check(c.open(s.port()), "the client could not connect");
+    check(insist(s, c, "GET /quiet HTTP/1.1\r\nHost: a\r\n\r\n"), "the request never went out");
+    check(pump(s, c, answered), "the answer never came back");
+
+    s.shard.expire(1000000);
+    check(pump(s, c, hung_up), "an expired connection was never hung up on");
+    check(s.shard.conns().count() == 0, "the expired connection is still in the table");
+}
+
+/**
+ * @brief
  * \~english One socket serves more than one request.
  * \~spanish Un socket sirve mas de una peticion.
  * \~
@@ -1015,6 +1051,7 @@ void run_every_case(Which which) {
 
         test_a_request_over_a_socket(which);
         test_a_finished_connection_closes_its_socket(which);
+        test_an_expired_connection_is_hung_up_on(which);
         test_two_requests_on_one_socket(which);
         test_four_sockets_at_once(which);
         test_an_idle_socket_holds_no_buffer(which);

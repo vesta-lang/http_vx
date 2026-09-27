@@ -214,6 +214,86 @@ public:
     /// \~english Content bytes on @p stream, in DATA frames; @p end closes it.  \~spanish Bytes de contenido en @p stream, en tramas DATA; @p end lo cierra.  \~
     bool send_body(uint64_t stream, const uint8_t *p, size_t n, bool end) noexcept;
 
+    /**
+     * \~english
+     * The DATA frame header of a body filled in place: its type in one byte
+     * and its length in two, whatever the length.  Two bytes hold up to 16383
+     * and a fill is at most one send chunk, so the width is fixed before the
+     * length is known; a length need not be minimal (RFC 9000, 16 -- only a
+     * QUIC frame's type must be; RFC 9114, 7.1).
+     * \~spanish
+     * La cabecera de trama DATA de un cuerpo rellenado en su sitio: su tipo en un
+     * byte y su longitud en dos, sea cual sea la longitud.  Dos bytes caben hasta
+     * 16383 y un relleno es como mucho un trozo de envio, asi que el ancho se fija
+     * antes de saber la longitud; una longitud no tiene por que ser minima (RFC
+     * 9000, 16 -- solo el tipo de una trama QUIC tiene que serlo; RFC 9114, 7.1).
+     * \~
+     */
+    static constexpr size_t kFillHead = 3;
+
+    /**
+     * \~english
+     * The most a stream with an open body keeps written and not yet sent: one
+     * chunk.  The transport's credit could let a source fill far more, and all
+     * of it would sit in memory until the congestion window let it go; this
+     * way what is filled is what is about to leave, and the next fill comes
+     * when it has left.
+     * \~spanish
+     * Lo mas que guarda escrito y sin mandar un flujo con un cuerpo abierto: un
+     * trozo.  El credito del transporte podria dejar a una fuente rellenar mucho
+     * mas, y todo se quedaria en memoria hasta que la ventana de congestion lo
+     * dejara salir; asi lo que se rellena es lo que esta a punto de salir, y el
+     * siguiente relleno llega cuando ha salido.
+     * \~
+     */
+    static constexpr size_t kFillAhead = quic::kRecvChunk;
+
+    /// \~english Server: which place holds @p stream's message (Event::slot); Event::kNoSlot if none.
+    /// \~spanish Servidor: que sitio guarda el mensaje de @p stream (Event::slot); Event::kNoSlot si ninguno.  \~
+    size_t slot_of(uint64_t stream) const noexcept;
+
+    /**
+     * @brief
+     * \~english Server: where the body of the next DATA frame on @p stream is written, in place; null if there is no room.
+     * \~spanish Servidor: donde se escribe el cuerpo de la siguiente trama DATA de @p stream, en su sitio; nulo si no hay sitio.
+     * \~
+     *
+     * \~english
+     * The room is the least of the stream's flow control credit, the
+     * connection's (less what this stream and this end's control and QPACK
+     * streams wrote and have not sent), kFillAhead and what the send side has
+     * contiguous, all after the frame header.  None
+     * before the final response's header section has gone into the stream, or
+     * once the stream is ended or reset.  The pointer is taken by body_commit,
+     * which MUST come next.
+     * \~spanish
+     * El sitio es el menor del credito de control de flujo del flujo, el de la
+     * conexion (menos lo que este flujo y los flujos de control y de QPACK de este
+     * extremo escribieron y no mandaron), kFillAhead y lo que tiene seguido el
+     * lado de envio, todo tras la cabecera de la trama.  Ninguno
+     * antes de que la cabecera de la respuesta final haya entrado en el flujo, ni
+     * cuando el flujo acabo o se reinicio.  El puntero lo toma body_commit, que
+     * DEBE ir justo despues.
+     * \~
+     *
+     * @param room \~english how many body bytes fit there  \~spanish cuantos bytes de cuerpo caben ahi  \~
+     */
+    uint8_t *body_room(uint64_t stream, size_t &room) noexcept;
+
+    /**
+     * @brief
+     * \~english Server: the @p n bytes written at body_room become one DATA frame; @p end ends the stream after it.
+     * \~spanish Servidor: los @p n bytes escritos en body_room pasan a ser una trama DATA; @p end acaba el flujo tras ella.
+     * \~
+     *
+     * \~english Zero bytes is no frame; with @p end, the stream ends alone.
+     * \~spanish Cero bytes es ninguna trama; con @p end, el flujo acaba solo.  \~
+     *
+     * @return \~english false if this was not the room given, or @p n exceeds it: the connection fails, loudly
+     *         \~spanish false si este no era el sitio dado, o @p n lo supera: la conexion falla, en voz alta  \~
+     */
+    bool body_commit(uint64_t stream, size_t n, bool end) noexcept;
+
     /// \~english Client: opens a request stream and sends its header section; the stream's ID, or ~0.
     /// \~spanish Cliente: abre un flujo de peticion y manda su seccion de cabecera; el ID del flujo, o ~0.  \~
     uint64_t send_request(const qpack::Line *lines, size_t count, bool end) noexcept;
@@ -381,6 +461,11 @@ private:
      * \~spanish Bytes entregados con un evento Body, consumidos en el siguiente poll.  \~ */
     uint64_t defer_stream_ = ~uint64_t{0};
     size_t defer_n_ = 0;
+
+    /* \~english The room body_room gave, and on which stream: what body_commit checks.
+     * \~spanish El sitio que dio body_room, y en que flujo: lo que comprueba body_commit.  \~ */
+    uint64_t fill_stream_ = ~uint64_t{0};
+    size_t fill_room_ = 0;
 
     /// \~english GOAWAY sent (server: the first stream refused) and received.  \~spanish GOAWAY mandado (servidor: el primer flujo rechazado) y recibido.  \~
     uint64_t goaway_sent_ = ~uint64_t{0};

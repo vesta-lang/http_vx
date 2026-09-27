@@ -112,6 +112,60 @@ public:
      */
     StreamError write(const uint8_t *p, size_t n, size_t &accepted) noexcept;
 
+    /**
+     * @brief
+     * \~english Room to write in place: @p front bytes of framing kept at the write point, then up to @p room contiguous bytes.
+     * \~spanish Sitio para escribir en su lugar: @p front bytes de enmarcado guardados en el punto de escritura, y despues hasta @p room bytes seguidos.
+     * \~
+     *
+     * \~english
+     * For a writer that produces its bytes where they will be kept, and
+     * knows its framing only afterwards: an HTTP/3 DATA frame whose length is
+     * the body just produced.  @p room reaches the end of one chunk at most,
+     * because only a chunk is contiguous; whatever the capacity leaves.  The
+     * reservation is taken by the next @c commit, and nothing else may be
+     * written in between.
+     * \~spanish
+     * Para quien produce sus bytes donde se van a guardar, y sabe su enmarcado
+     * solo despues: una trama DATA de HTTP/3 cuya longitud es el cuerpo recien
+     * producido.  @p room llega como mucho al final de un trozo, porque solo un
+     * trozo es contiguo; lo que deje la capacidad.  La reserva la toma el
+     * siguiente @c commit, y no se puede escribir nada entre medias.
+     * \~
+     *
+     * @param front \~english framing bytes that go in front  \~spanish bytes de enmarcado que van delante  \~
+     * @param room  \~english how many bytes fit at the pointer, 0 if none
+     *              \~spanish cuantos bytes caben en el puntero, 0 si ninguno  \~
+     * @return      \~english where the bytes go; null when the stream takes nothing, or a chunk could not be had
+     *              \~spanish donde van los bytes; nulo si el flujo no admite nada, o no se pudo tener un trozo  \~
+     */
+    uint8_t *reserve(size_t front, size_t &room) noexcept;
+
+    /**
+     * @brief
+     * \~english Takes what @c reserve gave: @p front_len framing bytes at the write point, then @p n bytes already in place.
+     * \~spanish Toma lo que dio @c reserve: @p front_len bytes de enmarcado en el punto de escritura, y despues @p n bytes ya en su sitio.
+     * \~
+     *
+     * \~english
+     * Zero and zero gives the reservation back: a chunk it made and nothing
+     * uses is freed at once, so a writer with nothing to say holds no memory.
+     * \~spanish
+     * Cero y cero devuelve la reserva: un trozo que hizo y que nada usa se
+     * libera en el acto, asi que quien no tiene nada que decir no retiene
+     * memoria.
+     * \~
+     *
+     * @param front     \~english the framing  \~spanish el enmarcado  \~
+     * @param front_len \~english as many bytes as were reserved in front, or 0 with @p n 0
+     *                  \~spanish tantos bytes como se reservaron delante, o 0 con @p n 0  \~
+     * @param n         \~english bytes written at the reserved pointer, at most its room
+     *                  \~spanish bytes escritos en el puntero reservado, como mucho su sitio  \~
+     * @return          \~english OutOfMemory if the framing's chunk could not be had: nothing is taken
+     *                  \~spanish OutOfMemory si no se pudo tener el trozo del enmarcado: no se toma nada  \~
+     */
+    StreamError commit(const uint8_t *front, size_t front_len, size_t n) noexcept;
+
     /// \~english No more data: the stream ends where it is written up to.
     /// \~spanish No hay mas datos: el flujo acaba donde esta escrito.  \~
     void finish() noexcept;

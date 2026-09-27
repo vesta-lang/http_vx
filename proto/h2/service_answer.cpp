@@ -101,113 +101,12 @@ bool Http2Service::deliver(State &s, uint32_t stream,
             return send_reset(s, stream, h2::ErrorCode::InternalError, out);
     }
 
-    /* \~english
-     * The header block, from the fields @c wire_fields checked and lowered:
-     * names in lower case (RFC 9113, 8.2), nothing connection-specific (8.2.2)
-     * and no value HTTP forbids (8.2.1).  Secrets go never indexed, which asks
-     * every hop on the way not to remember them (RFC 7541, 7.1.3); the rest
-     * is written without indexing, which is never wrong.
-     *
-     * No `content-length` is added for a response with content, and that is
-     * not an omission: in HTTP/2 the frames say where the body ends, so a
-     * length here would be a second statement of the same fact -- and the
-     * failure of two statements of one fact is that they disagree, which in a
-     * response body is where one message ends inside another.  HEAD is the
-     * exception, because there the frames say nothing: the length is the one
-     * GET would have had, unless the handler said its own (RFC 9110, 9.3.2;
-     * RFC 9113, 8.1.1 lets a response with no content carry it).
-     *
-     * \~spanish
-     * El bloque de cabeceras, con las cabeceras que comprobo y bajo a
-     * minusculas @c wire_fields: nombres en minusculas (RFC 9113, 8.2), nada
-     * propio de la conexion (8.2.2) y ningun valor que HTTP prohiba (8.2.1).
-     * Los secretos van como no indexables nunca, que le pide a cada salto del
-     * camino que no los recuerde (RFC 7541, 7.1.3); el resto se escribe sin
-     * indexar, que nunca esta mal.
-     *
-     * No se anade `content-length` a una respuesta con contenido, y no es un
-     * olvido: en HTTP/2 las tramas dicen donde acaba el cuerpo, asi que una
-     * longitud aqui seria una segunda afirmacion del mismo hecho -- y el modo de
-     * fallar de dos afirmaciones de un hecho es que discrepen, que en un cuerpo
-     * de respuesta es donde un mensaje acaba dentro de otro.  HEAD es la
-     * excepcion, porque ahi las tramas no dicen nada: la longitud es la que
-     * habria tenido GET, salvo que el manejador diga la suya (RFC 9110, 9.3.2;
-     * RFC 9113, 8.1.1 deja que la lleve una respuesta sin contenido).
-     * \~ */
-    block_.clear();
-
-    h2::hpack::Encoder &enc = s.conn.encoder();
-    h2::hpack::WriteStatus ws = enc.write_status(block_, res.status());
-    bool has_length = false;
-
-    for (size_t i = 0; i < count && ws == h2::hpack::WriteStatus::Ok; ++i) {
-        const WireField &f = lines_[i];
-        const h2::hpack::Indexing how = field_is_secret(f.id)
-                                            ? h2::hpack::Indexing::Never
-                                            : h2::hpack::Indexing::WithoutIndexing;
-        if (f.id == FieldId::ContentLength) has_length = true;
-
-        if (f.id != FieldId::Unknown)
-            ws = enc.write_field(block_, f.id, f.value, f.value_len, how);
-        else
-            ws = enc.write_field(block_, f.name, f.name_len, f.value,
-                                 f.value_len, how);
-    }
-
-    if (head && !has_length && ws == h2::hpack::WriteStatus::Ok) {
-        uint8_t digits[kContentLengthDigits];
-        const size_t n = write_content_length(digits, body.len);
-        ws = enc.write_field(block_, FieldId::ContentLength, digits, n);
-    }
-
-    /* \~english
-     * A field that could not be stored ends the CONNECTION and not the stream.
-     * The encoder says why in the header: a write that ran out of memory may
-     * have left the peer's table out of step with this end's, and from then on
-     * every index names a different field on a connection that keeps working.
-     * \~spanish
-     * Una cabecera que no se pudo guardar acaba la CONEXION y no el flujo.  El
-     * codificador dice por que en su cabecera: una escritura que se quedo sin
-     * memoria puede haber dejado la tabla del otro extremo desacompasada de la de
-     * este, y a partir de ahi cada indice nombra otra cabecera en una conexion
-     * que sigue funcionando.
-     * \~ */
-    if (ws == h2::hpack::WriteStatus::OutOfMemory) return false;
-
-    if (ws != h2::hpack::WriteStatus::Ok) {
+    const HeadWrite hw = put_head(s, stream, res, count, head, empty, out);
+    if (hw == HeadWrite::ConnectionFailed) return false;
+    if (hw == HeadWrite::StreamFailed) {
         if (w != nullptr) drop_work(s, w);
         return send_reset(s, stream, h2::ErrorCode::InternalError, out);
     }
-
-    h2::HeaderFramer framer;
-    IoList list;
-
-    const h2::FrameError fe =
-        framer.frame(list, stream, block_.data(), block_.size(),
-                     s.conn.peer().max_frame_size, empty);
-
-    /* \~english
-     * A block too large to be written in one go is this server's own output
-     * being unreasonable, not the peer's input: it takes more frames than one
-     * write holds, which at the smallest legal frame size is a hundred and
-     * twenty-eight kilobytes of COMPRESSED header.  It is said out loud and the
-     * stream ends, because the alternative is half a header block on the wire
-     * and a peer waiting for a CONTINUATION that is not coming.
-     *
-     * \~spanish
-     * Un bloque demasiado grande para escribirlo de una vez es la salida de este
-     * servidor pasandose, no la entrada del otro extremo: lleva mas tramas de las
-     * que cabe una escritura, que al tamano de trama legal mas pequeno son ciento
-     * veintiocho kilobytes de cabecera COMPRIMIDA.  Se dice en voz alta y el
-     * flujo se acaba, porque la alternativa es medio bloque de cabeceras en el
-     * cable y un extremo esperando una CONTINUATION que no va a llegar.
-     * \~ */
-    if (fe != h2::FrameError::Ok) {
-        if (w != nullptr) drop_work(s, w);
-        return send_reset(s, stream, h2::ErrorCode::InternalError, out);
-    }
-
-    if (!put_list(list, out)) return false;
 
     /* \~english
      * An empty body is over with the header block, which already carried
@@ -268,6 +167,114 @@ bool Http2Service::deliver(State &s, uint32_t stream,
     w->answering = true;
 
     return true;
+}
+
+Http2Service::HeadWrite Http2Service::put_head(State &s, uint32_t stream,
+                                               const ResponseBuilder &res,
+                                               size_t count, bool head,
+                                               bool end_stream,
+                                               Buffer &out) noexcept {
+    /* \~english
+     * The header block, from the fields @c wire_fields checked and lowered:
+     * names in lower case (RFC 9113, 8.2), nothing connection-specific (8.2.2)
+     * and no value HTTP forbids (8.2.1).  Secrets go never indexed, which asks
+     * every hop on the way not to remember them (RFC 7541, 7.1.3); the rest
+     * is written without indexing, which is never wrong.
+     *
+     * No `content-length` is added for a response with content, and that is
+     * not an omission: in HTTP/2 the frames say where the body ends, so a
+     * length here would be a second statement of the same fact -- and the
+     * failure of two statements of one fact is that they disagree, which in a
+     * response body is where one message ends inside another.  HEAD is the
+     * exception, because there the frames say nothing: the length is the one
+     * GET would have had, unless the handler said its own (RFC 9110, 9.3.2;
+     * RFC 9113, 8.1.1 lets a response with no content carry it).
+     *
+     * \~spanish
+     * El bloque de cabeceras, con las cabeceras que comprobo y bajo a
+     * minusculas @c wire_fields: nombres en minusculas (RFC 9113, 8.2), nada
+     * propio de la conexion (8.2.2) y ningun valor que HTTP prohiba (8.2.1).
+     * Los secretos van como no indexables nunca, que le pide a cada salto del
+     * camino que no los recuerde (RFC 7541, 7.1.3); el resto se escribe sin
+     * indexar, que nunca esta mal.
+     *
+     * No se anade `content-length` a una respuesta con contenido, y no es un
+     * olvido: en HTTP/2 las tramas dicen donde acaba el cuerpo, asi que una
+     * longitud aqui seria una segunda afirmacion del mismo hecho -- y el modo de
+     * fallar de dos afirmaciones de un hecho es que discrepen, que en un cuerpo
+     * de respuesta es donde un mensaje acaba dentro de otro.  HEAD es la
+     * excepcion, porque ahi las tramas no dicen nada: la longitud es la que
+     * habria tenido GET, salvo que el manejador diga la suya (RFC 9110, 9.3.2;
+     * RFC 9113, 8.1.1 deja que la lleve una respuesta sin contenido).
+     * \~ */
+    block_.clear();
+
+    h2::hpack::Encoder &enc = s.conn.encoder();
+    h2::hpack::WriteStatus ws = enc.write_status(block_, res.status());
+    bool has_length = false;
+
+    for (size_t i = 0; i < count && ws == h2::hpack::WriteStatus::Ok; ++i) {
+        const WireField &f = lines_[i];
+        const h2::hpack::Indexing how = field_is_secret(f.id)
+                                            ? h2::hpack::Indexing::Never
+                                            : h2::hpack::Indexing::WithoutIndexing;
+        if (f.id == FieldId::ContentLength) has_length = true;
+
+        if (f.id != FieldId::Unknown)
+            ws = enc.write_field(block_, f.id, f.value, f.value_len, how);
+        else
+            ws = enc.write_field(block_, f.name, f.name_len, f.value,
+                                 f.value_len, how);
+    }
+
+    if (head && !has_length && ws == h2::hpack::WriteStatus::Ok) {
+        uint8_t digits[kContentLengthDigits];
+        const size_t n = write_content_length(digits, res.body().len);
+        ws = enc.write_field(block_, FieldId::ContentLength, digits, n);
+    }
+
+    /* \~english
+     * A field that could not be stored ends the CONNECTION and not the stream.
+     * The encoder says why in the header: a write that ran out of memory may
+     * have left the peer's table out of step with this end's, and from then on
+     * every index names a different field on a connection that keeps working.
+     * \~spanish
+     * Una cabecera que no se pudo guardar acaba la CONEXION y no el flujo.  El
+     * codificador dice por que en su cabecera: una escritura que se quedo sin
+     * memoria puede haber dejado la tabla del otro extremo desacompasada de la de
+     * este, y a partir de ahi cada indice nombra otra cabecera en una conexion
+     * que sigue funcionando.
+     * \~ */
+    if (ws == h2::hpack::WriteStatus::OutOfMemory) return HeadWrite::ConnectionFailed;
+    if (ws != h2::hpack::WriteStatus::Ok) return HeadWrite::StreamFailed;
+
+    h2::HeaderFramer framer;
+    IoList list;
+
+    const h2::FrameError fe =
+        framer.frame(list, stream, block_.data(), block_.size(),
+                     s.conn.peer().max_frame_size, end_stream);
+
+    /* \~english
+     * A block too large to be written in one go is this server's own output
+     * being unreasonable, not the peer's input: it takes more frames than one
+     * write holds, which at the smallest legal frame size is a hundred and
+     * twenty-eight kilobytes of COMPRESSED header.  It is said out loud and the
+     * stream ends, because the alternative is half a header block on the wire
+     * and a peer waiting for a CONTINUATION that is not coming.
+     *
+     * \~spanish
+     * Un bloque demasiado grande para escribirlo de una vez es la salida de este
+     * servidor pasandose, no la entrada del otro extremo: lleva mas tramas de las
+     * que cabe una escritura, que al tamano de trama legal mas pequeno son ciento
+     * veintiocho kilobytes de cabecera COMPRIMIDA.  Se dice en voz alta y el
+     * flujo se acaba, porque la alternativa es medio bloque de cabeceras en el
+     * cable y un extremo esperando una CONTINUATION que no va a llegar.
+     * \~ */
+    if (fe != h2::FrameError::Ok) return HeadWrite::StreamFailed;
+
+    if (!put_list(list, out)) return HeadWrite::ConnectionFailed;
+    return HeadWrite::Written;
 }
 
 bool Http2Service::refuse(State &s, uint32_t stream, StatusCode status, Work *w,
@@ -346,6 +353,19 @@ bool Http2Service::answer(State &s, uint32_t stream, const Request &req,
                           const uint8_t *head, const uint8_t *body, size_t n,
                           Work *w, Buffer &out) noexcept {
     ResponseBuilder res(said_);
+
+    /* \~english
+     * Opening is allowed where the response can have a body at all: the
+     * answer to a `HEAD` goes whole with its head (HVX-5, 4.1).  Allowing it
+     * is four stores; a response that is not opened pays nothing else (R39).
+     * \~spanish
+     * Abrir se permite donde la respuesta puede tener cuerpo: la de un `HEAD`
+     * sale entera con su cabecera (HVX-5, 4.1).  Permitirlo son cuatro
+     * escrituras; una respuesta que no se abre no paga nada mas (R39).
+     * \~ */
+    if (port_ != nullptr && req.method != MethodId::Head)
+        res.allow_open(gate_, s.handle, stream, *this);
+
     handler_->handle(req, head, body, n, res);
 
     ++served_;
@@ -376,8 +396,26 @@ bool Http2Service::answer(State &s, uint32_t stream, const Request &req,
     if (bad != nullptr) {
         ++bad_answers_;
         last_bad_answer_ = bad;
+
+        /* \~english
+         * An opened response whose head cannot travel is not sent half-opened:
+         * its source is ended, as HTTP/1.1 ends one whose head cannot be
+         * written, and the answer is the 500.
+         * \~spanish
+         * Una respuesta abierta cuya cabecera no puede viajar no se manda medio
+         * abierta: su fuente se acaba, como acaba HTTP/1.1 una cuya cabecera no
+         * se puede escribir, y la respuesta es el 500.
+         * \~ */
+        if (res.opened_source() != nullptr)
+            port_->end(*res.opened_source(), GoneReason::ConnectionClosed);
         return refuse(s, stream, status::kInternalServerError, w, out);
     }
+
+    if (res.opened_source() != nullptr) return start_open(s, stream, res, count, w, out);
+
+    // \~english A limit on open responses was reached: 503 on this stream, and the connection carries on.
+    // \~spanish Se agoto un tope de respuestas abiertas: 503 en este flujo, y la conexion sigue.  \~
+    if (res.open_refused()) return refuse(s, stream, status::kServiceUnavailable, w, out);
 
     return deliver(s, stream, res, count, req.method == MethodId::Head, w, out);
 }

@@ -244,6 +244,13 @@ int main(int argc, char **argv) {
     http_vx::Http1Service service;
     http_vx::Shard shard;
 
+    serve::Events events;
+    if (!events.start()) {
+        std::fprintf(stderr, "http_vx: cannot start the event thread\n");
+        return 1;
+    }
+    greeting.events = &events;
+
     http_vx::h1::Limits h1;
     if (!service.reset(cfg.connections, greeting, h1)) {
         std::fprintf(stderr, "http_vx: no memory for the service\n");

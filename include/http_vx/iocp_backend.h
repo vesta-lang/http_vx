@@ -74,6 +74,7 @@
 
 #include "http_vx/buffer_pool.h"
 #include "http_vx/datagram.h"
+#include "http_vx/id_index.h"
 #include "http_vx/reactor_ops.h"
 
 #include <atomic>
@@ -366,6 +367,30 @@ class IocpBackend final : public Backend {
     bool start_send(const Op &op, Context *c) noexcept;
     bool start_close(const Op &op) noexcept;
 
+    /**
+     * @brief
+     * \~english Ends the read outstanding on @p op's socket, and nothing else of it (OpKind::Cancel).
+     * \~spanish Acaba la lectura pendiente en el socket de @p op, y nada mas suyo (OpKind::Cancel).
+     * \~
+     *
+     * \~english
+     * `CancelIoEx` on the READ's own OVERLAPPED: cancelling everything on
+     * the socket would also end a write still going out, and closing with
+     * courtesy is letting that write finish.
+     * \~spanish
+     * `CancelIoEx` sobre el OVERLAPPED de la LECTURA: cancelar todo lo del socket
+     * acabaria tambien una escritura que todavia sale, y cerrar con cortesia es
+     * dejar que acabe.
+     * \~
+     */
+    bool start_cancel(const Op &op) noexcept;
+
+    /// \~english Remembers @p c as the read outstanding on its socket.  \~spanish Recuerda @p c como la lectura pendiente en su socket.  \~
+    void note_read(const Context *c) noexcept;
+
+    /// \~english Forgets @p c as the read of its socket, if it was.  \~spanish Olvida @p c como la lectura de su socket, si lo era.  \~
+    void forget_read(const Context *c) noexcept;
+
     /// \~english Posts a receive of one datagram.
     /// \~spanish Pone la recepcion de un datagrama.  \~
     bool start_recv_from(const Op &op, Context *c) noexcept;
@@ -415,6 +440,20 @@ class IocpBackend final : public Backend {
 
     Context *contexts_ = nullptr;
     uint32_t context_count_ = 0;
+
+    /**
+     * \~english
+     * The read outstanding on each socket, by socket: what a cancel looks up.
+     * A hash and not an array because sockets on Windows are handles, not
+     * small dense numbers; sized by the contexts, since a read is one.
+     * \~spanish
+     * La lectura pendiente en cada socket, por socket: lo que busca una
+     * cancelacion.  Un hash y no un array porque en Windows los sockets son
+     * handles, no numeros pequenos y densos; del tamano de los contextos, porque
+     * una lectura es uno.
+     * \~
+     */
+    IdIndex reads_;
     uint32_t free_head_ = 0xFFFFFFFF;
     size_t in_flight_ = 0;
 

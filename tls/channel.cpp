@@ -149,16 +149,47 @@ bool Channel::fail_session(Buffer &out) noexcept {
                 f.why != nullptr ? f.why : "the handshake failed without saying why", out);
 }
 
+size_t Channel::padding_for(size_t take) const noexcept {
+    if (!write_.installed() || pad_block_ == 0) return 0;
+    const size_t inner = take + 1;
+    size_t padding = (pad_block_ - inner % pad_block_) % pad_block_;
+    if (inner + padding > kMaxInnerPlaintext) padding = kMaxInnerPlaintext - inner;
+    return padding;
+}
+
+bool Channel::begin_in_place(Buffer &out) noexcept {
+    if (state_ != State::Open || close_sent_ || !write_.installed()) return false;
+    // \~english What send does before application data, done before the room is kept (4.6.3, 5.5).
+    // \~spanish Lo que hace send antes de los datos de aplicacion, hecho antes de guardar el sitio (4.6.3, 5.5).  \~
+    if (update_owed_ && !key_update(false, out)) return false;
+    if (write_.sequence() >= update_after_ && !key_update(false, out)) return false;
+    return true;
+}
+
+bool Channel::seal_in_place(Buffer &out, size_t record_at) noexcept {
+    const size_t live = out.size();
+    if (record_at + kRecordHeader > live) return false;
+    const size_t n = live - record_at - kRecordHeader;
+    if (n == 0 || n > kMaxFragment) return fail(Alert::InternalError, "application data written in place does not fit one record", out);
+
+    const size_t padding = padding_for(n);
+    const size_t after = 1 + padding + quic::kTagSize;
+    // \~english Room behind for the type, the padding and the tag; the buffer may move, the offset does not.
+    // \~spanish Sitio detras para el tipo, el relleno y la marca; el buffer puede moverse, el desplazamiento no.  \~
+    if (out.reserve(after) == nullptr) return fail(Alert::InternalError, "no room to seal in place", out);
+    uint8_t *record = out.writable() + record_at;
+    const size_t made = write_.seal_in_place(ContentType::ApplicationData, n, padding, record,
+                                             kRecordHeader + n + after);
+    if (made == 0) return fail(Alert::InternalError, "application data could not be sealed", out);
+    out.commit(after);
+    return true;
+}
+
 bool Channel::emit(ContentType type, const uint8_t *p, size_t n, uint16_t version, Buffer &out) noexcept {
     // \~english In fragments of at most 2^14, never an empty one (5.1).  \~spanish En fragmentos de 2^14 como mucho, nunca uno vacio (5.1).  \~
     while (n != 0) {
         const size_t take = n < kMaxFragment ? n : kMaxFragment;
-        size_t padding = 0;
-        if (write_.installed() && pad_block_ != 0) {
-            const size_t inner = take + 1;
-            padding = (pad_block_ - inner % pad_block_) % pad_block_;
-            if (inner + padding > kMaxInnerPlaintext) padding = kMaxInnerPlaintext - inner;
-        }
+        const size_t padding = padding_for(take);
         const size_t room = kRecordOverhead + take + padding;
         uint8_t *at = out.reserve(room);
         if (at == nullptr) return false;

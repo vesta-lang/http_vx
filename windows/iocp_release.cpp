@@ -185,6 +185,7 @@ void IocpBackend::release() noexcept {
         contexts_ = nullptr;
     }
 
+    reads_.release();
     context_count_ = 0;
     free_head_ = 0xFFFFFFFF;
     in_flight_ = 0;

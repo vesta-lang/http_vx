@@ -282,12 +282,26 @@ class Service {
      * \~spanish Hay sitio en @p c, pedido con @c StreamPort::want_writable: rellena en @p out lo que este abierto.
      * \~
      *
+     * \~english
+     * At most @p budget bytes are appended to @p out in one call, framing
+     * included.  TLS asks for one record's worth, so what the service writes
+     * is sealed where it lies, and asks again while the service writes; what
+     * did not fit waits for the next call.
+     * \~spanish
+     * En una llamada se anaden a @p out como mucho @p budget bytes, enmarcado
+     * incluido.  TLS pide lo que cabe en un registro, para que lo que escriba el
+     * servicio se selle donde esta, y vuelve a pedir mientras el servicio
+     * escriba; lo que no cupo espera a la llamada siguiente.
+     * \~
+     *
+     * @param budget \~english the most bytes this call may append  \~spanish lo mas que puede anadir esta llamada  \~
      * @return \~english false to end the connection once @p out has gone
      *         \~spanish false para acabar la conexion cuando haya salido @p out  \~
      */
-    virtual bool on_writable(ConnHandle c, Buffer &out) noexcept {
+    virtual bool on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept {
         (void)c;
         (void)out;
+        (void)budget;
         return true;
     }
 };
@@ -409,6 +423,9 @@ struct ShardConfig {
      */
     uint32_t max_open = 1024;
     uint16_t max_open_per_conn = 16;
+
+    /// \~english The most one @c Service::on_writable call may write.  \~spanish Lo mas que puede escribir una llamada a @c Service::on_writable.  \~
+    uint32_t write_size = 65536;
 };
 
 /**
@@ -437,6 +454,19 @@ struct ShardCounts {
     /// \~english Sockets @c adopt refused because there is no stream side.
     /// \~spanish Sockets que @c adopt rechazo porque no hay lado de flujos.  \~
     uint64_t refused_adoptions = 0;
+
+    /**
+     * \~english
+     * Closes whose outstanding read could not be cancelled: the backend's
+     * queue was full.  Such a connection leaves when its peer next speaks
+     * or goes, not before.
+     * \~spanish
+     * Cierres cuya lectura pendiente no se pudo cancelar: la cola del backend
+     * estaba llena.  Una conexion asi se va cuando su otro extremo vuelva a
+     * hablar o se vaya, no antes.
+     * \~
+     */
+    uint64_t uncancelled = 0;
 };
 
 /**
@@ -877,6 +907,10 @@ class Shard final : public StreamPort {
     };
 
     DatagramPort datagram_port_{*this};
+
+    /// \~english Handed to the service on a resume with nothing held here; never given memory.
+    /// \~spanish Lo que se le da al servicio en una reanudacion sin nada guardado aqui; nunca recibe memoria.  \~
+    Buffer nothing_;
 
     /// \~english The datagram side's service, or null.  \~spanish El servicio del lado de datagramas, o nulo.  \~
     DatagramService *datagram_service_ = nullptr;

@@ -74,19 +74,95 @@ const char *const kH2[] = {"h2"};
 const char *const kH11[] = {"http/1.1"};
 const uint8_t kFakeCert[] = {'f', 'a', 'k', 'e', ' ', 'c', 'e', 'r', 't'};
 
-/// \~english The same handler for both versions: the target and the body's size.  \~spanish El mismo manejador para las dos versiones: el destino y el tamano del cuerpo.  \~
+/// \~english The same handler for both versions: the target and the body's size; "/open" opens @c source.
+/// \~spanish El mismo manejador para las dos versiones: el destino y el tamano del cuerpo; "/open" abre @c source.  \~
 class Echo final : public http_vx::Handler {
 public:
     void handle(const http_vx::Request &req, const uint8_t *head, const uint8_t *, size_t n,
                 http_vx::ResponseBuilder &res) noexcept override {
+        res.status(200);
+        res.field(http_vx::FieldId::ContentType, "text/plain", 10);
+        if (source != nullptr && req.target.len == 5 &&
+            std::memcmp(reinterpret_cast<const char *>(head) + req.target.off, "/open", 5) == 0) {
+            opened = res.open(*source);
+            return;
+        }
         char text[256];
         const int len = std::snprintf(text, sizeof text, "you asked for %.*s with %zu bytes",
                                       static_cast<int>(req.target.len),
                                       reinterpret_cast<const char *>(head) + req.target.off, n);
-        res.status(200);
-        res.field(http_vx::FieldId::ContentType, "text/plain", 10);
         res.body(text, static_cast<size_t>(len));
     }
+
+    http_vx::BodySource *source = nullptr;
+    http_vx::OpenResponse opened;
+};
+
+/// \~english A source the test feeds by hand.  \~spanish Una fuente que la prueba alimenta a mano.  \~
+class Stream final : public http_vx::BodySource {
+public:
+    size_t fill(http_vx::OpenResponse, uint8_t *dst, size_t room, bool &done) noexcept override {
+        size_t n = 0;
+        if (full_fills != 0) {
+            --full_fills;
+            std::memset(dst, 'x', room);
+            n = room;
+        } else {
+            n = pending.size() < room ? pending.size() : room;
+            std::memcpy(dst, pending.data(), n);
+            pending.erase(0, n);
+        }
+        done = finish && pending.empty() && full_fills == 0;
+        return n;
+    }
+
+    void gone(http_vx::OpenResponse, http_vx::GoneReason why) noexcept override {
+        ++gones;
+        last = why;
+    }
+
+    std::string pending;
+    bool finish = false;
+    int full_fills = 0;
+    int gones = 0;
+    http_vx::GoneReason last = http_vx::GoneReason::Finished;
+};
+
+/**
+ * @brief
+ * \~english The shard's side, played by the test over a real kick queue: it records what the service asks for.
+ * \~spanish El lado del fragmento, hecho por la prueba sobre una cola de avisos de verdad: apunta lo que pide el servicio.
+ * \~
+ */
+class TestPort final : public http_vx::StreamPort {
+public:
+    http_vx::OpenResponse open(ConnHandle c, uint64_t stream, http_vx::BodySource &s,
+                               http_vx::KickTarget &target) noexcept override {
+        http_vx::OpenResponse r;
+        r.conn = c;
+        r.stream = stream;
+        kicks.open(s, target, r);
+        return r;
+    }
+    size_t fill(http_vx::BodySource &s, uint8_t *dst, size_t room, bool &done) noexcept override {
+        done = false;
+        const size_t n = s.fill(s.response(), dst, room, done);
+        return n < room ? n : room;
+    }
+    void end(http_vx::BodySource &s, http_vx::GoneReason why) noexcept override { kicks.close(s, why); }
+    void want_writable(ConnHandle) noexcept override { ++writable; }
+    void hold_reads(ConnHandle, bool hold) noexcept override {
+        held = hold;
+        if (!hold) ++resumes;
+    }
+    http_vx::GoneReason closing_reason(ConnHandle) const noexcept override {
+        return http_vx::GoneReason::ConnectionClosed;
+    }
+
+    http_vx::KickQueue kicks;
+    int writable = 0;
+    int resumes = 0;
+    bool held = false;
 };
 
 void put(Buffer &b, const void *p, size_t n) {
@@ -402,6 +478,89 @@ void test_refusals(test_support::FakeCrypto &f, void *key) {
     check(!t.reset(4, cfg), "no certificate: refused");
 }
 
+/**
+ * @brief
+ * \~english An open HTTP/1.1 response through TLS: sealed in place a record per call, and the request behind it served on resume.
+ * \~spanish Una respuesta abierta de HTTP/1.1 por TLS: sellada en su sitio un registro por llamada, y la peticion de detras servida al reanudar.
+ * \~
+ */
+void test_open(Crypto &cc, Server &s, const char *name) {
+    where = name;
+    TestPort port;
+    Stream source;
+    s.tls.attach(&port);
+    s.echo.source = &source;
+
+    Client c(cc, s, 2, kBoth + 1, 1);
+    c.run();
+    check(c.ch.open(), "the handshake completes");
+
+    // \~english The open response, and a request right behind it in the same read.
+    // \~spanish La respuesta abierta, y una peticion justo detras en la misma lectura.  \~
+    c.send("GET /open HTTP/1.1\r\nHost: a\r\n\r\nGET /one HTTP/1.1\r\nHost: a\r\n\r\n");
+    c.run();
+    std::string r = text(c.plain);
+    check(s.echo.opened.valid() && port.held, "the response opened and held the reads");
+    check(r.find("transfer-encoding: chunked") != std::string::npos, "the open head came through TLS");
+    check(r.find("you asked for /one") == std::string::npos, "the request behind was answered before the open one ended");
+
+    // \~english A kick: one chunk, sealed where the service wrote it.
+    // \~spanish Un aviso: un trozo, sellado donde lo escribio el servicio.  \~
+    source.pending = "hello";
+    source.kick();
+    port.kicks.drain();
+    check(port.writable == 1, "the kick did not ask for room");
+    Buffer out;
+    check(s.tls.on_writable(c.conn, out, 65536), "the connection ended on a fill");
+    put(c.s2c, out.data(), out.size());
+    c.run();
+    check(text(c.plain).find("0005\r\nhello\r\n") != std::string::npos, "the chunk did not open on the client");
+
+    // \~english Full fills: one record each, as many as fit the budget, all opening on the client.
+    // \~spanish Rellenos llenos: un registro cada uno, tantos como quepan en el presupuesto, todos abriendose en el cliente.  \~
+    c.plain.consume(c.plain.size());
+    source.full_fills = 8;
+    source.kick();
+    port.kicks.drain();
+    out.clear();
+    check(s.tls.on_writable(c.conn, out, 65536), "the connection ended on full fills");
+    const size_t records = out.size();
+    put(c.s2c, out.data(), out.size());
+    c.run();
+    const std::string got = text(c.plain);
+    size_t xs = 0;
+    for (char ch : got) xs += ch == 'x' ? 1 : 0;
+    check(xs == 3 * (http_vx::tls::kMaxFragment - http_vx::Http1Service::kFramingMax),
+          "the budget did not give exactly three full records");
+    check(records <= 65536, "more than the budget was written");
+    check(source.full_fills == 5, "the service was asked past the budget");
+
+    // \~english Done: the last chunk, and the request that waited is answered with no new bytes from the peer.
+    // \~spanish Acabada: el ultimo trozo, y la peticion que espero se contesta sin bytes nuevos del otro.  \~
+    source.full_fills = 0;
+    source.finish = true;
+    source.kick();
+    port.kicks.drain();
+    out.clear();
+    s.tls.on_writable(c.conn, out, 65536);
+    put(c.s2c, out.data(), out.size());
+    c.run();
+    check(source.gones == 1 && source.last == http_vx::GoneReason::Finished, "gone(Finished) did not come once");
+    check(port.resumes == 1, "ending did not resume the reads");
+
+    Buffer empty;
+    out.clear();
+    s.tls.on_bytes(c.conn, empty, out);
+    put(c.s2c, out.data(), out.size());
+    c.run();
+    r = text(c.plain);
+    check(r.find("0\r\n\r\n") != std::string::npos, "the last chunk did not come");
+    check(r.find("you asked for /one") != std::string::npos, "the request behind was not answered on resume");
+
+    s.echo.source = nullptr;
+    s.tls.attach(nullptr);
+}
+
 void run_all(Crypto &c, const uint8_t *cert, size_t len, void *key, const char *name) {
     Server s(c, cert, len, key, true, true);
     where = name;
@@ -411,6 +570,7 @@ void run_all(Crypto &c, const uint8_t *cert, size_t len, void *key, const char *
     test_http2(c, s, name, ~size_t{0});
     test_http2(c, s, name, 3);
     check(s.tls.handshakes() == 4 && s.tls.failures() == 0, "four handshakes, no failure");
+    test_open(c, s, name);
 }
 
 } // namespace

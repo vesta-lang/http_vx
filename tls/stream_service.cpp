@@ -219,7 +219,6 @@ bool TlsService::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
         fresh->rebase(s.plain_at);
     }
     Buffer &plain = *plain_.at(s.plain);
-    const size_t before = plain.size();
 
     s.channel.set_clock(clock_us_);
     const tls::ChannelStatus st = s.channel.receive(in, plain, out);
@@ -235,14 +234,67 @@ bool TlsService::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
         return false;
     }
 
+    /* \~english
+     * Handed over whenever there is plaintext, not only when some came now:
+     * what waited behind an open HTTP/1.1 response is already decrypted here,
+     * and resuming calls with nothing new (HVX-5, 5.1).
+     * \~spanish
+     * Se entrega siempre que haya texto en claro, no solo cuando acaba de llegar:
+     * lo que espero detras de una respuesta abierta de HTTP/1.1 ya esta
+     * descifrado aqui, y reanudar llama sin nada nuevo (HVX-5, 5.1).
+     * \~ */
     bool keep = true;
-    if (s.inner != nullptr && plain.size() > before) {
+    if (s.inner != nullptr && !plain.empty()) {
         scratch_.clear();
         keep = s.inner->on_bytes(c, plain, scratch_);
         // \~english The answer goes out even when the inner service ends the connection: it is usually why.
         // \~spanish La respuesta sale aunque el servicio de dentro acabe la conexion: suele ser el porque.  \~
         if (!scratch_.empty() && !s.channel.send(scratch_.data(), scratch_.size(), out)) keep = false;
         if (scratch_.capacity() > cfg_.buffer_ceiling) scratch_.release();
+    }
+    return finish(c, s, out, keep);
+}
+
+void TlsService::attach(StreamPort *port) noexcept {
+    // \~english The inner services open responses; TLS only seals what they write.
+    // \~spanish Los servicios de dentro abren respuestas; TLS solo sella lo que escriben.  \~
+    if (cfg_.http1 != nullptr) cfg_.http1->attach(port);
+    if (cfg_.http2 != nullptr) cfg_.http2->attach(port);
+}
+
+bool TlsService::on_writable(ConnHandle c, Buffer &out, size_t budget) noexcept {
+    if (c.slot >= capacity_) return false;
+    Slot &s = slots_[c.slot];
+    if (s.inner == nullptr) return true;
+
+    /* \~english
+     * One record per call into the inner service, written where it will be
+     * sealed: the header is kept, the service writes at most 2^14 bytes
+     * right behind it, and the record is sealed in place -- no copy of the
+     * body (HVX-5, 7.4).  Asked again while it writes and a whole record
+     * still fits the budget.
+     * \~spanish
+     * Un registro por llamada al servicio de dentro, escrito donde se va a
+     * sellar: se guarda la cabecera, el servicio escribe como mucho 2^14 bytes
+     * justo detras, y el registro se sella en su sitio -- sin copiar el cuerpo
+     * (HVX-5, 7.4).  Se le vuelve a pedir mientras escriba y quepa entero otro
+     * registro en el presupuesto.
+     * \~ */
+    const size_t start = out.size();
+    bool keep = true;
+    while (keep && out.size() - start + tls::kRecordOverhead + tls::kMaxFragment <= budget) {
+        if (!s.channel.begin_in_place(out)) return finish(c, s, out, false);
+
+        const size_t record_at = out.size();
+        if (out.reserve(tls::kRecordHeader) == nullptr) return finish(c, s, out, false);
+        out.commit(tls::kRecordHeader);
+
+        keep = s.inner->on_writable(c, out, tls::kMaxFragment);
+        if (out.size() == record_at + tls::kRecordHeader) {
+            out.uncommit(tls::kRecordHeader);
+            break;
+        }
+        if (!s.channel.seal_in_place(out, record_at)) return finish(c, s, out, false);
     }
     return finish(c, s, out, keep);
 }

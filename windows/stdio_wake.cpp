@@ -195,6 +195,35 @@ bool StdioBackend::wake() noexcept {
     return false;
 }
 
+void StdioBackend::abandon_read() noexcept {
+    if (!read_in_flight_ || helper_ == nullptr) return;
+
+    /* \~english
+     * The helper is reading into the buffer of the read being cancelled, so
+     * it is taken out of `ReadFile` -- it does nothing but read, so the
+     * cancel cannot hit anything else -- and waited for until it says it is
+     * done: from then on the buffer is nobody's.  Asked again while it has
+     * not got into the read yet, when a cancel finds nothing to cancel.
+     * \~spanish
+     * El auxiliar esta leyendo en el buffer de la lectura que se cancela, asi
+     * que se le saca de `ReadFile` -- no hace nada mas que leer, asi que la
+     * cancelacion no puede dar con nada mas -- y se le espera hasta que diga que
+     * acabo: desde ahi el buffer no es de nadie.  Se vuelve a pedir mientras no
+     * haya llegado a la lectura, cuando una cancelacion no encuentra nada.
+     * \~ */
+    const HANDLE t = static_cast<HANDLE>(helper_);
+    const HANDLE done = static_cast<HANDLE>(done_event_);
+    do {
+        CancelSynchronousIo(t);
+    } while (WaitForSingleObject(done, 10) == WAIT_TIMEOUT);
+    read_in_flight_ = false;
+}
+
+void StdioBackend::idle(int timeout_ms) noexcept {
+    if (wake_event_ == nullptr) return;
+    WaitForSingleObject(static_cast<HANDLE>(wake_event_), timeout_ms < 0 ? INFINITE : static_cast<DWORD>(timeout_ms));
+}
+
 long StdioBackend::read_or_wake(uint8_t *room, uint32_t n, int timeout_ms, bool &woken) noexcept {
     woken = false;
     if (helper_ == nullptr) return -1;

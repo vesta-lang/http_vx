@@ -231,6 +231,37 @@ class StdioBackend final : public Backend {
      */
     long read_or_wake(uint8_t *room, uint32_t n, int timeout_ms, bool &woken) noexcept;
 
+    /**
+     * @brief
+     * \~english Waits with nothing pending: until a wake or the deadline; the platform's.
+     * \~spanish Espera sin nada pendiente: hasta un despertar o el plazo; de cada plataforma.
+     * \~
+     *
+     * \~english
+     * A shard with no operation here -- its connection held behind an open
+     * response, say -- still has to sleep until a kick, not turn: a wait
+     * that came back at once would spin a core.
+     * \~spanish
+     * Un fragmento sin ninguna operacion aqui -- con su conexion retenida detras
+     * de una respuesta abierta, por ejemplo -- tiene que dormir igualmente hasta
+     * un aviso, no dar vueltas: una espera que volviera en el acto gastaria un
+     * nucleo.
+     * \~
+     */
+    void idle(int timeout_ms) noexcept;
+
+    /**
+     * @brief
+     * \~english Gives up a read the platform has in flight, and waits until its buffer is free; the platform's.
+     * \~spanish Abandona una lectura que la plataforma tenga en vuelo, y espera a que su buffer quede libre; de cada plataforma.
+     * \~
+     */
+    void abandon_read() noexcept;
+
+    /// \~english The socket a cancelled read is left with: it completes as a failure.
+    /// \~spanish El socket con el que se queda una lectura cancelada: acaba como fallo.  \~
+    static constexpr int32_t kCancelledFd = -0x7FFFFFFF - 1;
+
     /* \~english
      * The wake mechanism's state, in types that name no platform.  Linux: the
      * eventfd.  Windows: the helper thread that is the ONLY reader of the

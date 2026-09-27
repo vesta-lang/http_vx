@@ -95,6 +95,17 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
         if (e.kind == h2::EventKind::StreamEnded) {
             Work *w = find_work(s, e.stream_id);
             if (w != nullptr) drop_work(s, w);
+
+            /* \~english
+             * An open response on it ends with it.  The peer reset it, or broke
+             * a rule on it and this end reset it: either way it is the peer
+             * that stopped the stream, and its source is told so.
+             * \~spanish
+             * Una respuesta abierta en el acaba con el.  El otro extremo lo
+             * reinicio, o rompio una regla en el y este lo reinicio: en los dos
+             * casos es el otro el que paro el flujo, y a su fuente se le dice.
+             * \~ */
+            if (s.opens.count != 0) end_stream_open(s, e.stream_id, GoneReason::PeerReset);
             continue;
         }
 
@@ -326,6 +337,16 @@ bool Http2Service::on_bytes(ConnHandle c, Buffer &in, Buffer &out) noexcept {
      * \~ */
     if (!drain(s, out)) return false;
     if (!flush_control(s, out)) return false;
+
+    /* \~english
+     * The same event may unblock an open response: one that wants to be asked
+     * and now has room asks the shard for it (HVX-5, 4.3).
+     * \~spanish
+     * El mismo suceso puede desbloquear una respuesta abierta: una que quiere
+     * que se le pregunte y ahora tiene sitio se lo pide al fragmento (HVX-5,
+     * 4.3).
+     * \~ */
+    if (s.opens.count != 0) wake_open(s);
 
     const uint64_t done = s.conn.consumed();
     if (done > in.origin()) in.consume(static_cast<size_t>(done - in.origin()));

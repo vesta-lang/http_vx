@@ -599,6 +599,25 @@ void Shard::close(ConnHandle c) noexcept {
         h->reading = kNoBuffer;
     }
 
+    /* \~english
+     * And a read still outstanding is ENDED, not waited for: only the peer
+     * would complete it, and a peer that went silent for good -- which is
+     * what a deadline is for -- never does.  Writes are left to finish.
+     * \~spanish
+     * Y una lectura todavia pendiente se ACABA, no se espera: solo la
+     * completaria el otro extremo, y uno que se callo para siempre -- que es
+     * para lo que esta un plazo -- no lo hace nunca.  Las escrituras se dejan
+     * acabar.
+     * \~ */
+    if ((h->flags & kReadPending) != 0 && io_ != nullptr) {
+        Op cancel;
+        cancel.conn = c;
+        cancel.kind = OpKind::Cancel;
+        cancel.buffer = kNoBuffer;
+        cancel.fd = h->fd;
+        if (!io_->submit(cancel)) ++counts_.uncancelled;
+    }
+
     send_next(c, *h);
     leave_if_done(c, *h);
 }
@@ -678,7 +697,10 @@ void Shard::on_read(const Completion &done) noexcept {
 
 void Shard::serve(ConnHandle c, ConnHot &hot, uint32_t buf) noexcept {
     ConnHot *h = &hot;
-    Buffer *in = pool_.at(buf);
+
+    // \~english No buffer is an empty one: a resume with nothing held here (see run_asked).
+    // \~spanish Sin buffer es uno vacio: una reanudacion sin nada guardado aqui (ver run_asked).  \~
+    Buffer *in = buf == kNoBuffer ? &nothing_ : pool_.at(buf);
     if (in == nullptr) {
         close(c);
         return;
@@ -699,7 +721,7 @@ void Shard::serve(ConnHandle c, ConnHot &hot, uint32_t buf) noexcept {
      * \~ */
     const uint32_t wb = pool_.acquire();
     if (wb == kNoBuffer) {
-        pool_.release(buf);
+        if (buf != kNoBuffer) pool_.release(buf);
         close(c);
         return;
     }
@@ -729,10 +751,14 @@ void Shard::serve(ConnHandle c, ConnHot &hot, uint32_t buf) noexcept {
      * Un fragmento que lo soltara aqui haria ilegible toda peticion que llegara
      * en dos paquetes, que son casi todas las grandes.
      * \~ */
-    const bool empty = out->empty();
-    h->reading = in->empty() ? kNoBuffer : buf;
+    // \~english An input nobody should write to keeps no memory, whatever the service did.
+    // \~spanish Una entrada en la que nadie deberia escribir no se queda memoria, haga lo que haga el servicio.  \~
+    if (buf == kNoBuffer) nothing_.release();
 
-    if (h->reading == kNoBuffer) pool_.release(buf);
+    const bool empty = out->empty();
+    h->reading = in->empty() || buf == kNoBuffer ? kNoBuffer : buf;
+
+    if (h->reading == kNoBuffer && buf != kNoBuffer) pool_.release(buf);
 
     /* \~english
      * The answer goes out BEFORE the connection is ended, whether or not the
@@ -1048,6 +1074,7 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
 
         case OpKind::Close:
+        case OpKind::Cancel:
             break;
         }
     }

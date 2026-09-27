@@ -38,6 +38,7 @@ bool MemoryBackend::feed_datagram(const DatagramPath &path, const uint8_t *p,
 }
 
 bool MemoryBackend::waiting(const Op &op) const noexcept {
+    if (op.fd == kCancelledFd) return false;
     switch (op.kind) {
     case OpKind::Recv:
     case OpKind::Ready:
@@ -72,6 +73,7 @@ bool MemoryBackend::waiting(const Op &op) const noexcept {
     case OpKind::Send:
     case OpKind::SendTo:
     case OpKind::Close:
+    case OpKind::Cancel:
         return false;
     }
 
