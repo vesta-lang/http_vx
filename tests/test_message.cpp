@@ -172,6 +172,18 @@ void test_version() {
     check(http_vx::version_text(static_cast<Version>(200))[0] == '\0',
           "a value past the end is written out");
 
+    /* \~english
+     * The first value past the table is the edge: one row too many would read
+     * whatever sits after it and hand it out as a spelling.
+     * \~spanish
+     * El primer valor pasada la tabla es el borde: una fila de mas leeria lo
+     * que haya detras y lo daria como grafia.
+     * \~ */
+    const char *past = http_vx::version_text(
+        static_cast<Version>(static_cast<int>(Version::Http3) + 1));
+    check(past != nullptr && past[0] == '\0',
+          "the first value past the table is written out");
+
     check(http_vx::version_is_text(Version::Http10), "HTTP/1.0 is not text");
     check(http_vx::version_is_text(Version::Http11), "HTTP/1.1 is not text");
     check(!http_vx::version_is_text(Version::Http2), "HTTP/2 is text");

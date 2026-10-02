@@ -32,6 +32,7 @@
 #include "http_vx/fields.h"
 
 #include <cstdio>
+#include <new>
 
 namespace {
 
@@ -136,6 +137,73 @@ void test_foreign_field() {
     check(a.find_next(from_b) == nullptr,
           "a field from another collection was accepted");
     check(a.find_next(nullptr) == nullptr, "a null field was accepted");
+
+    /* \~english
+     * The one just past the last is not a field either: it is where the
+     * walk stops, and starting from it would read past the array.
+     * \~spanish
+     * La que esta justo detras de la ultima tampoco es una cabecera: es donde
+     * se para el recorrido, y empezar desde ella leeria mas alla del array.
+     * \~ */
+    check(a.find_next(a.end()) == nullptr, "the one past the last was accepted");
+
+    /* \~english
+     * And one that lies BEFORE the array.  The collection is built inside a
+     * block of bytes of our own, with a field-shaped record placed ahead of
+     * it, so that the foreign pointer is below `begin()` and still readable --
+     * a walk that did not refuse it would find the collection's own `Host`
+     * entries after it and answer with one of them.
+     * \~spanish
+     * Y una que cae ANTES del array.  La coleccion se construye dentro de un
+     * bloque de bytes propio, con un registro con forma de cabecera delante,
+     * de modo que el puntero ajeno queda por debajo de `begin()` y aun se
+     * puede leer -- un recorrido que no lo rechazara encontraria despues las
+     * entradas `Host` de la propia coleccion y contestaria con una.
+     * \~ */
+    alignas(64) unsigned char arena[64 + sizeof(http_vx::Fields)];
+    http_vx::Field *before = new (arena) http_vx::Field(make(FieldId::Host, 5));
+    http_vx::Fields *inside = new (arena + 64) http_vx::Fields();
+    inside->add(make(FieldId::Host, 6));
+    inside->add(make(FieldId::Host, 7));
+    check(inside->find_next(before) == nullptr,
+          "a field from before the array was accepted");
+    inside->~Fields();
+}
+
+/**
+ * @brief
+ * \~english Each known name has a bit of its own.
+ * \~spanish Cada nombre conocido tiene un bit propio.
+ * \~
+ *
+ * \~english
+ * A collection holding one name must answer yes to that one and no to every
+ * other, `Unknown` included.  Two names sharing a bit would make one of them
+ * report as present when only the other arrived, and the mask short-circuits
+ * the search, so the lie would never be corrected by the array.
+ *
+ * \~spanish
+ * Una coleccion con un solo nombre debe contestar que si a ese y que no a
+ * todos los demas, `Unknown` incluido.  Dos nombres que compartieran bit
+ * harian que uno constara como presente cuando solo llego el otro, y la
+ * mascara corta la busqueda, asi que el array nunca corregiria la mentira.
+ *
+ * \~
+ */
+void test_each_name_has_its_own_bit() {
+    using http_vx::FieldId;
+    const unsigned count = static_cast<unsigned>(FieldId::Count);
+    for (unsigned a = 1; a < count; ++a) {
+        http_vx::Fields f;
+        f.add(make(static_cast<FieldId>(a)));
+        for (unsigned b = 0; b < count; ++b) {
+            const bool want = a == b;
+            check(f.has(static_cast<FieldId>(b)) == want,
+                  "a name reports another one's presence");
+            check((f.find(static_cast<FieldId>(b)) != nullptr) == want,
+                  "a name finds another one's field");
+        }
+    }
 }
 
 /**
@@ -238,6 +306,7 @@ int main() {
     test_add_and_find();
     test_repeated();
     test_foreign_field();
+    test_each_name_has_its_own_bit();
     test_clear_resets_the_mask();
     test_overflow();
 

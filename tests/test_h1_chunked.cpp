@@ -37,6 +37,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -483,9 +484,378 @@ void test_status_mapping() {
           "trailers over the limit are not a 431");
 }
 
+/**
+ * @brief
+ * \~english Every hexadecimal digit is worth what it says, and nothing near them is a digit.
+ * \~spanish Cada digito hexadecimal vale lo que dice, y nada cercano a ellos es un digito.
+ * \~
+ *
+ * \~english
+ * One chunk per digit, whose size is the digit itself: the first and the last
+ * of each range (`0`, `9`, `a`, `f`, `A`, `F`) are where a boundary written one
+ * off would drop a digit.  The characters just outside each range are refused.
+ *
+ * \~spanish
+ * Un trozo por digito, cuyo tamano es el propio digito: el primero y el ultimo
+ * de cada rango (`0`, `9`, `a`, `f`, `A`, `F`) son donde un limite escrito con
+ * uno de error perderia un digito.  Los caracteres justo fuera de cada rango se
+ * rechazan.
+ *
+ * \~
+ */
+void test_every_hex_digit() {
+    const char digits[] = "123456789abcdefABCDEF";
+    for (size_t i = 0; digits[i] != '\0'; ++i) {
+        const char c = digits[i];
+        const size_t value = (c >= '0' && c <= '9')   ? static_cast<size_t>(c - '0')
+                             : (c >= 'a' && c <= 'f') ? static_cast<size_t>(c - 'a' + 10)
+                                                      : static_cast<size_t>(c - 'A' + 10);
+        char msg[64];
+        size_t n = 0;
+        msg[n++] = c;
+        msg[n++] = '\r';
+        msg[n++] = '\n';
+        for (size_t k = 0; k < value; ++k) msg[n++] = 'x';
+        const char tail[] = "\r\n0\r\n\r\n";
+        std::memcpy(msg + n, tail, sizeof(tail));
+
+        char want[32];
+        std::memset(want, 'x', value);
+        want[value] = '\0';
+        reads_as(msg, want, "a hexadecimal digit was not worth its value");
+    }
+
+    refuses("/\r\n\r\n", ChunkError::BadChunkSize, "the character before 0 was a digit");
+    refuses(":\r\n\r\n", ChunkError::BadChunkSize, "the character after 9 was a digit");
+    refuses("@\r\n\r\n", ChunkError::BadChunkSize, "the character before A was a digit");
+    refuses("G\r\n\r\n", ChunkError::BadChunkSize, "the character after F was a digit");
+    refuses("`\r\n\r\n", ChunkError::BadChunkSize, "the character before a was a digit");
+}
+
+/**
+ * @brief
+ * \~english The size has exactly as many digits as the limit, and no overflow slips past it.
+ * \~spanish El tamano tiene exactamente tantos digitos como el limite, y ningun desbordamiento se cuela.
+ * \~
+ *
+ * \~english
+ * Sixteen digits are allowed by default and seventeen are not, so the limit is
+ * checked at its edge.  Past that, with the digit limit raised, the arithmetic
+ * is the only thing left standing between a size and a wrap-around: 2^64 must
+ * not read as zero (the end of the body), and the largest size must read as the
+ * enormous number it is and be refused for it.
+ *
+ * \~spanish
+ * Dieciseis digitos se permiten por defecto y diecisiete no, asi que el limite
+ * se comprueba en su borde.  Mas alla, con el limite de digitos subido, la
+ * aritmetica es lo unico que queda entre un tamano y una vuelta del contador:
+ * 2^64 no puede leerse como cero (el final del cuerpo), y el tamano mayor tiene
+ * que leerse como el numero enorme que es y rechazarse por serlo.
+ *
+ * \~
+ */
+void test_size_digits_and_overflow() {
+    reads_as("0000000000000005\r\nhello\r\n0\r\n\r\n", "hello",
+             "sixteen digits of size were refused");
+
+    http_vx::h1::Limits wide;
+    wide.max_chunk_size_digits = 32;
+
+    const Reading wrap = read_body("10000000000000000\r\n\r\n", 0, wide);
+    check(wrap.result == ChunkResult::Error, "a size of 2^64 was accepted");
+    check(wrap.error == ChunkError::ChunkSizeTooLong,
+          "a size of 2^64 was refused for the wrong reason");
+
+    const Reading huge = read_body("ffffffffffffffff\r\n", 0, wide);
+    check(huge.result == ChunkResult::Error, "the largest size was accepted");
+    check(huge.error == ChunkError::BodyTooLarge,
+          "the largest size was taken for an overflow instead of a size");
+
+    const Reading near_wrap = read_body("1fffffffffffffff0\r\n", 0, wide);
+    check(near_wrap.error == ChunkError::ChunkSizeTooLong,
+          "a size that wraps the counter was accepted");
+}
+
+/**
+ * @brief
+ * \~english Many small chunks are many sizes, not one long one.
+ * \~spanish Muchos trozos pequenos son muchos tamanos, no uno largo.
+ * \~
+ *
+ * \~english
+ * The digit count is per chunk.  A body of thirty one-digit chunks has far
+ * more than sixteen digits of size between them and is perfectly ordinary.
+ *
+ * \~spanish
+ * La cuenta de digitos es por trozo.  Un cuerpo de treinta trozos de un digito
+ * tiene muchos mas de dieciseis digitos de tamano entre todos y es del todo
+ * corriente.
+ *
+ * \~
+ */
+void test_digits_are_counted_per_chunk() {
+    char msg[256];
+    size_t n = 0;
+    for (int i = 0; i < 30; ++i) {
+        const char piece[] = "1\r\nx\r\n";
+        std::memcpy(msg + n, piece, sizeof(piece) - 1);
+        n += sizeof(piece) - 1;
+    }
+    const char tail[] = "0\r\n\r\n";
+    std::memcpy(msg + n, tail, sizeof(tail));
+
+    reads_as(msg, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+             "thirty small chunks were read as one long size");
+}
+
+/**
+ * @brief
+ * \~english The limits are inclusive: what fits exactly is accepted.
+ * \~spanish Los limites son inclusivos: lo que cabe justo se acepta.
+ * \~
+ */
+void test_limits_at_the_edge() {
+    {
+        http_vx::h1::Limits limits;
+        limits.max_body_bytes = 5;
+        const Reading one = read_body("5\r\nhello\r\n0\r\n\r\n", 0, limits);
+        check(one.result == ChunkResult::Done, "a chunk exactly at the body limit was refused");
+        check(one.body_bytes == 5, "a chunk at the body limit was not counted");
+
+        const Reading two = read_body("3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n", 0, limits);
+        check(two.result == ChunkResult::Done,
+              "two chunks exactly at the body limit were refused");
+
+        const Reading over = read_body("3\r\nhel\r\n3\r\nlo!\r\n0\r\n\r\n", 0, limits);
+        check(over.error == ChunkError::BodyTooLarge, "one byte over the limit was accepted");
+    }
+    {
+        /* \~english
+         * The extension length counts from the semicolon, so `;aaaa` is five.
+         * \~spanish
+         * La longitud de la extension cuenta desde el punto y coma, asi que
+         * `;aaaa` son cinco.
+         * \~ */
+        http_vx::h1::Limits limits;
+        limits.max_chunk_extension = 5;
+        const Reading fits = read_body("5;aaaa\r\nhello\r\n0\r\n\r\n", 0, limits);
+        check(fits.result == ChunkResult::Done,
+              "an extension exactly at the limit was refused");
+        const Reading over = read_body("5;aaaaa\r\nhello\r\n0\r\n\r\n", 0, limits);
+        check(over.error == ChunkError::BadChunkExtension,
+              "an extension one over the limit was accepted");
+    }
+    {
+        /* \~english
+         * Six bytes of trailer (`A: b` and its line ending), then the end.
+         * \~spanish
+         * Seis bytes de remolque (`A: b` y su fin de linea), y luego el final.
+         * \~ */
+        http_vx::h1::Limits limits;
+        limits.max_trailer_bytes = 6;
+        const Reading fits = read_body("0\r\nA: b\r\n\r\n", 0, limits);
+        check(fits.result == ChunkResult::Done,
+              "trailers exactly at the limit were refused");
+        limits.max_trailer_bytes = 5;
+        const Reading over = read_body("0\r\nA: b\r\n\r\n", 0, limits);
+        check(over.error == ChunkError::TrailersTooLarge,
+              "trailers one byte over the limit were accepted");
+
+        http_vx::h1::Limits two;
+        two.max_trailers = 2;
+        const Reading ok = read_body("0\r\nA: 1\r\nB: 2\r\n\r\n", 0, two);
+        check(ok.result == ChunkResult::Done, "exactly as many trailers as allowed were refused");
+    }
+}
+
+/**
+ * @brief
+ * \~english Trailers that never end are refused while they are still arriving.
+ * \~spanish Los remolques que no acaban se rechazan mientras aun estan llegando.
+ * \~
+ *
+ * \~english
+ * The limit is checked in every state a trailer can be waiting in, not only at
+ * its end: a peer that sends a name, a run of spaces or a value and never a
+ * line ending must be cut off at the limit instead of being waited for.
+ *
+ * \~spanish
+ * El limite se comprueba en cada estado en que puede estar esperando un
+ * remolque, no solo al final: un extremo que mande un nombre, una tirada de
+ * espacios o un valor y nunca un fin de linea tiene que cortarse en el limite
+ * en vez de esperarlo.
+ *
+ * \~
+ */
+void test_endless_trailers_are_cut() {
+    http_vx::h1::Limits limits;
+    limits.max_trailer_bytes = 16;
+
+    const Reading name = read_body(
+        "0\r\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, limits);
+    check(name.result == ChunkResult::Error && name.error == ChunkError::TrailersTooLarge,
+          "an endless trailer name was waited for");
+
+    const Reading spaces = read_body(
+        "0\r\nX:                                                          ", 0, limits);
+    check(spaces.result == ChunkResult::Error && spaces.error == ChunkError::TrailersTooLarge,
+          "an endless run of spaces after a trailer name was waited for");
+
+    const Reading value = read_body(
+        "0\r\nX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0, limits);
+    check(value.result == ChunkResult::Error && value.error == ChunkError::TrailersTooLarge,
+          "an endless trailer value was waited for");
+}
+
+/**
+ * @brief
+ * \~english Malformed trailers, each for its own reason.
+ * \~spanish Remolques mal formados, cada uno por su razon.
+ * \~
+ */
+void test_malformed_trailers() {
+    refuses("0\r\n: v\r\n\r\n", ChunkError::BadTrailerName, "a trailer with no name was accepted");
+    refuses("0\r\nX: a\nb\r\n\r\n", ChunkError::BareLineFeed,
+            "a line feed inside a trailer value was accepted");
+    refuses("0\r\nX: a\r\r\n\r\n", ChunkError::BareCarriageReturn,
+            "a trailer ending in a carriage return and no line feed was accepted");
+    refuses("0\r\n\rX", ChunkError::BareCarriageReturn,
+            "the closing line ending without its line feed was accepted");
+    refuses("5\rhello\r\n0\r\n\r\n", ChunkError::BareCarriageReturn,
+            "a size line ending in a carriage return and no line feed was accepted");
+    refuses("0\r\nX: a\x01\r\n\r\n", ChunkError::BadTrailerValue,
+            "a control character inside a trailer value was accepted");
+    refuses("5;a\x01\r\nhello\r\n0\r\n\r\n", ChunkError::BadChunkExtension,
+            "a control character inside an extension was accepted");
+    refuses("0\r\n\nX", ChunkError::BareLineFeed,
+            "a bare line feed where the trailers should end was accepted");
+}
+
+/**
+ * @brief
+ * \~english What a trailer is recorded as: where it is, how long, and what it is.
+ * \~spanish Como se anota un remolque: donde esta, cuanto mide, y que es.
+ * \~
+ */
+void test_trailer_fields() {
+    const char *msg = "0\r\nETag:   \"abc\" \t \r\nX-Other:1\r\n\r\n";
+    const uint8_t *d = reinterpret_cast<const uint8_t *>(msg);
+    const size_t len = std::strlen(msg);
+
+    const http_vx::h1::Limits limits;
+    ChunkedReader r(limits);
+    r.reset(0);
+    http_vx::Fields t;
+    check(r.read(http_vx::View{d, len, 0}, t) == ChunkResult::Done,
+          "a body with trailers was not read");
+    check(t.size() == 2, "the trailers were not recorded");
+    if (t.size() != 2) return;
+
+    const http_vx::Field &a = t.begin()[0];
+    check(a.id == http_vx::FieldId::ETag, "a known trailer lost what it is");
+    check(a.name_len == 4 && std::memcmp(d + a.name_off, "ETag", 4) == 0,
+          "the first trailer name is not where it was recorded");
+    check(a.value_len == 5 && std::memcmp(d + a.value_off, "\"abc\"", 5) == 0,
+          "the first trailer value was not trimmed on both sides");
+
+    const http_vx::Field &b = t.begin()[1];
+    check(b.id == http_vx::FieldId::Unknown, "an unknown trailer claims to be known");
+    check(b.name_len == 7 && std::memcmp(d + b.name_off, "X-Other", 7) == 0,
+          "the second trailer name is not where it was recorded");
+    check(b.value_len == 1 && d[b.value_off] == '1',
+          "the second trailer value is not where it was recorded");
+}
+
+/**
+ * @brief
+ * \~english The largest name and value a field can record, and the first that cannot.
+ * \~spanish El nombre y el valor mayores que una cabecera puede anotar, y el primero que no.
+ * \~
+ *
+ * \~english
+ * Lengths are stored in sixteen bits.  The largest value is recorded intact
+ * and one more is refused: a length cut to sixteen bits would record the wrong
+ * number of bytes and carry on as if nothing had happened.
+ *
+ * \~spanish
+ * Las longitudes se guardan en dieciseis bits.  El valor mayor se anota entero
+ * y uno mas se rechaza: una longitud recortada a dieciseis bits anotaria un
+ * numero de bytes equivocado y seguiria como si nada.
+ *
+ * \~
+ */
+void test_the_largest_trailer() {
+    http_vx::h1::Limits limits;
+    limits.max_trailer_bytes = 1u << 20;
+
+    const std::string head = "0\r\n";
+    const std::string end = "\r\n\r\n";
+    const std::string longest(0xFFFF, 'a');
+    const std::string too_long(0x10000, 'a');
+
+    const Reading name_ok = read_body((head + longest + ": v" + end).c_str(), 0, limits);
+    check(name_ok.result == ChunkResult::Done, "the longest trailer name was refused");
+    const Reading name_big = read_body((head + too_long + ": v" + end).c_str(), 0, limits);
+    check(name_big.error == ChunkError::TrailersTooLarge,
+          "a trailer name past sixteen bits was accepted");
+
+    const Reading value_ok = read_body((head + "X: " + longest + end).c_str(), 0, limits);
+    check(value_ok.result == ChunkResult::Done, "the longest trailer value was refused");
+    const Reading value_big = read_body((head + "X: " + too_long + end).c_str(), 0, limits);
+    check(value_big.error == ChunkError::TrailersTooLarge,
+          "a trailer value past sixteen bits was accepted");
+}
+
+/**
+ * @brief
+ * \~english The whole forbidden set, one by one, and the values that are not fields.
+ * \~spanish El conjunto prohibido entero, uno a uno, y los valores que no son cabeceras.
+ * \~
+ */
+void test_forbidden_set_in_full() {
+    using http_vx::FieldId;
+    using http_vx::h1::field_forbidden_in_trailers;
+
+    const FieldId forbidden[] = {
+        FieldId::ContentLength,  FieldId::TransferEncoding, FieldId::Connection,
+        FieldId::KeepAlive,      FieldId::Upgrade,          FieldId::TE,
+        FieldId::Trailer,        FieldId::Expect,           FieldId::Host,
+        FieldId::Authorization,  FieldId::ProxyAuthorization, FieldId::SetCookie,
+        FieldId::Cookie,         FieldId::ContentType,      FieldId::ContentEncoding,
+        FieldId::ContentRange,   FieldId::CacheControl,
+    };
+    for (FieldId id : forbidden)
+        check(field_forbidden_in_trailers(id), "a forbidden trailer name is allowed");
+
+    /* \~english
+     * The count itself and anything past it are not names.  Answering "forbidden"
+     * for them would be answering for something that does not exist, and the
+     * bit test behind it would shift out of range.
+     * \~spanish
+     * El propio total y cualquier cosa por encima no son nombres.  Contestar
+     * "prohibido" por ellos seria contestar por algo que no existe, y la prueba
+     * de bit de detras se desplazaria fuera de rango.
+     * \~ */
+    check(!field_forbidden_in_trailers(FieldId::Count), "the count is a forbidden name");
+    check(!field_forbidden_in_trailers(static_cast<FieldId>(
+              static_cast<unsigned>(FieldId::Count) + 1)),
+          "a value past the count is a forbidden name");
+    check(!field_forbidden_in_trailers(static_cast<FieldId>(1000)),
+          "a far out value is a forbidden name");
+}
+
 } // namespace
 
 int main() {
+    test_every_hex_digit();
+    test_size_digits_and_overflow();
+    test_digits_are_counted_per_chunk();
+    test_limits_at_the_edge();
+    test_endless_trailers_are_cut();
+    test_malformed_trailers();
+    test_trailer_fields();
+    test_the_largest_trailer();
+    test_forbidden_set_in_full();
     test_ordinary();
     test_extensions();
     test_bad_sizes();

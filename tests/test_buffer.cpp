@@ -502,6 +502,213 @@ void test_ceiling() {
           "a refused reserve moved the bytes");
 }
 
+/**
+ * @brief
+ * \~english Moving carries the stream position along with the memory.
+ * \~spanish Mover se lleva la posicion del flujo junto con la memoria.
+ * \~
+ *
+ * \~english
+ * Every offset the parser holds is relative to the origin, so a buffer that
+ * arrives with the origin at zero makes all of them point at bytes that are
+ * not the ones they named.
+ *
+ * \~spanish
+ * Todos los desplazamientos que guarda el analizador son relativos al origen,
+ * asi que un buffer que llega con el origen a cero hace que todos apunten a
+ * bytes que no son los que nombraron.
+ *
+ * \~
+ */
+void test_move_keeps_the_origin() {
+    http_vx::Buffer a;
+    fill(a, 40);
+    a.consume(25);
+    check(a.origin() == 25, "the origin did not advance with the consume");
+
+    http_vx::Buffer b(static_cast<http_vx::Buffer &&>(a));
+    check(b.origin() == 25, "move construction lost the origin");
+    check(a.origin() == 0, "the moved-from buffer kept its origin");
+
+    http_vx::Buffer c;
+    fill(c, 8);
+    c.consume(3);
+    c = static_cast<http_vx::Buffer &&>(b);
+    check(c.origin() == 25, "move assignment lost the origin");
+    check(b.origin() == 0, "the assigned-from buffer kept its origin");
+    check(c.view().origin == 25, "the view of a moved buffer lost the origin");
+}
+
+/**
+ * @brief
+ * \~english Releasing ends the stream: the next one starts at zero.
+ * \~spanish Soltar acaba el flujo: el siguiente empieza en cero.
+ * \~
+ */
+void test_release_resets_the_origin() {
+    http_vx::Buffer b;
+    fill(b, 40);
+    b.consume(30);
+    check(b.origin() == 30, "the origin did not advance with the consume");
+
+    b.release();
+    check(b.origin() == 0, "releasing kept the stream position");
+    check(b.size() == 0, "releasing kept the bytes");
+}
+
+/**
+ * @brief
+ * \~english Consuming everything gives the whole block back.
+ * \~spanish Consumirlo todo devuelve el bloque entero.
+ * \~
+ *
+ * \~english
+ * An empty buffer is rewound to its start, so the next read has the full
+ * capacity instead of whatever was left past the old tail.  Without it a
+ * connection that reads and drains in lockstep would creep to the end of the
+ * block and pay for a slide on every message.
+ *
+ * \~spanish
+ * Un buffer vacio se rebobina a su principio, asi que la siguiente lectura
+ * tiene la capacidad entera y no lo que quedara detras de la cola antigua.
+ * Sin eso una conexion que lee y vacia al mismo ritmo se arrastraria hasta el
+ * final del bloque y pagaria un deslizamiento en cada mensaje.
+ *
+ * \~
+ */
+void test_drained_buffer_rewinds() {
+    http_vx::Buffer b;
+    fill(b, 10);
+    const size_t cap = b.capacity();
+    check(b.tail_room() == cap - 10, "the tail room does not follow the commit");
+
+    b.consume(10);
+    check(b.empty(), "consuming everything left something");
+    check(b.tail_room() == cap, "a drained buffer was not rewound to the start");
+    check(b.origin() == 10, "rewinding lost the stream position");
+}
+
+/**
+ * @brief
+ * \~english Asking for exactly what is there neither grows nor slides.
+ * \~spanish Pedir exactamente lo que hay no hace crecer ni deslizar.
+ * \~
+ *
+ * \~english
+ * Both boundaries are inclusive: a request equal to the tail room fits in
+ * place, and a request equal to what sliding would free fits by sliding.  The
+ * cheaper path wins at the boundary, and the capacity is how it shows.
+ *
+ * \~spanish
+ * Los dos limites son inclusivos: una peticion igual al sitio de la cola cabe
+ * donde esta, y una igual a lo que liberaria deslizar cabe deslizando.  En el
+ * limite gana el camino barato, y la capacidad es como se nota.
+ *
+ * \~
+ */
+void test_exact_fit() {
+    http_vx::Buffer b;
+    fill(b, 10);
+    const size_t cap = b.capacity();
+
+    /* \~english
+     * The capacity alone cannot tell "served in place" from "reallocated at
+     * the same size", so the address of the block is compared too.
+     * \~spanish
+     * La capacidad por si sola no distingue "servido donde estaba" de
+     * "realocado al mismo tamano", asi que se compara tambien la direccion del
+     * bloque.
+     * \~ */
+    const uint8_t *block = b.data();
+    uint8_t *p = b.reserve(b.tail_room());
+    check(p != nullptr && p == b.tail(), "an exact fit was not served in place");
+    check(b.capacity() == cap, "an exact fit in the tail room grew the buffer");
+    check(b.data() == block, "an exact fit in the tail room moved the block");
+
+    /* \~english
+     * Fill to the end, drop a hundred from the front: the tail room is zero and
+     * the hundred dropped bytes are exactly what a slide frees.
+     * \~spanish
+     * Llenar hasta el final y quitar cien del principio: el sitio de la cola
+     * es cero y los cien bytes descartados son justo lo que libera deslizar.
+     * \~ */
+    http_vx::Buffer c;
+    fill(c, 10);
+    const size_t all = c.capacity();
+    fill(c, all - 10);
+    check(c.tail_room() == 0, "the buffer was not filled to the end");
+    const uint8_t *base = c.data();
+    c.consume(100);
+
+    p = c.reserve(100);
+    check(p != nullptr, "an exact fit by sliding failed");
+    check(c.capacity() == all, "an exact fit by sliding grew the buffer");
+    check(c.data() == base, "an exact fit by sliding moved the block");
+    check(c.tail_room() == 100, "sliding did not free what the head had dropped");
+}
+
+/**
+ * @brief
+ * \~english Growing makes room for the live bytes AND the request.
+ * \~spanish Crecer hace sitio para los bytes vivos Y la peticion.
+ * \~
+ *
+ * \~english
+ * The block is sized for the sum.  Sized for the request alone it can come
+ * back the same size as before, with the room still short, and the caller
+ * writes past the end of what it was handed.
+ *
+ * \~spanish
+ * El bloque se dimensiona para la suma.  Dimensionado solo para la peticion
+ * puede volver del mismo tamano que tenia, con el sitio todavia corto, y quien
+ * llama escribe pasado el final de lo que se le dio.
+ *
+ * \~
+ */
+void test_growth_covers_live_plus_request() {
+    http_vx::Buffer b;
+    b.reserve(1);
+    const size_t cap = b.capacity();
+    fill(b, cap - 96);
+
+    uint8_t *p = b.reserve(200);
+    check(p != nullptr, "growing for a small request failed");
+    check(b.tail_room() >= 200, "the room handed out is shorter than asked");
+    check(b.size() == cap - 96, "growing changed how many bytes are live");
+}
+
+/**
+ * @brief
+ * \~english The ceiling is reachable, and the block that reaches it is full size.
+ * \~spanish El techo se alcanza, y el bloque que lo alcanza es de tamano completo.
+ * \~
+ *
+ * \~english
+ * Doubling lands on the ceiling for any request above half of it, and the
+ * capacity must be the ceiling: a capacity cut down to the request would be
+ * smaller than the doubling promised.  Asking for exactly the ceiling is
+ * served too -- only past it is a refusal.
+ *
+ * \~spanish
+ * Duplicar cae en el techo para cualquier peticion por encima de su mitad, y
+ * la capacidad tiene que ser el techo: una capacidad recortada a la peticion
+ * seria menor de lo que prometia duplicar.  Pedir exactamente el techo
+ * tambien se sirve -- solo pasado el se niega.
+ *
+ * \~
+ */
+void test_ceiling_is_reachable() {
+    const size_t max = http_vx::kBufferMaxCapacity;
+
+    http_vx::Buffer a;
+    check(a.reserve(max / 2 + 1000) != nullptr, "a request below the ceiling failed");
+    check(a.capacity() == max, "doubling to the ceiling did not give the ceiling");
+
+    http_vx::Buffer b;
+    check(b.reserve(max) != nullptr, "a request for exactly the ceiling was refused");
+    check(b.capacity() == max, "the ceiling request got a different capacity");
+}
+
 } // namespace
 
 int main() {
@@ -517,6 +724,12 @@ int main() {
     test_clear_keeps_the_memory();
     test_move();
     test_ceiling();
+    test_move_keeps_the_origin();
+    test_release_resets_the_origin();
+    test_drained_buffer_rewinds();
+    test_exact_fit();
+    test_growth_covers_live_plus_request();
+    test_ceiling_is_reachable();
 
     if (failures != 0) {
         std::fprintf(stderr, "test_buffer: %d failures\n", failures);

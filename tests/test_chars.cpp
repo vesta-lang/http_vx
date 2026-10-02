@@ -227,6 +227,8 @@ void test_field_value_is_valid() {
     check(http_vx::field_value_is_valid("a b", 3),
           "interior whitespace was refused");
     check(http_vx::field_value_is_valid("", 0), "the empty value was refused");
+    check(http_vx::field_value_is_valid(nullptr, 0), "the empty value with no bytes was refused");
+    check(!http_vx::field_value_is_valid(nullptr, 3), "a null value was accepted");
     check(http_vx::field_value_is_valid("\x80\xFF", 2), "obs-text was refused");
 
     check(!http_vx::field_value_is_valid(" x", 2), "a leading space was accepted");
@@ -274,6 +276,25 @@ void test_token_equals() {
     const uint8_t at[] = {'@'};
     check(!http_vx::token_equals(at, 1, "`"), "only letters are lowered");
     check(http_vx::token_equals(close, 0, ""), "empty equals empty");
+
+    /* \~english
+     * Every letter, at both ends of the alphabet: the first and last capital
+     * are where an off-by-one in the range would leave one unlowered, and the
+     * characters just outside the range (`@` and `[`) must stay as they are.
+     * \~spanish
+     * Todas las letras, en los dos extremos del alfabeto: la primera y la
+     * ultima mayuscula son donde un error de uno en el rango dejaria una sin
+     * bajar, y los caracteres justo fuera del rango (`@` y `[`) deben quedarse
+     * como estan.
+     * \~ */
+    for (char c = 'A'; c <= 'Z'; ++c) {
+        const uint8_t upper[] = {static_cast<uint8_t>(c)};
+        const char lower[] = {static_cast<char>(c + ('a' - 'A')), '\0'};
+        check(http_vx::token_equals(upper, 1, lower),
+              "a capital letter was not lowered before the comparison");
+    }
+    const uint8_t bracket[] = {'['};
+    check(!http_vx::token_equals(bracket, 1, "{"), "a bracket was lowered into a brace");
 }
 
 /**
