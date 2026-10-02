@@ -56,8 +56,17 @@ bool Shard::start(const ShardConfig &cfg, Backend &io, Service *service,
 
     cfg_ = cfg;
     io_ = &io;
-    kicks_.reset(&io);
+    // \~english One wake for both stacks that can wake this shard (HVX-6, 6).
+    // \~spanish Un despertar para las dos pilas que pueden despertar a este fragmento (HVX-6, 6).  \~
+    wake_.reset(&io);
+    kicks_.reset(wake_);
+    mail_.reset(wake_);
+    stop_requested_ = false;
     service_ = service;
+
+    // \~english Made here, on the thread that starts the shard, so the memory is its own (HVX-6, R44).
+    // \~spanish Se hace aqui, en el hilo que arranca el fragmento, para que la memoria sea suya (HVX-6, R44).  \~
+    if (!mail_pool_.reset(cfg.mail_nodes)) return false;
 
     if (!conns_.reset(cfg.connections)) return false;
     if (!pool_.reset(cfg.buffers, cfg.buffer_ceiling)) return false;
@@ -157,18 +166,22 @@ void Shard::on_accept(const Completion &done, uint64_t now) noexcept {
      * senalar.
      * \~ */
     const ConnHandle c = adopt(done.fd, now);
-    if (c.valid()) return;
+    if (c.valid()) {
+        ++counts_.accepted;
+        return;
+    }
 
-    Op shut;
-    shut.kind = OpKind::Close;
-    shut.buffer = kNoBuffer;
-    shut.fd = done.fd;
-    io_->submit(shut);
+    ++counts_.accept_refused;
+    close_socket(done.fd);
 }
 
 void Shard::release() noexcept {
     if (io_ != nullptr && (service_ != nullptr || datagram_service_ != nullptr)) shut_down();
     datagram_service_ = nullptr;
+
+    // \~english What was handed over and never taken is closed, not leaked; then the pool goes.
+    // \~spanish Lo que se paso y nunca se cogio se cierra, no se pierde; luego se va el pozo.  \~
+    release_mail();
 
     if (queue_next_ != nullptr) {
         util::host_free(queue_next_);
@@ -1005,15 +1018,17 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
     }
 
     /* \~english
-     * A wait that may sleep publishes it first and looks at the kicks again
-     * (HVX-5, 6.3): a kick already there makes it not wait at all.
+     * A wait that may sleep publishes it first and looks at the kicks and the
+     * mailbox again (HVX-5, 6.3; HVX-6, 6): one already there makes it not
+     * wait at all.
      * \~spanish
      * Una espera que puede dormir lo publica antes y vuelve a mirar los avisos
-     * (HVX-5, 6.3): un aviso que ya este hace que no espere nada.
+     * y el buzon (HVX-5, 6.3; HVX-6, 6): uno que ya este hace que no espere
+     * nada.
      * \~ */
-    const int wait_ms = timeout_ms != 0 && !kicks_.about_to_sleep() ? 0 : timeout_ms;
+    const int wait_ms = wait_budget(timeout_ms);
     const size_t made = io_->wait(done, cap, wait_ms);
-    kicks_.awake();
+    wake_.awake();
 
     for (size_t i = 0; i < made; ++i) {
         /* \~english
@@ -1078,6 +1093,10 @@ size_t Shard::poll(uint64_t now, int timeout_ms) noexcept {
             break;
         }
     }
+
+    // \~english What other shards sent: after the completions, before the kicks (HVX-6, 6).
+    // \~spanish Lo que mandaron otros fragmentos: despues de las finalizaciones, antes de los avisos (HVX-6, 6).  \~
+    run_mail(now);
 
     // \~english Every kicked source, to whoever opened its response.
     // \~spanish Cada fuente avisada, a quien abrio su respuesta.  \~

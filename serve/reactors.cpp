@@ -36,9 +36,26 @@ void Reactors::print_names(std::FILE *out) const noexcept {
 }
 
 bool Reactors::make(const char *want, http_vx::BufferPool &pool,
-                    uint32_t connections, const char *host, uint16_t on) noexcept {
+                    uint32_t connections, const char *host, uint16_t on,
+                    Listening listening) noexcept {
 #ifdef _WIN32
     (void)want;
+
+    /* \~english
+     * Windows has no way to share an address between listening sockets (HVX-6,
+     * 4.2): one shard listens and hands the sockets it accepts to the others.
+     * Asking for a shared one is a request this system cannot meet, and it is
+     * refused rather than turned into something else.
+     * \~spanish
+     * Windows no tiene forma de compartir una direccion entre sockets de
+     * escucha (HVX-6, 4.2): un fragmento escucha y pasa los sockets que acepta a
+     * los demas.  Pedir uno compartido es una peticion que este sistema no puede
+     * cumplir, y se rechaza en vez de convertirla en otra cosa.
+     * \~ */
+    if (listening == Listening::Shared) {
+        error_ = 50; // ERROR_NOT_SUPPORTED
+        return false;
+    }
 
     /* \~english
      * The ceiling is on OPERATIONS here, because a completion port holds one
@@ -47,14 +64,22 @@ bool Reactors::make(const char *want, http_vx::BufferPool &pool,
      * Aqui el techo es de OPERACIONES, porque un puerto de finalizacion guarda
      * un registro por cosa que este haciendo el nucleo.
      * \~ */
-    if (!iocp_.reset(pool, connections * 2 + 64) || !iocp_.listen(host, on)) {
+    if (!iocp_.reset(pool, connections * 2 + 64)) {
         error_ = iocp_.last_error();
         return false;
     }
-    port_ = iocp_.port();
+    if (listening == Listening::Alone && !iocp_.listen(host, on)) {
+        error_ = iocp_.last_error();
+        return false;
+    }
+    port_ = listening == Listening::Alone ? iocp_.port() : on;
     io_ = &iocp_;
     return true;
 #else
+    const http_vx::ListenShare share =
+        listening == Listening::Shared ? http_vx::ListenShare::SharedPort : http_vx::ListenShare::Alone;
+    const bool listens = listening != Listening::Off;
+
     if (std::strcmp(want, uring_.name()) == 0) {
         /* \~english
          * The ceiling is on RING ENTRIES, which is neither of the other two:
@@ -65,11 +90,11 @@ bool Reactors::make(const char *want, http_vx::BufferPool &pool,
          * dos: acota lo que espera a entregarse, y el nucleo hace el anillo de
          * finalizaciones del doble para lo que esta en vuelo.
          * \~ */
-        if (!uring_.reset(pool, 1024) || !uring_.listen(host, on)) {
+        if (!uring_.reset(pool, 1024) || (listens && !uring_.listen(host, on, 512, share))) {
             error_ = uring_.last_error();
             return false;
         }
-        port_ = uring_.port();
+        port_ = listens ? uring_.port() : on;
         io_ = &uring_;
         return true;
     }
@@ -81,11 +106,11 @@ bool Reactors::make(const char *want, http_vx::BufferPool &pool,
      * El techo es de DESCRIPTORES, porque la disponibilidad guarda una nota por
      * socket y nada por operacion.
      * \~ */
-    if (!epoll_.reset(pool, connections + 64) || !epoll_.listen(host, on)) {
+    if (!epoll_.reset(pool, connections + 64) || (listens && !epoll_.listen(host, on, 512, share))) {
         error_ = epoll_.last_error();
         return false;
     }
-    port_ = epoll_.port();
+    port_ = listens ? epoll_.port() : on;
     io_ = &epoll_;
     return true;
 #endif

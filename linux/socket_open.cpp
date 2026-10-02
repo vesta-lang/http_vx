@@ -51,7 +51,7 @@ bool socket_address(const char *host, uint16_t port, SocketAddress &out,
 }
 
 int open_listener(const char *host, uint16_t port, int backlog, bool nonblock,
-                  uint16_t &bound, int32_t &error) noexcept {
+                  ListenShare share, uint16_t &bound, int32_t &error) noexcept {
     SocketAddress addr;
     if (!socket_address(host, port, addr, error)) return -1;
 
@@ -79,9 +79,22 @@ int open_listener(const char *host, uint16_t port, int backlog, bool nonblock,
      * datagramas: uno de doble pila cogeria clientes v4 como direcciones
      * mapeadas, un extremo con dos grafias.
      * \~ */
+    /* \~english
+     * `SO_REUSEPORT` goes before `bind`, on EVERY socket of the group: the
+     * kernel only lets sockets share an address when all of them asked for it
+     * before binding, and then spreads incoming connections among them by a
+     * hash of the four-tuple (HVX-6, 4.1).
+     * \~spanish
+     * `SO_REUSEPORT` va antes de `bind`, en CADA socket del grupo: el nucleo solo
+     * deja que varios sockets compartan una direccion cuando todos lo pidieron
+     * antes de atarse, y entonces reparte las conexiones entre ellos por un hash
+     * de la cuadrupla (HVX-6, 4.1).
+     * \~ */
     const int on = 1;
     const bool fine =
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) == 0 &&
+        (share != ListenShare::SharedPort ||
+         setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on) == 0) &&
         (addr.family != AF_INET6 ||
          setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on) == 0) &&
         bind(s, reinterpret_cast<const sockaddr *>(&addr.raw), addr.len) == 0 &&

@@ -41,6 +41,7 @@
 #define HTTP_VX_KICK_QUEUE_H
 
 #include "http_vx/open_response.h"
+#include "http_vx/shard_wake.h"
 
 #include <atomic>
 #include <cstddef>
@@ -61,7 +62,7 @@ struct KickCounts {
     uint64_t taken = 0;
     /// \~english Kicks that found their source already queued.  \~spanish Avisos que encontraron su fuente ya en la cola.  \~
     uint64_t coalesced = 0;
-    /// \~english Times a sleeping shard was woken.  \~spanish Veces que se desperto a un fragmento dormido.  \~
+    /// \~english Times a sleeping shard was woken; the mark is shared, so with a mailbox these include its pushes.  \~spanish Veces que se desperto a un fragmento dormido; la marca es compartida, asi que con un buzon incluyen sus pushes.  \~
     uint64_t wakes = 0;
     /// \~english Wakes the backend could not deliver.  \~spanish Despertares que el backend no pudo entregar.  \~
     uint64_t failed_wakes = 0;
@@ -81,8 +82,21 @@ public:
     KickQueue(const KickQueue &) = delete;
     KickQueue &operator=(const KickQueue &) = delete;
 
-    /// \~english The backend a sleeping shard is woken through.  \~spanish El backend por el que se despierta a un fragmento dormido.  \~
+    /**
+     * @brief
+     * \~english Stand-alone: the queue owns its wake, which goes through @p io.
+     * \~spanish Autonoma: la cola es dueña de su despertar, que pasa por @p io.
+     * \~
+     */
     void reset(Backend *io) noexcept;
+
+    /**
+     * @brief
+     * \~english Shared: the queue wakes through @p wake, the shard's one mark (HVX-6, 6).
+     * \~spanish Compartida: la cola despierta por @p wake, la unica marca del fragmento (HVX-6, 6).
+     * \~
+     */
+    void reset(ShardWake &wake) noexcept;
 
     /**
      * @brief
@@ -163,12 +177,10 @@ private:
     void deliver_gone(BodySource &s) noexcept;
 
     std::atomic<BodySource *> head_{nullptr};
-    std::atomic<uint32_t> sleeping_{0};
-    Backend *io_ = nullptr;
 
-    /// \~english Counted by kickers, which may be any thread.  \~spanish Contados por quien avisa, que puede ser cualquier hilo.  \~
-    std::atomic<uint64_t> wakes_{0};
-    std::atomic<uint64_t> failed_wakes_{0};
+    /// \~english The wake this queue uses: its own when stand-alone, the shard's when shared.  \~spanish El despertar que usa esta cola: el suyo si es autonoma, el del fragmento si es compartida.  \~
+    ShardWake own_;
+    ShardWake *wake_ = &own_;
 
     /// \~english Counted by the shard alone.  \~spanish Contados solo por el fragmento.  \~
     uint64_t taken_ = 0;

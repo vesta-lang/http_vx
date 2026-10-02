@@ -117,6 +117,9 @@ add_library(http_vx_core STATIC
         reactor/shard_open.cpp
         reactor/shard_datagram.cpp
         reactor/kick_queue.cpp
+        reactor/mailbox.cpp
+        reactor/shard_mail.cpp
+        reactor/shard_wake.cpp
         reactor/shard_streamless.cpp
         reactor/timer_wheel.cpp
 )
@@ -471,27 +474,35 @@ endif ()
 # Va aqui y no al lado de `http_vx_serve` porque es lo unico del proyecto que
 # enlaza una libreria de plataforma, y esas se definen justo arriba.
 # ---------------------------------------------------------------------------
-add_executable(http_vx_listen serve/listen.cpp serve/options.cpp serve/reactors.cpp
-        serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp serve/events.cpp)
-target_include_directories(http_vx_listen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
-target_link_libraries(http_vx_listen PRIVATE http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core
+# Todo el servidor menos su `main`, en una libreria: lo enlazan el programa y la
+# prueba de su grupo de fragmentos, y asi las dos cosas son el mismo codigo.
+add_library(http_vx_serve_lib STATIC
+        serve/options.cpp serve/reactors.cpp
+        serve/tls_setup.cpp serve/h3_setup.cpp serve/report.cpp serve/events.cpp
+        serve/shard_group.cpp serve/shard_runner.cpp serve/cpu_affinity.cpp serve/host_notes.cpp)
+target_include_directories(http_vx_serve_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(http_vx_serve_lib PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_serve_lib PUBLIC http_vx_h3_service http_vx_tls_stream http_vx_proto http_vx_core
         Threads::Threads)
 # HTTPS con los proveedores que haya; sin ninguno, `--tls` se niega a arrancar (R24).
 if (TARGET http_vx_crypto_openssl)
-    target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_openssl)
-    target_compile_definitions(http_vx_listen PRIVATE HTTP_VX_HAVE_OPENSSL=1)
+    target_link_libraries(http_vx_serve_lib PUBLIC http_vx_crypto_openssl)
+    target_compile_definitions(http_vx_serve_lib PRIVATE HTTP_VX_HAVE_OPENSSL=1)
 endif ()
 if (TARGET http_vx_crypto_cng)
-    target_link_libraries(http_vx_listen PRIVATE http_vx_crypto_cng)
-    target_compile_definitions(http_vx_listen PRIVATE HTTP_VX_HAVE_CNG=1)
+    target_link_libraries(http_vx_serve_lib PUBLIC http_vx_crypto_cng)
+    target_compile_definitions(http_vx_serve_lib PRIVATE HTTP_VX_HAVE_CNG=1)
 endif ()
 
 if (WIN32)
-    target_link_libraries(http_vx_listen PRIVATE http_vx_windows)
+    target_link_libraries(http_vx_serve_lib PUBLIC http_vx_windows)
 else ()
-    target_link_libraries(http_vx_listen PRIVATE http_vx_linux)
+    target_link_libraries(http_vx_serve_lib PUBLIC http_vx_linux)
 endif ()
+
+add_executable(http_vx_listen serve/listen.cpp)
+target_compile_options(http_vx_listen PRIVATE -Wall -Wextra -pedantic-errors)
+target_link_libraries(http_vx_listen PRIVATE http_vx_serve_lib)
 
 # ---------------------------------------------------------------------------
 # Las medidas.  El README dice que no son opcionales y tiene razon por dos
@@ -761,9 +772,32 @@ if (HTTP_VX_BUILD_TESTS)
         # acaba una vez como fallo con su buffer, y la escritura no se toca.
         http_vx_add_test(test_backend_cancel tests/test_backend_cancel.cpp)
         target_link_libraries(test_backend_cancel PRIVATE http_vx_linux)
+
+        # Un socket de escucha por fragmento en la misma direccion (SO_REUSEPORT,
+        # HVX-6 4.1): cuatro fragmentos, muchas conexiones, repartidas.
+        http_vx_add_test(test_shard_reuseport tests/test_shard_reuseport.cpp)
+        target_link_libraries(test_shard_reuseport PRIVATE http_vx_linux Threads::Threads)
     endif ()
 
     http_vx_add_test(test_shard_streamless tests/test_shard_streamless.cpp)
+
+    # El buzon entre fragmentos (HVX-6, 6): sus pozos y su camino de vuelta en un
+    # hilo, y un fragmento que DUERME con productores en otros hilos, contra el
+    # backend de memoria que duerme y contra cada backend real de la plataforma.
+    # Y dos fragmentos que se pasan un socket.
+    # El grupo de fragmentos del servidor ejecutable, con el servidor entero.
+    http_vx_add_test(test_shard_group tests/test_shard_group.cpp)
+    target_link_libraries(test_shard_group PRIVATE http_vx_serve_lib)
+
+    foreach (_mail_test test_mailbox test_shard_mail)
+        http_vx_add_test(${_mail_test} tests/${_mail_test}.cpp)
+        target_link_libraries(${_mail_test} PRIVATE Threads::Threads)
+        if (WIN32)
+            target_link_libraries(${_mail_test} PRIVATE http_vx_windows)
+        else ()
+            target_link_libraries(${_mail_test} PRIVATE http_vx_linux)
+        endif ()
+    endforeach ()
 endif ()
 
 # ---------------------------------------------------------------------------

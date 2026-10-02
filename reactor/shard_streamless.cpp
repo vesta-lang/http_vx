@@ -61,14 +61,7 @@ void Shard::unserved(const Completion &done) noexcept {
      * descriptor perdido -- asi que se cierra, igual que cierra uno una tabla
      * llena.
      * \~ */
-    if (done.kind == OpKind::Accept && done.ok() && done.fd >= 0 &&
-        io_ != nullptr) {
-        Op shut;
-        shut.kind = OpKind::Close;
-        shut.buffer = kNoBuffer;
-        shut.fd = done.fd;
-        io_->submit(shut);
-    }
+    if (done.kind == OpKind::Accept && done.ok() && done.fd >= 0) close_socket(done.fd);
 }
 
 } // namespace http_vx

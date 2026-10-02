@@ -157,10 +157,10 @@ bool EpollBackend::reset(BufferPool &pool, uint32_t max_fds) noexcept {
     return true;
 }
 
-bool EpollBackend::listen(const char *host, uint16_t port, int backlog) noexcept {
+bool EpollBackend::listen(const char *host, uint16_t port, int backlog, ListenShare share) noexcept {
     if (queue_ < 0) return false;
 
-    const int s = open_listener(host, port, backlog, true, port_, last_error_);
+    const int s = open_listener(host, port, backlog, true, share, port_, last_error_);
     if (s < 0) return false;
 
     if (static_cast<uint32_t>(s) >= max_fds_) {

@@ -54,6 +54,10 @@ struct Options {
     const char *provider = nullptr;
     /// \~english HTTP/3 on UDP, same address and port.  \~spanish HTTP/3 sobre UDP, misma direccion y puerto.  \~
     bool h3 = false;
+    /// \~english How many shards, one thread each; zero asks for one per CPU the process may use.  \~spanish Cuantos fragmentos, un hilo cada uno; cero pide uno por CPU que pueda usar el proceso.  \~
+    uint32_t shards = 0;
+    /// \~english The most shards one server may be asked for.  \~spanish Lo mas que se le puede pedir a un servidor en fragmentos.  \~
+    static constexpr uint32_t kMaxShards = 1024;
     /// \~english The usage was asked for.  \~spanish Se pidio el uso.  \~
     bool help = false;
 

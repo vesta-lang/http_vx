@@ -43,7 +43,12 @@ bool BodySource::kick() noexcept {
     return q != nullptr && q->kick(*this);
 }
 
-void KickQueue::reset(Backend *io) noexcept { io_ = io; }
+void KickQueue::reset(Backend *io) noexcept {
+    own_.reset(io);
+    wake_ = &own_;
+}
+
+void KickQueue::reset(ShardWake &wake) noexcept { wake_ = &wake; }
 
 void KickQueue::open(BodySource &s, KickTarget &target, OpenResponse r) noexcept {
     s.target_ = &target;
@@ -77,23 +82,9 @@ bool KickQueue::kick(BodySource &s) noexcept {
     } while (!head_.compare_exchange_weak(h, &s, std::memory_order_seq_cst,
                                           std::memory_order_relaxed));
 
-    /* \~english
-     * Dekker's second half: the push above, THEN "is it sleeping".  Only the
-     * first kick since the shard went to sleep finds 1 and pays the system
-     * call; every other one is this exchange and nothing more.
-     * \~spanish
-     * La segunda mitad de Dekker: el push de arriba, DESPUES "esta durmiendo".
-     * Solo el primer aviso desde que el fragmento se durmio encuentra un 1 y paga
-     * la llamada al sistema; cualquier otro es este intercambio y nada mas.
-     * \~ */
-    if (sleeping_.exchange(0, std::memory_order_seq_cst) == 1) {
-        wakes_.fetch_add(1, std::memory_order_relaxed);
-        if (io_ == nullptr || !io_->wake()) {
-            failed_wakes_.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-    }
-    return true;
+    // \~english Dekker's second half -- the push above, THEN "is it sleeping" -- lives in the shared wake.
+    // \~spanish La segunda mitad de Dekker -- el push de arriba, DESPUES "esta durmiendo" -- vive en el despertar compartido.  \~
+    return wake_->notify();
 }
 
 bool KickQueue::about_to_sleep() noexcept {
@@ -106,15 +97,15 @@ bool KickQueue::about_to_sleep() noexcept {
      * O quien avisa metio antes de esta escritura -- y la lectura de abajo lo
      * ve -- o despues, y su intercambio ve el 1 y despierta.
      * \~ */
-    sleeping_.store(1, std::memory_order_seq_cst);
+    wake_->publish_sleeping();
     if (head_.load(std::memory_order_seq_cst) != nullptr) {
-        sleeping_.store(0, std::memory_order_relaxed);
+        wake_->cancel_sleeping();
         return false;
     }
     return true;
 }
 
-void KickQueue::awake() noexcept { sleeping_.store(0, std::memory_order_relaxed); }
+void KickQueue::awake() noexcept { wake_->awake(); }
 
 void KickQueue::deliver_gone(BodySource &s) noexcept {
     ++gone_[static_cast<size_t>(s.why_)];
@@ -182,8 +173,9 @@ KickCounts KickQueue::counts() const noexcept {
     KickCounts c;
     c.taken = taken_;
     c.coalesced = coalesced_;
-    c.wakes = wakes_.load(std::memory_order_relaxed);
-    c.failed_wakes = failed_wakes_.load(std::memory_order_relaxed);
+    const WakeCounts w = wake_->counts();
+    c.wakes = w.wakes;
+    c.failed_wakes = w.failed_wakes;
     for (size_t i = 0; i < 5; ++i) c.gone[i] = gone_[i];
     return c;
 }

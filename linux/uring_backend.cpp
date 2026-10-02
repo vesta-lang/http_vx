@@ -34,6 +34,25 @@
 
 #include <new>
 
+/* \~english
+ * The syscall numbers, for a system whose headers do not define them (the
+ * x86-64 table was missing from the headers of the development machine).
+ * Both are the same on every architecture that uses the unified table, x86-64
+ * and 32-bit x86 included, and they never change: a number is ABI.
+ * \~spanish
+ * Los numeros de las llamadas al sistema, para un sistema cuyas cabeceras no
+ * los definen (en las cabeceras de la maquina de desarrollo faltaba la tabla
+ * de x86-64).  Los dos son iguales en toda arquitectura que usa la tabla
+ * unificada, x86-64 y x86 de 32 bits incluidas, y no cambian nunca: un numero
+ * es ABI.
+ * \~ */
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup 425
+#endif
+#ifndef __NR_io_uring_enter
+#define __NR_io_uring_enter 426
+#endif
+
 namespace http_vx {
 
 namespace {
@@ -294,10 +313,10 @@ bool UringBackend::reset(BufferPool &pool, uint32_t entries) noexcept {
     return true;
 }
 
-bool UringBackend::listen(const char *host, uint16_t port, int backlog) noexcept {
+bool UringBackend::listen(const char *host, uint16_t port, int backlog, ListenShare share) noexcept {
     if (fd_ < 0) return false;
 
-    const int s = open_listener(host, port, backlog, false, port_, last_error_);
+    const int s = open_listener(host, port, backlog, false, share, port_, last_error_);
     if (s < 0) return false;
 
     listener_ = s;

@@ -27,6 +27,8 @@
 #ifndef HTTP_VX_LINUX_SOCKET_OPEN_H
 #define HTTP_VX_LINUX_SOCKET_OPEN_H
 
+#include "http_vx/listen_share.h"
+
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -66,12 +68,14 @@ bool socket_address(const char *host, uint16_t port, SocketAddress &out,
  *
  * @param nonblock \~english whether it must not block (epoll) or may (io_uring)
  *                 \~spanish si no debe bloquear (epoll) o puede (io_uring)  \~
+ * @param share    \~english whether it asks for `SO_REUSEPORT`, set before binding (HVX-6, 4.1)
+ *                 \~spanish si pide `SO_REUSEPORT`, puesto antes de atarse (HVX-6, 4.1)  \~
  * @param bound    \~english the port it got  \~spanish el puerto que le toco  \~
  * @param error    \~english the system's error when it fails  \~spanish el error del sistema cuando falla  \~
  * @return         \~english the socket, or -1  \~spanish el socket, o -1  \~
  */
 int open_listener(const char *host, uint16_t port, int backlog, bool nonblock,
-                  uint16_t &bound, int32_t &error) noexcept;
+                  ListenShare share, uint16_t &bound, int32_t &error) noexcept;
 
 } // namespace http_vx
 

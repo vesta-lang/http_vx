@@ -74,6 +74,7 @@
 #include "http_vx/buffer_pool.h"
 #include "http_vx/datagram.h"
 #include "http_vx/id_index.h"
+#include "http_vx/listen_share.h"
 #include "http_vx/reactor_ops.h"
 
 #include <atomic>
@@ -167,10 +168,13 @@ class UringBackend final : public Backend {
      *                \~spanish el puerto, o cero para cualquiera  \~
      * @param backlog \~english how many may wait to be accepted
      *                \~spanish cuantas pueden esperar a que las acepten  \~
+     * @param share   \~english whether other shards may listen on the same address (HVX-6, 4.1)
+     *                \~spanish si otros fragmentos pueden escuchar en la misma direccion (HVX-6, 4.1)  \~
      * @return        \~english false if it could not listen
      *                \~spanish false si no pudo escuchar  \~
      */
-    bool listen(const char *host, uint16_t port, int backlog = 512) noexcept;
+    bool listen(const char *host, uint16_t port, int backlog = 512,
+                ListenShare share = ListenShare::Alone) noexcept;
 
     /// \~english Which port it is listening on.
     /// \~spanish En que puerto esta escuchando.  \~

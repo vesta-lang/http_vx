@@ -62,6 +62,21 @@ void Options::parse(int argc, char **argv) noexcept {
                 return;
             }
             provider = argv[++i];
+        } else if (is(arg, "--shards")) {
+            uint16_t count = 0;
+            if (i + 1 >= argc) {
+                error = "--shards needs a number";
+                return;
+            }
+            // \~english Read as a port is: digits only, and no wider than 16 bits, which is far past kMaxShards.
+            // \~spanish Se lee como un puerto: solo cifras, y no mas de 16 bits, que es mucho mas que kMaxShards.  \~
+            if (!read_port(argv[i + 1], count) || count == 0 || count > kMaxShards) {
+                error = "--shards must be a number from 1 to 1024";
+                culprit = argv[i + 1];
+                return;
+            }
+            shards = count;
+            ++i;
         } else if (is(arg, "--h3")) {
             h3 = true;
         } else if (arg[0] == '-') {
@@ -104,7 +119,7 @@ Endpoint endpoint(const char *host, uint16_t port) noexcept {
 
 void print_usage(std::FILE *out, const Reactors &reactors) noexcept {
     std::fprintf(out,
-                 "usage: http_vx_listen [--tls CERT KEY [--tls-provider NAME] [--h3]]\n"
+                 "usage: http_vx_listen [--tls CERT KEY [--tls-provider NAME] [--h3]] [--shards N]\n"
                  "                      [HOST [PORT [BACKEND]]]\n"
                  "  HOST            the address to listen on (default 127.0.0.1)\n"
                  "  PORT            0 to 65535, 0 for any (default 8080)\n"
@@ -116,7 +131,9 @@ void print_usage(std::FILE *out, const Reactors &reactors) noexcept {
                  reactors.default_name());
     TlsSetup::print_names(out);
     std::fprintf(out, " (default: the first)\n"
-                      "  --h3            also serve HTTP/3 on UDP, same address and port\n");
+                      "  --h3            also serve HTTP/3 on UDP, same address and port\n"
+                      "  --shards N      N threads, each pinned to a CPU and serving its own connections\n"
+                      "                  (default: one per CPU this process may use)\n");
 }
 
 } // namespace serve

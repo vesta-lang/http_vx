@@ -58,6 +58,21 @@ namespace serve {
 
 /**
  * @brief
+ * \~english How a shard's backend listens.
+ * \~spanish Como escucha el backend de un fragmento.
+ * \~
+ */
+enum class Listening : uint8_t {
+    /// \~english Its own socket, the only one on the address (a server of one shard).  \~spanish Su propio socket, el unico en la direccion (un servidor de un fragmento).  \~
+    Alone,
+    /// \~english Its own socket, sharing the address with the other shards' (`SO_REUSEPORT`, Linux).  \~spanish Su propio socket, compartiendo la direccion con los de los otros fragmentos (`SO_REUSEPORT`, Linux).  \~
+    Shared,
+    /// \~english No socket: the backend is made and nothing listens on it.  \~spanish Ningun socket: se hace el backend y no escucha nada en el.  \~
+    Off,
+};
+
+/**
+ * @brief
  * \~english The backends of this build, and the one made.
  * \~spanish Los backends de esta construccion, y el que se hizo.
  * \~
@@ -106,11 +121,12 @@ class Reactors {
      * @param connections \~english how many connections the shard holds  \~spanish cuantas conexiones tiene el fragmento  \~
      * @param host        \~english the address  \~spanish la direccion  \~
      * @param on          \~english the port, zero for any  \~spanish el puerto, cero para cualquiera  \~
+     * @param listening   \~english how it listens, or not at all  \~spanish como escucha, o si no escucha  \~
      * @return            \~english false, with @c error set, if it could not
      *                    \~spanish false, con @c error puesto, si no se pudo  \~
      */
     bool make(const char *want, http_vx::BufferPool &pool, uint32_t connections,
-              const char *host, uint16_t on) noexcept;
+              const char *host, uint16_t on, Listening listening = Listening::Alone) noexcept;
 
     /// \~english A UDP socket on the backend made, for HTTP/3; -1, with @c error, if it cannot be had.
     /// \~spanish Un socket UDP en el backend hecho, para HTTP/3; -1, con @c error, si no se puede tener.  \~

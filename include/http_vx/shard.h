@@ -68,6 +68,7 @@
 #include "http_vx/conn_table.h"
 #include "http_vx/datagram_service.h"
 #include "http_vx/kick_queue.h"
+#include "http_vx/mailbox.h"
 #include "http_vx/open_port.h"
 #include "http_vx/reactor_ops.h"
 #include "http_vx/timer_wheel.h"
@@ -426,6 +427,20 @@ struct ShardConfig {
 
     /// \~english The most one @c Service::on_writable call may write.  \~spanish Lo mas que puede escribir una llamada a @c Service::on_writable.  \~
     uint32_t write_size = 65536;
+
+    /**
+     * \~english
+     * How many messages this shard may have in flight to other shards at once
+     * (HVX-6, 6): the size of its own pool of mailbox nodes, made at start on
+     * the shard's thread.  A send with none free is refused and counted.
+     * \~spanish
+     * Cuantos mensajes puede tener este fragmento en vuelo hacia otros a la vez
+     * (HVX-6, 6): el tamano de su propio pozo de nodos de buzon, hecho al
+     * arrancar en el hilo del fragmento.  Un envio sin ninguno libre se rechaza
+     * y se cuenta.
+     * \~
+     */
+    uint32_t mail_nodes = 256;
 };
 
 /**
@@ -467,6 +482,21 @@ struct ShardCounts {
      * \~
      */
     uint64_t uncancelled = 0;
+
+    /// \~english Connections accepted on this shard's own listener and taken.  \~spanish Conexiones aceptadas en el socket de escucha propio del fragmento y cogidas.  \~
+    uint64_t accepted = 0;
+
+    /// \~english Accepted sockets closed because the shard could not take them (full or no stream side).  \~spanish Sockets aceptados y cerrados porque el fragmento no pudo cogerlos (lleno o sin lado de flujos).  \~
+    uint64_t accept_refused = 0;
+
+    /// \~english Sockets another shard handed over (@c MailKind::AdoptSocket) and taken.  \~spanish Sockets que otro fragmento paso (@c MailKind::AdoptSocket) y se cogieron.  \~
+    uint64_t mail_adopted = 0;
+
+    /// \~english Handed-over sockets closed because this shard could not take them.  \~spanish Sockets pasados y cerrados porque este fragmento no pudo cogerlos.  \~
+    uint64_t mail_adopt_refused = 0;
+
+    /// \~english Sockets this shard decided to close and whose close the backend refused: they stay open.  \~spanish Sockets que este fragmento decidio cerrar y cuyo cierre rechazo el backend: siguen abiertos.  \~
+    uint64_t unclosed = 0;
 };
 
 /**
@@ -561,6 +591,37 @@ class Shard final : public StreamPort {
      */
     KickQueue &kicks() noexcept { return kicks_; }
     const KickQueue &kicks() const noexcept { return kicks_; }
+
+    /**
+     * @brief
+     * \~english This shard's inbox: what other shards say to it (HVX-6, 6).
+     * \~spanish El buzon de entrada de este fragmento: lo que le dicen los otros (HVX-6, 6).
+     * \~
+     *
+     * \~english
+     * Any thread may push a node taken from its own @c MailPool; every poll
+     * drains it after the completions and before the kicks.  It shares the
+     * shard's one wake with the kick queue.
+     * \~spanish
+     * Cualquier hilo puede meter un nodo sacado de su propio @c MailPool; cada
+     * poll lo vacia despues de las finalizaciones y antes de los avisos.
+     * Comparte con la cola de avisos el unico despertar del fragmento.
+     * \~
+     */
+    Mailbox &mailbox() noexcept { return mail_; }
+
+    /// \~english This shard's pool of messages to send; only its own thread sends from it.  \~spanish El pozo de mensajes a mandar de este fragmento; solo su propio hilo manda desde el.  \~
+    MailPool &mail_pool() noexcept { return mail_pool_; }
+    const MailPool &mail_pool() const noexcept { return mail_pool_; }
+
+    /// \~english What the inbox has taken.  \~spanish Lo que ha cogido el buzon de entrada.  \~
+    MailboxCounts mail_received() const noexcept { return mail_.counts(); }
+
+    /// \~english Whether a @c MailKind::Stop arrived: the owner's loop ends.  \~spanish Si llego un @c MailKind::Stop: el bucle de su dueno termina.  \~
+    bool stop_requested() const noexcept { return stop_requested_; }
+
+    /// \~english What the wake has counted, kicks and mailbox together.  \~spanish Lo que ha contado el despertar, avisos y buzon juntos.  \~
+    WakeCounts wake_counts() const noexcept { return wake_.counts(); }
 
     /**
      * @brief
@@ -831,6 +892,26 @@ class Shard final : public StreamPort {
      */
     void on_accept(const Completion &done, uint64_t now) noexcept;
 
+    /**
+     * @brief
+     * \~english How long the wait may be: publishes "sleeping" and looks at BOTH stacks again (HVX-6, 6).
+     * \~spanish Cuanto puede durar la espera: publica "durmiendo" y vuelve a mirar las DOS pilas (HVX-6, 6).
+     * \~
+     *
+     * @param timeout_ms \~english what the caller asked for  \~spanish lo que pidio quien llama  \~
+     * @return           \~english @p timeout_ms, or zero when a kick or a message is already there  \~spanish @p timeout_ms, o cero cuando ya hay un aviso o un mensaje  \~
+     */
+    int wait_budget(int timeout_ms) noexcept;
+
+    /// \~english Handles every message in the mailbox, oldest first, and hands each node back to its sender.  \~spanish Atiende cada mensaje del buzon, el mas antiguo primero, y devuelve cada nodo a su remitente.  \~
+    void run_mail(uint64_t now) noexcept;
+
+    /// \~english Closes a socket this shard will not serve, with the same operation as everywhere else.  \~spanish Cierra un socket que este fragmento no va a servir, con la misma operacion que en todas partes.  \~
+    void close_socket(int32_t fd) noexcept;
+
+    /// \~english Closes the sockets of messages never handled, hands their nodes back, and gives up the pool.  \~spanish Cierra los sockets de los mensajes nunca atendidos, devuelve sus nodos, y suelta el pozo.  \~
+    void release_mail() noexcept;
+
     /// \~english Asks for one more connection.
     /// \~spanish Pide una conexion mas.  \~
     void want_accept() noexcept;
@@ -873,7 +954,13 @@ class Shard final : public StreamPort {
     Service *service_ = nullptr;
     ShardConfig cfg_;
     ShardCounts counts_;
+
+    /// \~english The one wake of this shard, shared by its kicks and its mailbox.  \~spanish El unico despertar de este fragmento, compartido por sus avisos y su buzon.  \~
+    ShardWake wake_;
     KickQueue kicks_;
+    Mailbox mail_;
+    MailPool mail_pool_;
+    bool stop_requested_ = false;
 
     OpenCounts open_counts_;
 

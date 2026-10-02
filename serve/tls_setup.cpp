@@ -157,6 +157,7 @@ void TlsSetup::print_names(std::FILE *out) noexcept {
 }
 
 TlsSetup::~TlsSetup() {
+    http_vx::wipe_secret(ticket_key_, sizeof ticket_key_);
     if (sealer_ != nullptr) {
         sealer_->~TicketSealer();
         util::host_free(sealer_);
@@ -215,7 +216,8 @@ bool TlsSetup::choose(const char *name) noexcept {
     return false;
 }
 
-bool TlsSetup::load(const char *name, const char *cert_path, const char *key_path) noexcept {
+bool TlsSetup::load(const char *name, const char *cert_path, const char *key_path,
+                    const uint8_t *ticket_key) noexcept {
     if (!choose(name)) {
         if (why_ == nullptr) why_ = "no memory for the provider";
         return false;
@@ -284,14 +286,16 @@ bool TlsSetup::load(const char *name, const char *cert_path, const char *key_pat
 
     // \~english Tickets, sealed with a key that never leaves this process (tls_ticket.h).
     // \~spanish Tickets, sellados con una clave que nunca sale de este proceso (tls_ticket.h).  \~
-    uint8_t tk[http_vx::tls::TicketSealer::kKeySize];
-    if (!crypto_->random(tk, sizeof tk)) {
+    // \~english With several shards the key is made once and given to each, or a ticket one shard issued would be refused by the next.
+    // \~spanish Con varios fragmentos la clave se hace una vez y se da a cada uno, o un ticket que emitio un fragmento lo rechazaria el siguiente.  \~
+    if (ticket_key != nullptr) {
+        util::vesta_memcpy(ticket_key_, ticket_key, sizeof ticket_key_);
+    } else if (!crypto_->random(ticket_key_, sizeof ticket_key_)) {
         why_ = "the provider gave no random bytes for the ticket key";
         return false;
     }
     void *mem = util::host_alloc(sizeof(http_vx::tls::TicketSealer));
-    if (mem != nullptr) sealer_ = new (mem) http_vx::tls::TicketSealer(*crypto_, tk);
-    http_vx::wipe_secret(tk, sizeof tk);
+    if (mem != nullptr) sealer_ = new (mem) http_vx::tls::TicketSealer(*crypto_, ticket_key_);
     if (sealer_ == nullptr || !sealer_->ready()) {
         why_ = "the ticket key could not be prepared";
         return false;

@@ -62,9 +62,15 @@ public:
      * \~english Chooses the provider @p name (null: the build's first) and loads @p cert_path and @p key_path.
      * \~spanish Elige el proveedor @p name (nulo: el primero de la construccion) y carga @p cert_path y @p key_path.
      * \~
+     * @param ticket_key \~english the ticket key to use (kKeySize bytes), or null for a new random one
+     *                   \~spanish la clave de tickets a usar (kKeySize bytes), o nulo para una aleatoria nueva  \~
      * @return \~english false, with why(), when TLS cannot be served  \~spanish falso, con why(), cuando no se puede servir TLS  \~
      */
-    bool load(const char *name, const char *cert_path, const char *key_path) noexcept;
+    bool load(const char *name, const char *cert_path, const char *key_path,
+              const uint8_t *ticket_key = nullptr) noexcept;
+
+    /// \~english The ticket key in use, to give to the other shards' setups so they open each other's tickets.  \~spanish La clave de tickets en uso, para dar a los setups de los otros fragmentos y que abran los tickets de los demas.  \~
+    const uint8_t *ticket_key() const noexcept { return ticket_key_; }
 
     /// \~english Whether this build has a provider called @p name.
     /// \~spanish Si esta construccion tiene un proveedor llamado @p name.  \~
@@ -96,6 +102,7 @@ private:
     /// \~spanish Que clase de proveedor vive en provider_mem_: 0 ninguna, 1 OpenSSL, 2 CNG.  \~
     uint8_t kind_ = 0;
     http_vx::tls::TicketSealer *sealer_ = nullptr;
+    uint8_t ticket_key_[http_vx::tls::TicketSealer::kKeySize] = {};
     uint8_t *file_ = nullptr;
     uint8_t *certs_[kMaxChain] = {};
     size_t lens_[kMaxChain] = {};
